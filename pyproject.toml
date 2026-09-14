@@ -1,0 +1,29 @@
+[project]
+name = "pokerlab"
+version = "0.1.0"
+description = "No-Limit Texas Hold'em engine with pluggable players, built as a foundation for future reinforcement-learning self-play and live table recognition."
+requires-python = ">=3.13"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-cov", "ruff"]
+rl = ["torch", "numpy", "gymnasium"]
+vision = ["opencv-python", "numpy", "mss"]
+
+[project.scripts]
+poker-play = "pokerlab.cli.play:main"
+poker-gui = "pokerlab.gui.app:main"
+poker-train = "pokerlab.rl.train:main"  # needs the `rl` extra installed
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pokerlab"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
