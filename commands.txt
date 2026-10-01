@@ -83,3 +83,9 @@ cd /mnt/shared_volume/POKER/Poker-RL
 OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1 .venv/bin/python -m pokerlab.rl.elo_bb_grid \
     --hands 10000 --jobs 20 --csv checkpoints/studies/elo_bb_grid.csv --csv-every 300 \
     2>&1 | tee checkpoints/logs/elo-bb-grid-$(date +%Y%m%d-%H%M%S).log
+
+# ── PUBBLICA SU GIT I TOP 5 MODELLI (solo la cartella top_models/) ──
+# --dry-run mostra cosa farebbe; --no-push fa solo il commit
+cd /mnt/shared_volume/POKER/Poker-RL
+.venv/bin/python -m pokerlab.rl.push_top_models --dry-run
+.venv/bin/python -m pokerlab.rl.push_top_models
