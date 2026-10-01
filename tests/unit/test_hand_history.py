@@ -1,9 +1,10 @@
 import random
 
+from support import make_always_call_bot
+
 from pokerlab.engine.config import GameConfig
 from pokerlab.engine.history import HandHistoryReader, HandHistoryWriter
 from pokerlab.engine.table import Table
-from pokerlab.players.scripted import make_always_call_bot
 
 
 def test_hand_history_roundtrips_through_jsonl(tmp_path):

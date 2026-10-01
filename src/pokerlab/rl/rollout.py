@@ -13,7 +13,6 @@ place in `rl/ppo.py`, where trajectories become tensors.
 from __future__ import annotations
 
 import random
-from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
@@ -22,7 +21,6 @@ from pokerlab.engine.config import GameConfig
 from pokerlab.engine.table import Table
 from pokerlab.players.base import Observation, Player
 from pokerlab.players.rl_agent import DecisionRecord, PolicyFn, RLAgentPlayer
-from pokerlab.players.scripted import get_bot_profile
 
 
 @dataclass
@@ -70,19 +68,14 @@ def compute_gae(
 
 @dataclass(frozen=True)
 class Opponent:
-    """A non-learner seat filler, in `BOT_CATALOG`'s factory shape."""
+    """A non-learner seat filler: a label plus a uniform-signature factory."""
 
     label: str
     factory: Callable[[str, str, random.Random], Player]
 
 
-def scripted_opponent(key: str) -> Opponent:
-    profile = get_bot_profile(key)
-    return Opponent(label=profile.label, factory=profile.factory)
-
-
 def policy_opponent(label: str, policy_fn: PolicyFn, config: GameConfig) -> Opponent:
-    """Wrap a frozen policy (typically a past snapshot) as an opponent."""
+    """Wrap a frozen policy (a previously trained model) as an opponent."""
 
     def factory(player_id: str, name: str, rng: random.Random) -> Player:
         return RLAgentPlayer(
@@ -102,27 +95,34 @@ class OpponentPool:
     Self-play against nothing but the current policy can chase its own tail:
     the reward is relative, so both sides can drift without either getting
     stronger, and the agent learns exploits that only work against its twin.
-    Past snapshots and the scripted catalog anchor it to something that does
-    not move with it.
+    Previously trained models (`extra_opponents`, drawn from the ranked pool --
+    see `train.py::registry_opponents`) anchor it to something that does not
+    move with it.
+
+    **The run's own past selves are deliberately not in here.** The pool used
+    to also hold frozen snapshots of the learner taken every few iterations,
+    weighted by a `snapshot_share`; that whole mechanism was removed at the
+    user's request. A snapshot is a copy of the network being trained, so it
+    drifts with it and anchors nothing -- the opposition it provides is the
+    same tail-chasing self-play the fixed pool exists to replace, and every
+    seat it took was a seat not facing a real, independently trained model.
+    With nothing in the pool (an empty store, the very first run ever),
+    `sample` returns `None` and every seat goes to the learner -- plain
+    self-play until there is something else to train against.
     """
 
-    def __init__(self, opponents: Sequence[Opponent] = (), *, max_snapshots: int = 5) -> None:
+    def __init__(self, opponents: Sequence[Opponent] = ()) -> None:
         self._fixed = list(opponents)
-        self._snapshots: deque[Opponent] = deque(maxlen=max_snapshots)
-
-    def add_snapshot(self, opponent: Opponent) -> None:
-        self._snapshots.append(opponent)
 
     def sample(self, rng: random.Random) -> Opponent | None:
         """An opponent for one seat, or None to seat the learner there."""
-        candidates = [*self._fixed, *self._snapshots]
-        return rng.choice(candidates) if candidates else None
+        return rng.choice(self._fixed) if self._fixed else None
 
     def __len__(self) -> int:
-        return len(self._fixed) + len(self._snapshots)
+        return len(self._fixed)
 
 
-class _SeatProxy(Player):
+class SeatProxy(Player):
     """Delegates to whoever occupies the seat this hand.
 
     Swapping occupants this way keeps one `Table` alive across hands, so the
@@ -175,7 +175,7 @@ class SelfPlayCollector:
         self._rng = rng if rng is not None else random.Random()
         self._pending: dict[int, list[DecisionRecord]] = {}
 
-        self._proxies = [_SeatProxy(f"s{seat}", f"S{seat}") for seat in range(config.num_players)]
+        self._proxies = [SeatProxy(f"s{seat}", f"S{seat}") for seat in range(config.num_players)]
         self._learners = [
             RLAgentPlayer(
                 f"s{seat}",

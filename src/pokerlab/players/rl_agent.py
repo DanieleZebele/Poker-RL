@@ -49,7 +49,7 @@ PolicyFn = Callable[[list[float], list[bool]], PolicyDecision]
 
 
 class RLAgentPlayer(Player):
-    """Wraps a policy's forward pass the way `ScriptedBot` wraps a rule.
+    """Wraps a policy's forward pass as a `Player`'s decision function.
 
     `big_blind` and `starting_stack` are the feature normalisation constants;
     they come from the table's `GameConfig`, since `Observation` carries no

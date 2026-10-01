@@ -1,27 +1,22 @@
 import random
 
 import pytest
+from support import make_always_call_bot, make_random_legal_bot
 
 from pokerlab.engine.config import GameConfig
 from pokerlab.engine.table import Table
-from pokerlab.players.scripted import (
-    make_always_call_bot,
-    make_random_legal_bot,
-    make_tight_aggressive_bot,
-)
 
 
 def build_mixed_table(num_players: int, seed: int, starting_stack: int = 500) -> Table:
     config = GameConfig(num_players=num_players, starting_stack=starting_stack, small_blind=1, big_blind=2)
     players = []
     for i in range(num_players):
-        kind = i % 3
-        if kind == 0:
+        if i % 2 == 0:
             players.append(make_always_call_bot(f"p{i}", f"AC{i}"))
-        elif kind == 1:
-            players.append(make_random_legal_bot(f"p{i}", f"R{i}", rng=random.Random(seed * 31 + i)))
         else:
-            players.append(make_tight_aggressive_bot(f"p{i}", f"TAG{i}"))
+            # Picks uniformly among whatever is legal, BET/RAISE included, so
+            # this alone already exercises every action type the fuzz needs.
+            players.append(make_random_legal_bot(f"p{i}", f"R{i}", rng=random.Random(seed * 31 + i)))
     return Table(config, players, rng=random.Random(seed))
 
 

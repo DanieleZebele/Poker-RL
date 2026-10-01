@@ -14,6 +14,10 @@ vision = ["opencv-python", "numpy", "mss"]
 poker-play = "pokerlab.cli.play:main"
 poker-gui = "pokerlab.gui.app:main"
 poker-train = "pokerlab.rl.train:main"  # needs the `rl` extra installed
+poker-loop = "pokerlab.rl.loop:main"  # continuous multi-process training; needs `rl`
+poker-kill = "pokerlab.rl.killswitch:main"  # immediate stop of this machine's loop; no torch
+poker-dashboard = "pokerlab.rl.dashboard:main"  # browser view of the fleet; stdlib only
+poker-elo = "pokerlab.rl.population_arena:main"  # update every model's Elo by hand; needs `rl`
 
 [build-system]
 requires = ["hatchling"]

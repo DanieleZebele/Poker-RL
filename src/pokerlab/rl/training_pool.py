@@ -1,0 +1,144 @@
+"""Who a training run plays against: a fresh, diverse draw from the shared store.
+
+Every `poker-train` run -- so every worker of every generation -- draws its own
+opponents from `checkpoints/models/` instead of inheriting a pool someone else
+ranked. That is the point: workers must not all train against the same twenty
+models, or the population converges on beating one fixed field. The draw mixes
+two sources:
+
+  * **top**: `top_share` of the seats, uniformly from the `top_n` best-rated
+    models, so there is always a strong field to learn from;
+  * **random**: every remaining seat, uniformly from the whole store, which is
+    what keeps weak and odd opponents (never-rated newcomers included) in the
+    mix and stops the field being only the current elite.
+
+The random source is also what makes a short top source harmless: with nothing
+rated yet it has nobody to draw, and the pool still comes out full.
+
+Pure Python -- no torch -- and given a seeded `random.Random` the draw is
+reproducible.
+"""
+
+from __future__ import annotations
+
+import random
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+
+from pokerlab.rl.pool_registry import (
+    DEFAULT_POOL_SIZE,
+    MODEL,
+    PoolMember,
+    PoolRegistry,
+)
+
+DEFAULT_TOP_SHARE = 0.5
+DEFAULT_TOP_N = 100
+
+
+def available_labels(models_dir: str | Path) -> list[str]:
+    """Every model in the shared store (a label is the file name without `.pt`)."""
+    directory = Path(models_dir)
+    if not directory.is_dir():
+        return []
+    return sorted(p.stem for p in directory.glob("*.pt") if not p.name.startswith("."))
+
+
+def _known(label: str, ranking: Mapping[str, PoolMember]) -> PoolMember:
+    """The ranking's view of a model, or a blank never-rated one if it has none."""
+    member = ranking.get(label)
+    if member is None:
+        return PoolMember(label=label, kind=MODEL, ref=f"{label}.pt")
+    return member
+
+
+def draw_training_pool(
+    ranking: Mapping[str, PoolMember],
+    labels: Sequence[str],
+    *,
+    size: int = DEFAULT_POOL_SIZE,
+    rng: random.Random,
+    top_share: float = DEFAULT_TOP_SHARE,
+    top_n: int = DEFAULT_TOP_N,
+) -> list[PoolMember]:
+    """Pick up to `size` opponents from `labels`.
+
+    `top_share` of the seats come from the `top_n` best-rated models and every
+    remaining seat is drawn uniformly from the whole store. The returned members
+    are *copies*, frozen and with `ref` set to the file name inside the models
+    directory: they are reference points for scoring one run's learner and are
+    never written back to the global ranking.
+    """
+    if size <= 0 or not labels:
+        return []
+    members = [_known(label, ranking) for label in labels]
+    by_label = {member.label: member for member in members}
+
+    rated = sorted((m for m in members if m.games > 0), key=lambda m: (-m.rating, m.label))
+    top_pool = [m.label for m in rated[:top_n]]
+    everything = [m.label for m in members]
+
+    chosen: list[str] = []
+    taken: set[str] = set()
+
+    def take(pool: Sequence[str], count: int) -> None:
+        candidates = [label for label in pool if label not in taken]
+        for label in rng.sample(candidates, min(count, len(candidates))):
+            chosen.append(label)
+            taken.add(label)
+
+    take(top_pool, round(size * top_share))
+    # Every remaining seat, which is also what a short top source falls back on.
+    take(everything, size - len(chosen))
+
+    return [
+        PoolMember(
+            label=label,
+            kind=MODEL,
+            ref=f"{label}.pt",
+            rating=by_label[label].rating,
+            games=by_label[label].games,
+            iteration=by_label[label].iteration,
+            frozen=True,
+        )
+        for label in chosen
+    ]
+
+
+def build_training_registry(models_dir: str | Path, drawn: Sequence[PoolMember]) -> PoolRegistry:
+    """An in-memory registry over the drawn opponents, for scoring a learner.
+
+    It is never saved: the members are frozen copies, so evaluating a learner
+    against them cannot move anyone's rating, and nothing here reaches disk.
+    """
+    registry = PoolRegistry(directory=Path(models_dir), max_models=max(len(drawn), 1))
+    for member in drawn:
+        registry.members[member.label] = member
+    return registry
+
+
+def pick_parents(
+    ranking: Mapping[str, PoolMember],
+    labels: Sequence[str],
+    count: int,
+    *,
+    rng: random.Random,
+    top_n: int = DEFAULT_TOP_N,
+) -> list[str]:
+    """`count` distinct parents to inherit weights from, drawn from the best-rated
+    models that exist on disk; cycling only if there are fewer than `count`.
+
+    Distinct so the inheriting half of a generation is competing lineages rather
+    than copies of one model.
+    """
+    if count <= 0:
+        return []
+    rated = sorted(
+        (m for m in (_known(label, ranking) for label in labels) if m.games > 0 and not m.frozen),
+        key=lambda m: (-m.rating, m.label),
+    )
+    pool = [m.label for m in rated[:top_n]]
+    if not pool:
+        return []
+    picked = rng.sample(pool, min(count, len(pool)))
+    return [picked[index % len(picked)] for index in range(count)]

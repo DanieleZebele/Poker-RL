@@ -34,8 +34,8 @@ class HandResult:
 
 class Table:
     """Drives full hands over a fixed list of Players, uniformly -- it never
-    branches on whether a seat is a ManualPlayer, a ScriptedBot, or (later)
-    an RL agent. Persists chip stacks and the button across hands."""
+    branches on whether a seat is a ManualPlayer, a GuiPlayer, or an RL agent.
+    Persists chip stacks and the button across hands."""
 
     def __init__(
         self,
@@ -44,6 +44,8 @@ class Table:
         rng: random.Random | None = None,
         history_writer: HandHistoryWriter | None = None,
         on_hand_started: Callable[[dict[str, Any]], None] | None = None,
+        on_street_dealt: Callable[[dict[str, Any]], None] | None = None,
+        on_action_applied: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         """`on_hand_started`, if given, is called once per hand right after
         blinds are posted (before any betting), with a dict of
@@ -51,6 +53,29 @@ class Table:
         hole_cards}. This is an optional spectator hook only -- e.g. a GUI
         showing blind postings and a "spy on opponents' cards" debug toggle
         -- nothing in the engine or in Player depends on it.
+
+        `on_street_dealt` is the same kind of hook for the flop/turn/river,
+        called right after each street's community cards are dealt and
+        before its betting round, with {hand_id, street, community_cards,
+        betting_closed}. `betting_closed` is True when nobody can act any
+        more (everyone still in the hand is all-in, or only one player has
+        chips left): a spectator that only watches Player.act() sees
+        *nothing at all* for such a runout, so a GUI has no other way to
+        show how an all-in finishes.
+
+        `on_action_applied` is the third, called after every action is
+        applied, with {hand_id, seat, player_id, name, action, record,
+        observation}. `observation` is the state *after* the action, which
+        is the whole point: wrapping `Player.act()` can only ever see the
+        state before it, since the engine applies the action once `act()`
+        has returned. A spectator built on `act()` alone is therefore
+        always one action behind, and the last action of a street is never
+        reflected at all -- there is no following action to correct it.
+        `record` is the engine's own ActionRecord, so the chips actually
+        committed are read off it rather than re-derived.
+
+        Building the Observation costs something, so it only happens when a
+        hook is installed -- training never pays for it.
         """
         if len(players) != config.num_players:
             raise ValueError(
@@ -61,6 +86,8 @@ class Table:
         self._rng = rng if rng is not None else random.Random()
         self._history_writer = history_writer
         self._on_hand_started = on_hand_started
+        self._on_street_dealt = on_street_dealt
+        self._on_action_applied = on_action_applied
         self.stacks: list[int] = [config.starting_stack] * config.num_players
         self._button_seat: int | None = None
         self._hand_counter = 0
@@ -137,6 +164,19 @@ class Table:
             if len(hand_state.hand_active_seats()) <= 1:
                 break
             hand_state.community_cards.extend(hand_state.deck.deal(num_cards))
+            # Read before start_new_street_betting: once nobody is left who
+            # can act, this street and every later one are a pure runout,
+            # and no Player.act() call will ever report them to a spectator.
+            betting_closed = len(hand_state.actionable_seats()) <= 1
+            if self._on_street_dealt is not None:
+                self._on_street_dealt(
+                    {
+                        "hand_id": hand_id,
+                        "street": street,
+                        "community_cards": list(hand_state.community_cards),
+                        "betting_closed": betting_closed,
+                    }
+                )
             start_new_street_betting(hand_state, street)
             postflop_first_actor = seats_clockwise_from(hand_state, button_seat + 1)[0]
             self._run_betting_round(hand_state, postflop_first_actor)
@@ -205,6 +245,18 @@ class Table:
                 observation = build_observation(hand_state, seat)
                 action = self.players[seat].act(observation, legal)
                 apply_action(hand_state, seat, action)
+                if self._on_action_applied is not None:
+                    self._on_action_applied(
+                        {
+                            "hand_id": hand_state.hand_id,
+                            "seat": seat,
+                            "player_id": ps.player_id,
+                            "name": ps.name,
+                            "action": action,
+                            "record": hand_state.action_log[-1],
+                            "observation": build_observation(hand_state, seat),
+                        }
+                    )
                 progressed = True
                 if len(hand_state.hand_active_seats()) <= 1:
                     hand_state.to_act = set()

@@ -1,9 +1,10 @@
 import random
 
+from support import make_always_call_bot
+
 from pokerlab.engine.actions import ActionType
 from pokerlab.engine.config import GameConfig
 from pokerlab.engine.table import Table
-from pokerlab.players.scripted import make_always_call_bot
 
 
 def make_table(num_players: int, starting_stack=200, small_blind=1, big_blind=2, seed=0) -> Table:
@@ -96,3 +97,60 @@ def test_on_hand_started_hook_fires_once_with_blinds_and_hole_cards():
     assert set(info["hole_cards"].keys()) == {0, 1, 2}
     for hole in info["hole_cards"].values():
         assert len(hole) == 2
+
+
+class ShoveBot:
+    """Goes all-in the moment it legally can, so every hand it plays runs
+    out with nobody left to act."""
+
+    def __init__(self, player_id: str, name: str) -> None:
+        self.player_id = player_id
+        self.name = name
+
+    def act(self, observation, legal_actions):
+        from pokerlab.engine.actions import Action
+
+        for la in legal_actions:
+            if la.action_type == ActionType.ALL_IN:
+                return Action(ActionType.ALL_IN)
+        return Action(legal_actions[0].action_type)
+
+    def notify(self, event, **data):
+        pass
+
+
+def test_on_street_dealt_hook_reports_each_board_as_it_is_dealt():
+    calls = []
+    config = GameConfig(num_players=3, starting_stack=200, small_blind=1, big_blind=2)
+    players = [make_always_call_bot(f"p{i}", f"P{i}") for i in range(3)]
+    table = Table(config, players, rng=random.Random(0), on_street_dealt=calls.append)
+
+    result = table.play_hand()
+
+    assert [c["street"].value for c in calls] == ["flop", "turn", "river"]
+    assert [len(c["community_cards"]) for c in calls] == [3, 4, 5]
+    assert calls[-1]["community_cards"] == result.hand_history.community_cards
+    assert all(c["hand_id"] == result.hand_id for c in calls)
+    # Everyone can still act on every street, so nothing is a forced runout.
+    assert [c["betting_closed"] for c in calls] == [False, False, False]
+
+
+def test_on_street_dealt_flags_an_all_in_runout_as_betting_closed():
+    """The one case a spectator cannot see any other way: with every
+    remaining player all-in, Table calls no Player at all between the last
+    bet and the payouts, so without this flag a GUI has nothing to show."""
+    calls = []
+    config = GameConfig(num_players=3, starting_stack=200, small_blind=1, big_blind=2)
+    players = [ShoveBot(f"p{i}", f"P{i}") for i in range(3)]
+    table = Table(config, players, rng=random.Random(7), on_street_dealt=calls.append)
+
+    table.play_hand()
+
+    assert [c["street"].value for c in calls] == ["flop", "turn", "river"]
+    assert all(c["betting_closed"] for c in calls)
+
+
+def test_a_table_without_the_street_hook_still_plays_normally():
+    table = make_table(3, seed=3)
+    result = table.play_hand()
+    assert sum(result.final_stacks.values()) == 600

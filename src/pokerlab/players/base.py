@@ -73,9 +73,9 @@ def build_observation(hand_state: HandState, seat: int) -> Observation:
 
 class Player(ABC):
     """The single extension point for every kind of decision-maker: a human
-    at the terminal, a scripted bot, and (in a future session) an RL agent
-    or a GUI-driven player. The engine only ever calls `act`; it never
-    branches on what kind of Player it is talking to.
+    at the terminal, an RL agent, or a GUI-driven player. The engine only
+    ever calls `act`; it never branches on what kind of Player it is
+    talking to.
     """
 
     def __init__(self, player_id: str, name: str) -> None:

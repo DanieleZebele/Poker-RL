@@ -5,8 +5,7 @@ from pokerlab.cards.card import Card
 from pokerlab.engine.actions import Action, ActionType, LegalAction
 from pokerlab.engine.state import PlayerStatus, Street
 from pokerlab.players.base import Observation, SeatPublicInfo
-from pokerlab.players.gui import GuiEvent, GuiPlayer, SteppingPlayer
-from pokerlab.players.scripted import make_always_call_bot
+from pokerlab.players.gui import GuiEvent, GuiPlayer
 
 
 def make_observation() -> Observation:
@@ -40,9 +39,11 @@ def test_act_publishes_a_your_turn_event_with_the_observation_and_legal_actions(
     assert your_turn_event.kind == "your_turn"
     assert your_turn_event.payload == (obs, legal)
 
-    action_taken_event = event_queue.get_nowait()
-    assert action_taken_event.kind == "action_taken"
-    assert action_taken_event.payload == ("p0", "Human0", obs, Action(ActionType.CHECK))
+    # The action itself is reported by Table's on_action_applied hook (see
+    # ActionReporter), not from here -- a Player cannot see the state after
+    # its own action, and the human's move must be drawn the same way a
+    # bot's is.
+    assert event_queue.empty()
 
 
 def test_act_blocks_until_a_decision_is_pushed_from_another_thread():
@@ -68,41 +69,3 @@ def test_act_blocks_until_a_decision_is_pushed_from_another_thread():
     worker.join(timeout=2)
     assert not worker.is_alive()
     assert results == [Action(ActionType.CALL)]
-
-
-def test_stepping_player_reports_the_action_without_blocking_when_step_mode_is_off():
-    event_queue: queue.Queue[GuiEvent] = queue.Queue()
-    step_gate: queue.Queue[None] = queue.Queue()
-    bot = make_always_call_bot("p1", "Bot1")
-    player = SteppingPlayer(bot, event_queue, step_gate, step_mode=lambda: False)
-    obs = make_observation()
-    legal = [LegalAction(ActionType.FOLD), LegalAction(ActionType.CHECK)]
-
-    action = player.act(obs, legal)
-
-    assert action.action_type == ActionType.CHECK  # always-call bot checks when it can
-    event = event_queue.get_nowait()
-    assert event.kind == "action_taken"
-    assert event.payload == ("p1", "Bot1", obs, action)
-
-
-def test_stepping_player_blocks_until_step_gate_is_released_when_step_mode_is_on():
-    event_queue: queue.Queue[GuiEvent] = queue.Queue()
-    step_gate: queue.Queue[None] = queue.Queue()
-    bot = make_always_call_bot("p1", "Bot1")
-    player = SteppingPlayer(bot, event_queue, step_gate, step_mode=lambda: True)
-    obs = make_observation()
-    legal = [LegalAction(ActionType.FOLD), LegalAction(ActionType.CHECK)]
-
-    results: list[Action] = []
-    worker = threading.Thread(target=lambda: results.append(player.act(obs, legal)))
-    worker.start()
-
-    worker.join(timeout=0.2)
-    assert worker.is_alive(), "should be blocked on step_gate while step mode is on"
-    assert results == []
-
-    step_gate.put(None)
-    worker.join(timeout=2)
-    assert not worker.is_alive()
-    assert results == [Action(ActionType.CHECK)]

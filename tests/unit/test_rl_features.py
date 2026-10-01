@@ -4,6 +4,7 @@ import math
 import random
 
 import pytest
+from support import make_random_legal_bot
 
 from pokerlab.cards.card import Card
 from pokerlab.cards.deck import Deck
@@ -13,7 +14,6 @@ from pokerlab.engine.config import GameConfig
 from pokerlab.engine.state import HandState, PlayerState, Street
 from pokerlab.engine.table import Table
 from pokerlab.players.base import Observation, Player, build_observation
-from pokerlab.players.scripted import make_random_legal_bot
 from pokerlab.rl.action_space import ACTION_DIM, legal_action_mask
 from pokerlab.rl.features import (
     CARDS_DIM,
