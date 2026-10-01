@@ -42,6 +42,7 @@ from pokerlab.gui.spot_table import (
     TableLayout,
     chair_position,
 )
+from pokerlab.vision.regions import BOARD, HOLE_CARDS, load_regions, save_regions
 
 # One wheel notch over a bet or raise amount moves it by this many big blinds.
 WHEEL_STEP_BIG_BLINDS = 1
@@ -176,6 +177,9 @@ class SpotFrame(ttk.Frame):
         self.stack_vars = [tk.StringVar(value="200") for _ in range(CHAIRS)]
         self._default_stack = "200"
         self.status_var = tk.StringVar()
+        self.regions = load_regions()
+        self.vision_var = tk.StringVar()
+        self._preview_images: list[tk.PhotoImage] = []  # Tk drops an image nobody holds
         self.chair_ui: dict[int, SimpleNamespace] = {}
         self.board_buttons: list[tk.Button] = []
         self.hole_buttons: list[tk.Button] = []
@@ -220,6 +224,7 @@ class SpotFrame(ttk.Frame):
         ttk.Label(side, text="Azioni").pack(anchor="w")
         self.log = tk.Text(side, height=8, width=36, state="disabled")
         self.log.pack(fill="x")
+        self._build_vision(side)
         advisors = ttk.LabelFrame(side, text=f"Consiglio dei top {DEFAULT_ADVISORS}", padding=6)
         advisors.pack(fill="both", expand=True, pady=(8, 0))
         self.ask_button = ttk.Button(advisors, text="Chiedi ai modelli", command=self._ask)
@@ -227,6 +232,110 @@ class SpotFrame(ttk.Frame):
         ttk.Label(advisors, textvariable=self.status_var, wraplength=300).pack(anchor="w", pady=2)
         self.advice = tk.Text(advisors, width=36, state="disabled", wrap="word")
         self.advice.pack(fill="both", expand=True)
+
+    # -- the screen ---------------------------------------------------------
+
+    def _build_vision(self, parent: ttk.Frame) -> None:
+        box = ttk.LabelFrame(parent, text="Schermo (vision)", padding=6)
+        box.pack(fill="x", pady=(8, 0))
+        zones = ttk.Frame(box)
+        zones.pack(fill="x")
+        ttk.Button(zones, text="Zona mie carte", command=lambda: self._set_zone(HOLE_CARDS)).pack(
+            side="left", padx=(0, 4)
+        )
+        ttk.Button(zones, text="Zona board", command=lambda: self._set_zone(BOARD)).pack(side="left")
+        actions = ttk.Frame(box)
+        actions.pack(fill="x", pady=(4, 0))
+        ttk.Button(actions, text="Anteprima", command=self._preview).pack(side="left", padx=(0, 4))
+        ttk.Button(actions, text="Salva ritaglio", command=self._save_crops).pack(side="left")
+        ttk.Label(box, textvariable=self.vision_var, wraplength=300, justify="left").pack(
+            anchor="w", pady=(4, 0)
+        )
+        self._update_vision_text()
+
+    def _update_vision_text(self, extra: str = "") -> None:
+        names = {HOLE_CARDS: "mie carte", BOARD: "board"}
+        parts = []
+        for name, label in names.items():
+            region = self.regions.get(name)
+            parts.append(
+                f"{label}: {region.width}x{region.height} a ({region.left}, {region.top})"
+                if region else f"{label}: non impostata"
+            )
+        self.vision_var.set("\n".join(parts) + (f"\n{extra}" if extra else ""))
+
+    def _set_zone(self, name: str) -> None:
+        """Drag a rectangle over the client; it is remembered between sessions."""
+        from pokerlab.vision.capture import VisionUnavailable
+        from pokerlab.vision.selector import select_region
+
+        try:
+            region = select_region(self)
+        except VisionUnavailable as exc:
+            self._update_vision_text(str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001 - a screen grab can fail in many ways
+            self._update_vision_text(f"Cattura non riuscita: {exc}")
+            return
+        if region is None:
+            self._update_vision_text("Selezione annullata.")
+            return
+        self.regions.set(name, region)
+        save_regions(self.regions)
+        self._update_vision_text("Zona salvata.")
+
+    def _capture_zones(self) -> dict:
+        """A frame per configured zone, or an empty dict with the reason shown."""
+        from pokerlab.vision.capture import VisionUnavailable, grab_region
+
+        if not self.regions.regions:
+            self._update_vision_text("Imposta prima almeno una zona.")
+            return {}
+        frames = {}
+        try:
+            for name, region in self.regions.regions.items():
+                frames[name] = grab_region(region)
+        except VisionUnavailable as exc:
+            self._update_vision_text(str(exc))
+            return {}
+        except Exception as exc:  # noqa: BLE001
+            self._update_vision_text(f"Cattura non riuscita: {exc}")
+            return {}
+        return frames
+
+    def _preview(self) -> None:
+        """What the program sees in each zone right now."""
+        import base64
+
+        from pokerlab.vision.capture import frame_to_png_bytes
+
+        frames = self._capture_zones()
+        if not frames:
+            return
+        window = tk.Toplevel(self)
+        window.title("Anteprima delle zone")
+        self._preview_images = []
+        for name, frame in frames.items():
+            ttk.Label(window, text=name).pack(anchor="w", padx=8, pady=(8, 0))
+            image = tk.PhotoImage(data=base64.b64encode(frame_to_png_bytes(frame)).decode("ascii"))
+            self._preview_images.append(image)
+            ttk.Label(window, image=image).pack(padx=8, pady=4)
+        self._update_vision_text(f"{len(frames)} zone catturate.")
+
+    def _save_crops(self) -> None:
+        """Write the zones as PNG files: the examples the recognition is built from."""
+        import time
+
+        from pokerlab.vision.capture import save_png
+        from pokerlab.vision.regions import DEFAULT_REGIONS_PATH
+
+        frames = self._capture_zones()
+        if not frames:
+            return
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        folder = DEFAULT_REGIONS_PATH.parent / "crops"
+        written = [save_png(frame, folder / f"{name}-{stamp}.png") for name, frame in frames.items()]
+        self._update_vision_text(f"Salvati {len(written)} ritagli in {folder}")
 
     def _draw_table(self) -> None:
         cx, cy = CENTER

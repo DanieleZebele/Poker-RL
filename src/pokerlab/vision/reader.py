@@ -1,7 +1,9 @@
 """Design-only stub for a future live table-recognition module: capturing a
 poker application's window and identifying cards/players from the image.
 
-NOT IMPLEMENTED in this session -- signatures and docstrings only. Building
+NOT IMPLEMENTED -- signatures and docstrings only. What does exist is the part
+before recognition: `regions.py` (the zones), `capture.py` (grabbing them) and
+`selector.py` (choosing them with the mouse); see CLAUDE.md, section "Vision". Building
 this requires the `vision` extra (`pip install -e ".[vision]"`, i.e.
 opencv-python/numpy/mss), which is deliberately not part of the core
 install.

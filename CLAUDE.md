@@ -19,9 +19,11 @@ reinforcement-learning poker project. Four planned sections:
    PyTorch actor-critic, self-play PPO with an opponent pool, checkpointing,
    evaluation in bb/100, a Gym-shaped `TablePokerEnv`, and the `poker-train`
    CLI. Requires the `rl` extra. See "RL" below.
-4. **Live table vision** (`src/pokerlab/vision/`) — **stub only.** Same
-   treatment as above, in `reader.py`; requires the `vision` extra
-   (opencv-python/numpy/mss).
+4. **Live table vision** (`src/pokerlab/vision/`) — **step 1 done, recognition
+   not started.** Screen capture (`mss`), a mouse-drag region selector and the
+   zones saved to `checkpoints/vision/regions.json` exist and are wired into the
+   "ask the models" screen; nothing reads a card yet. Requires the `vision` extra
+   (opencv-python/numpy/mss). See "Vision" below.
 5. **GUI for live testing** (`src/pokerlab/gui/`, `players/gui.py`) —
    **implemented.** A Tkinter desktop app (`poker-gui`): a setup screen
    (players/stack/blinds/hands/bot selection, offering trained models the
@@ -2575,6 +2577,49 @@ dependency (Flask, etc.) — it ships with Python. Architecture:
   small face-down backs next to their seat box (folded/busted/self show an
   empty slot there instead).
 
+## Vision (`vision/`)
+
+Goal: fill the spot screen (dealer, your cards, the board, the opponents' actions)
+from the poker client on screen. Started with the cards, and **only as far as
+getting an image of them**: how to recognise the cards is decided once there are
+real crops to look at.
+
+- **`regions.py`** (pure Python): `Region(left, top, width, height)` in pixels of
+  the virtual desktop — the numbers `mss` uses, so they can be negative on a
+  multi-monitor setup — and `RegionConfig`, saved atomically to
+  `checkpoints/vision/regions.json` (`HOLE_CARDS`, `BOARD`). A missing or corrupt
+  file, or one bad entry in it, is "no region", never an error.
+- **`capture.py`**: `list_monitors`, `grab_monitor`, `grab_region` (a BGR `numpy`
+  frame, what OpenCV expects), `frame_to_png_bytes`/`save_png` (through
+  `mss.tools`, **no Pillow**). `mss`/`numpy` are imported inside the functions and
+  a missing extra raises `VisionUnavailable`, so the GUI opens without it. Works
+  with both `mss.MSS` (new) and `mss.mss` (old, deprecated in 10.x).
+- **`selector.py`**: `select_region(parent)` hides pokerlab's own window,
+  photographs the monitor and shows it dimmed full screen; drag a rectangle,
+  Return confirms, Esc cancels. **Tk coordinates and screenshot pixels are not
+  assumed equal** (on a scaled Windows display they differ by the scale factor):
+  `scale_to_pixels` converts by comparing the canvas with the picture. The
+  picture goes to Tk as a PNG through `PhotoImage(data=...)`. A click without a
+  drag is not a selection and leaves the overlay open.
+  **It must always be closable**, which it once was not: the overlay is
+  override-redirect, some Linux window managers give such a window no keyboard
+  focus, and `focus_force` before the window is mapped does nothing — so Return and
+  Esc were ignored on a full-screen window holding the mouse. Now `present()` waits
+  for the window to be mapped (with a time limit; **never `wait_visibility`**, which
+  blocks forever if it never maps), then grabs and focuses it; there are also
+  on-screen Conferma/Annulla buttons, double-click to confirm, right-click to
+  cancel, and a 180 s self-cancel.
+- **In the GUI** (`spot_view.py::_build_vision`): "Zona mie carte", "Zona board",
+  "Anteprima" (shows what is captured now) and "Salva ritaglio" (writes PNGs to
+  `checkpoints/vision/crops/<zone>-<timestamp>.png` — the examples the
+  recognition will be built from).
+- **The client runs on the user's Windows PC**, where pokerlab's GUI also has to
+  run. Keep pokerlab's own window off the captured zones. Not verified on Windows
+  yet; capture and the preview/save path were checked on Linux/X11.
+- **Next, as a direction and not a decision:** template matching with OpenCV
+  (one template per rank and per suit, cut from the crops) if the client draws
+  its cards identically every time; OCR/CNN only if that fails.
+
 ## Setup and running things
 
 Classic venv (not uv — deliberate user preference):
@@ -3150,10 +3195,11 @@ così"). None is a bug; the current behaviour is coherent.
   optional `game: GameConfig` for this: `RLAgentPlayer` normalises its features
   by `big_blind`/`starting_stack`, which an `Observation` deliberately does not
   carry, so seating a model without it raises rather than guessing.
-- **Vision**: implement `TableStateReader` in `vision/reader.py`. It should
-  produce either an `Observation`-compatible read or a `HandHistory`-style
-  record — both integration points already exist, no engine changes needed.
-  Install the `vision` extra first.
+- **Vision**: see the section "Vision (`vision/`)" below for what exists. Next
+  is recognition (`CardRecognizer`, taking a crop and returning cards), then the
+  dealer button and the opponents' actions, each filling the same spot screen. The
+  integration points are unchanged: an `Observation`-compatible read or a
+  `HandHistory`-style record, no engine changes.
 - **GUI**: implemented — see the "GUI" section above, including a visual
   bot builder, opponent card-graphics, a spy toggle, step-through bot
   actions, a scrollable raise slider with pot-fraction shortcuts, a tinted
