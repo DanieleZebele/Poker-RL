@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import gc
 import struct
 import zlib
 
@@ -46,14 +45,9 @@ def png(width: int, height: int) -> bytes:
     )
 
 
-@pytest.fixture(scope="module")
-def root():
-    window = tk.Tk()
-    window.withdraw()
-    yield window
-    gc.collect()
-    window.destroy()
-    gc.collect()
+@pytest.fixture
+def root(app):
+    return app  # the session's one Tk root (tests/conftest.py)
 
 
 def make(root, origin=(0, 0)):

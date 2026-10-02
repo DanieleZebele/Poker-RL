@@ -21,8 +21,9 @@ reinforcement-learning poker project. Four planned sections:
    CLI. Requires the `rl` extra. See "RL" below.
 4. **Live table vision** (`src/pokerlab/vision/`) — **step 1 done, recognition
    not started.** Screen capture (`mss`), a mouse-drag region selector and the
-   zones saved to `checkpoints/vision/regions.json` exist and are wired into the
-   "ask the models" screen; nothing reads a card yet. Requires the `vision` extra
+   zones saved to `vision_data/regions.json` exist, with a screen of their own
+   ("Collect vision data" on the main menu) that collects labelled card crops;
+   nothing reads a card yet. Requires the `vision` extra
    (opencv-python/numpy/mss). See "Vision" below.
 5. **GUI for live testing** (`src/pokerlab/gui/`, `players/gui.py`) —
    **implemented.** A Tkinter desktop app (`poker-gui`): a setup screen
@@ -2297,6 +2298,16 @@ dependency (Flask, etc.) — it ships with Python. Architecture:
     same dialog as always, and if the global registry is missing, empty, or
     has fewer than 6 members with a file still on disk, the list is
     correspondingly shorter (never an error).
+  - **No `checkpoints/` at all (a PC that only cloned the repo, like the
+    Windows box the GUI runs on): the models come from `top_models/`**
+    (`cli/play.py::discover_top_models_folder`, the folder
+    `rl/push_top_models.py` commits: `<label>.pt` + `ratings.json`). It is a
+    fallback inside `discover_global_top_models`/`discover_trained_models`, so
+    the default table, the bot picker and the spot screen's advisors all get it;
+    it applies only when the registry yields nothing, never mixed in.
+    `push_top_models` passes `fallback_dir=None` -- it must not "find" the very
+    copies it is replacing -- and so must any test asserting an empty result,
+    because the tests run from the repo root, where `top_models/` exists.
 - **Busted players disappear from the table**: `TableFrame._hide_seat`
   calls `grid_remove()` (not just blanking the labels) on a seat's box once
   its stack hits 0, called from both `_render_observation` (seat missing
@@ -2518,10 +2529,13 @@ dependency (Flask, etc.) — it ships with Python. Architecture:
   `tk.Tk()` instances in rapid succession *within one process* was flaky
   on this machine's Tcl/Tk install (an intermittent "couldn't read file
   ...button.tcl" error despite the file existing) — `test_gui_app.py`
-  works around it with a single `module`-scoped `PokerGuiApp` fixture that
-  every test's `TableFrame` is parented to, destroying only the `Frame`
-  (not the Tk root) between tests. Follow that pattern for any new Tkinter
-  test rather than creating a fresh `Tk()`/`PokerGuiApp()` per test.
+  works around it with **one session-scoped `app` fixture in
+  `tests/conftest.py`** that every GUI test file shares, destroying only its
+  own frames (not the Tk root) between tests. It used to be one
+  module-scoped root per file; with four GUI files plus the selector's own
+  `tk.Tk()`, a run failed at setup about one time in three with
+  `invalid command name "tcl_findLibrary"`. Never add another `Tk()` or
+  `PokerGuiApp()` fixture: request `app`.
   **Second gotcha, and it fails an unrelated test file**: that fixture must
   `gc.collect()` on the main thread before tearing the root down. Left to
   chance, the frames' `StringVar`s are collected later by whatever thread
@@ -2538,6 +2552,38 @@ dependency (Flask, etc.) — it ships with Python. Architecture:
   then suit, with cards already used disabled. When it is someone's turn their
   action buttons appear on their chair; on yours, with both cards set, the top 5
   global-Elo models answer by themselves.
+  - **Your box hangs from under the felt and the canvas grows to fit it**
+    (`_build_chair` anchors chair 0 "n"; `refresh` ends in `_fit_canvas`, which
+    enlarges the canvas to its contents and the window with it, within the
+    screen, never shrinking). It used to be centred on its chair like the
+    others, and being the tallest -- cards plus actions, 314 px at 125% scaling
+    -- it ran 32 px past the 650 px canvas and cut the last action off.
+  - **Chairs may overlap; nothing is ever cut off, and a press brings a box to
+    the front.** A top chair grows upwards when its actions appear (~100 px to
+    ~245) and used to leave the canvas: `_fit_canvas` now slides the whole table
+    right/down when anything sticks out of the top or left, measured from each
+    chair's *requested* size (`_content_bbox` -- `canvas.bbox` lags right after
+    the buttons are rebuilt). Overlap between neighbours is accepted, at the
+    user's choice: a press anywhere on a box, buttons included, `lift()`s it
+    (`_make_raisable`: a per-chair bindtag placed *first* on every descendant,
+    so the clicked button still works; re-applied after every refresh because
+    the action buttons are rebuilt), and whoever is to act is lifted
+    automatically. The tag is a process-unique counter, never `winfo_id()`:
+    Windows reuses handles, so a new chair inherited a destroyed one's binding
+    whose `lift()` failed and aborted the script. Tk delivers no pointer events
+    to a withdrawn root, so the tests for this `deiconify()` for their duration.
+  - **Every amount on the spot screen is in big blinds** (at the user's
+    request): pot, bets on the chairs, action buttons, the raise field and its
+    wheel, the log, the models' advice and the status line, written as the
+    client writes them ("18,5 BB", comma decimals). The engine still counts
+    chips at fixed blinds of 1/2 (`ENGINE_SMALL_BLIND`/`ENGINE_BIG_BLIND`, the
+    blinds the models trained at; one chip = 0,5 BB) and converts only at the
+    edges: `spot.format_bb`/`bb_number` to show, `spot.parse_bb` to read input
+    (comma or dot, rounded to the nearest chip). The small/big blind entries
+    are gone -- "Blind 0,5 / 1 BB" is a fixed label -- and stacks are typed in
+    BB (default 100 = 200 chips). `describe_action` takes an optional
+    `big_blind`; without it it still speaks chips. Gotcha: never `.capitalize()`
+    a label with "BB" in it -- it lowercases the rest.
   - **The dealer button is the order of play.** `TableLayout.order()` lists the
     occupied chairs clockwise (as seen on screen) from the dealer, and those are
     engine seats 0, 1, 2, ... — which is why no seat number is ever typed. Chairs
@@ -2587,7 +2633,7 @@ real crops to look at.
 - **`regions.py`** (pure Python): `Region(left, top, width, height)` in pixels of
   the virtual desktop — the numbers `mss` uses, so they can be negative on a
   multi-monitor setup — and `RegionConfig`, saved atomically to
-  `checkpoints/vision/regions.json` (`HOLE_CARDS`, `BOARD`). A missing or corrupt
+  `vision_data/regions.json` (`HOLE_CARDS`, `BOARD`; outside `checkpoints/` on purpose, next to the crops). A missing or corrupt
   file, or one bad entry in it, is "no region", never an error.
 - **`capture.py`**: `list_monitors`, `grab_monitor`, `grab_region` (a BGR `numpy`
   frame, what OpenCV expects), `frame_to_png_bytes`/`save_png` (through
@@ -2609,16 +2655,300 @@ real crops to look at.
   blocks forever if it never maps), then grabs and focuses it; there are also
   on-screen Conferma/Annulla buttons, double-click to confirm, right-click to
   cancel, and a 180 s self-cancel.
-- **In the GUI** (`spot_view.py::_build_vision`): "Zona mie carte", "Zona board",
-  "Anteprima" (shows what is captured now) and "Salva ritaglio" (writes PNGs to
-  `checkpoints/vision/crops/<zone>-<timestamp>.png` — the examples the
-  recognition will be built from).
+- **The vision screen is compact and scrolls.** No instructions on it any more,
+  neither at the top nor in the sections (removed at the user's request, for
+  space). The sections sit in a canvas (`VisionFrame.body`) under a fixed title
+  bar and scroll with the wheel anywhere over them: the wheel is bound with
+  `bind_all` because the event goes to the widget under the pointer (a button,
+  a label), `_on_wheel` ignores events outside this screen or from a popup,
+  and `destroy` unbinds so no other screen inherits it. Both wheel families
+  are bound, each to its own direction (`<MouseWheel>` delta, X11
+  `<Button-4/5>`).
+- **In the GUI: a screen of its own** (`gui/vision_view.py::VisionFrame`, the
+  "Collect vision data" button on the main menu, next to "Chiedi ai modelli").
+  It used to be a block inside the spot screen and was moved out at the user's
+  request, so collecting examples does not crowd the table; `vision_view`
+  reuses `CardPicker`/`place_near_pointer` from `spot_view`, never the other way
+  round. Tests in `tests/unit/test_gui_vision.py`. Its buttons: "Zona mie carte", "Zona board",
+  "Anteprima" (shows what is captured now) and "Salva carte" / "Salva board"
+  (one zone each, so a crop of the cards does not need a board zone set; a
+  "Salva tutte" was removed at the user's request) — the examples the
+  recognition is built from.
+- **Dealer button: zones and examples, no recogniser yet.** The "Dealer (6
+  giocatori)" section sets one zone per seat (`regions.dealer_region_name`,
+  `dealer_6_<seat>` in `regions.json`; seat 0 is you at the bottom, then
+  clockwise on screen from your left, the spot screen's chair order; only 6-max
+  so far, the positions differ at 9). "Salva dealer" captures every zone set and
+  opens `DealerLabeler`: all crops side by side, each "Presente"/"Non presente",
+  at most one present (none is fine, between hands). On "Conferma" *every* crop
+  is written -- the absent ones are examples too -- to **`vision_data/dealer/`**
+  with a `{"zone", "dealer": bool}` label (`labels.save_dealer_label`), a folder
+  and a label shape of its own so neither dataset is mistaken for the other.
+  Card actions ("Salva carte/board", the test section) capture only the card
+  zones, never the dealer ones that share the regions file.
+- **Player seats: zones and examples, no recogniser yet.** The "Giocatori (6
+  giocatori)" section sets one zone per seat around the player box (avatar,
+  name, stack; `regions.player_region_name`, `player_6_<seat>`, same numbering
+  as the dealer, seat 0 = you included since you can fold too). "Salva
+  giocatori" opens a `SeatLabeler` with one state per seat
+  (`labels.SEAT_STATES`): `in_gioco`, `fuori` (folded, or just joined and
+  waiting), `sit_out` (seated but sitting out; added at the user's request) and
+  `libero` (empty seat); every crop is written on Conferma to
+  **`vision_data/players/`** with `{"zone", "state"}`
+  (`labels.save_player_label`). Each seat starts from the state it was given
+  last time (`VisionFrame.last_seat_states`), since between captures only a
+  seat or two changes; the very first capture starts blank and Conferma waits
+  until every seat has a state.
+  - **Recognition: `vision/seats.py`, colour rules plus one template**
+    (`python -m pokerlab.vision.seats` lists every crop where rule and label
+    disagree -- the place to find a mislabelled example). Measured on 72 crops:
+    an opponent in the hand shows pink-magenta card backs (share up to 0.59, 0
+    for every other state; threshold 0.10); seat 0 in the hand is read from the
+    white of *your* face-up cards (0.08-0.09 live, 0.00-0.02 folded and dimmed;
+    threshold 0.05 -- not their colours, which a hand of two black spades
+    lacks); an empty seat shows a green chair outline (0.026, 0 otherwise);
+    sit-out is the grey "SIT OUT" pill, matched by shape against the lettering
+    of labelled sit-out crops (`sit_out_templates`), so that one state needs an
+    example; anything else is "fuori". Result: 70/72, and both misses were
+    labels carried over wrongly by the remembered default, not rule errors.
+    Caveat: the two sit-out examples are the same seat, near-identical, so the
+    template's reach to other seats is unverified (others score <= 0.26
+    against a 0.6 threshold).
+  - **Wired into the spot screen's 0.5 s scan** (`ScreenReader._read_seats`,
+    `ScreenReading.seats`). Seated = every seat but `libero`/`sit_out`
+    (`screen_reader.seated_seats`): a folded player is still at the table, and
+    one picture cannot tell "out, folded" from "out, waiting to join", so a
+    newcomer is seated until the next hand. **Seating is applied only at a new
+    hand** (button moved, new hole cards) or on the first reading -- mid-hand
+    it would wipe the actions being typed every time someone stood up -- and
+    only on the chairs mapped to client seats. **Folds show at once**:
+    `_mark_seat_states` tags a seated player read `fuori`/`sit_out` ("fold",
+    grey border), but never inserts a FOLD into the actions, because *when* in
+    the sequence they folded is unknown. The button is put back on its chair
+    if seating moved it.
+  - **One screen grab per reading** (`capture.grab_regions`: the bounding
+    rectangle of every zone, captured once and cut up). Fourteen
+    `grab_region`s -- 2 card zones, 6 dealer, 6 player -- took 233 ms on the Tk
+    thread every 2 s, a visible stutter; one grab takes ~60 ms.
+  - **Dealer and player zones are separate and read separately**: the button
+    only in `dealer_*` zones, the seat state only in `player_*` zones. They
+    once *looked* merged because the dealer zone of seat 5 had been redrawn
+    round that player's whole box (149x111 against the usual ~38x37) -- the
+    two sections' buttons were both labelled "Posto 5". Now they read
+    "Gettone N" / "Giocatore N", the selector overlay names the zone being set
+    (`select_region(label=...)`), and a dealer zone with a side over
+    `regions.DEALER_ZONE_MAX_SIDE` (80) is flagged in the vision screen and
+    **skipped by `ScreenReader`**, since a player box contains a gold stack
+    chip that the dealer rule would take for the button.
+  - `SeatLabeler` is the one labelling window for per-seat states;
+    `DealerLabeler` is it with "Presente"/"Non presente" and an
+    at-most-one-present check.
+- **Bets and pot: zones and examples, no recogniser yet.** The "Puntate e
+  piatto (6 giocatori)" section sets a `pot` zone and one `bet_6_<seat>` per
+  seat (`regions.POT`, `regions.bet_region_name`), round where the number is
+  written. "Salva puntate" opens `AmountLabeler`: the crops side by side, pot
+  first, each with a text field for the amount **exactly as written on screen**
+  -- separators and K/M suffixes kept, "" for nothing shown -- because how the
+  client writes numbers is what a reader has to learn (`labels.AMOUNT_PATTERN`
+  allows digits, `.`/`,` and an optional K/M). Written on Conferma to
+  **`vision_data/amounts/`** as `{"zone", "text"}` (`labels.save_amount_label`).
+- **Reading them: `vision/amounts.py`** (`python -m pokerlab.vision.amounts`,
+  leave-one-out). The client writes the amount in big blinds, white on a dark
+  pill, **always followed by "BB"**, decimals with a **comma** ("18,5 BB");
+  labels hold the number only. White blobs left to right; the last two are the
+  "BB" (a reading not ending in two B-height blobs is not trusted); a blob under
+  `COMMA_MAX_HEIGHT` of the digit height is the comma; each other blob is a
+  digit, 1-NN by normalised correlation (`recognize.normalise_glyph`). A zone
+  with no blob as tall as a digit (`DIGIT_MIN_HEIGHT`) is "no amount" -- chips
+  lying there have white stripes, 3-5 px against ~18.
+  - **Two-stage digit match, measured.** The card ranks are the same typeface:
+    on their own they read 14/14 bet digits. But pooled with the bets' digits
+    they lose (a bet "5" out-matched a card "6", 0.73 vs 0.70), so: the bets'
+    own digits first, and only when their best match is below `OWN_SURE` 0.8
+    (right answers scored >= 0.865, wrong <= 0.73) the card ranks alone. That
+    covers digits 2-9 never seen in a bet; 0 and 1 have no card source (a ten
+    is one merged glyph).
+  - **Loops decide 3 vs 8** (`glyph_holes`, applied in `_Matcher`): candidates
+    are restricted to examples with the same number of closed loops -- 8 has
+    two; 0, 4, 6, 9 one; 1, 2, 3, 5, 7 none, measured identical for every
+    example in the bets *and* the card ranks. Correlation alone was a coin toss
+    between them (same right half): even with six 3s labelled, a 3 one pixel
+    taller than the others scored 0.825 on the 3s and 0.830 on the 8s. A ±1 px
+    shift-tolerant match tied them exactly and grey-level glyphs halved the
+    margin on every other digit, so both were rejected. If no example shares
+    the loop count (a stray mark broke a loop) all are considered again.
+  - **Measured: 152/154 leave-one-out**, and both misses are *labels* left
+    empty on crops that plainly show "7 BB" and "1 BB" (same capture,
+    `…025541`), not reading errors.
+  - The vision screen's amounts "Anteprima" captions each zone with its reading.
+- **Stacks: zones, examples, a reader awaiting its first crops.** The "Stack (6
+  giocatori)" section sets `stack_6_<seat>` zones (`regions.stack_region_name`)
+  and labels crops like the amounts (`AmountLabeler`, `labels.STACKS_DIR` =
+  `vision_data/stacks/`, same `{"zone", "text"}` shape). **The stacks are
+  written in yellow** (the user's word), so `amounts.text_mask` picks the
+  lettering's colour by zone -- `yellow_mask` for `stack_*`, white otherwise --
+  and then everything is shared: digits are compared as black-and-white
+  shapes, so white bet digits and yellow stack digits lend each other examples
+  (`build_reader` is fed both folders; `python -m pokerlab.vision.amounts`
+  checks both). Both assumptions made before any stack was seen held on the
+  first 24 crops: the yellow band (`YELLOW_HUE` 15-40, S > 80, V > 140)
+  isolates the lettering cleanly, and a stack is written "103,5 BB" like a bet
+  (`STACK_SUFFIX_BLOBS` = 2). **Measured: 177/178 bets+stacks leave-one-out**,
+  the miss being a label ("0" on an empty seat). Evaluate the two folders
+  *together*: run on `vision_data/stacks` alone, the only stack "0" had no
+  example left once excluded and read as 6 -- an artefact of the check, not
+  of the app, which pools both. Live, a full reading with stacks takes ~76 ms.
+  - The spot screen sets each seated player's stack **at a new hand only**,
+    with the seating (`SpotFrame._apply_stacks`): the stack shown plus the
+    chips already in front (the blinds, preflop). Never mid-hand: the chair's
+    field (now labelled "inizio BB") is the hand's *starting* stack, and the
+    engine takes every bet off it itself, so rewriting it after a bet would
+    take that bet off twice. Stacks are still *read* every 0.5 s, for a
+    check: each chair shows "resta X BB" -- what the engine leaves it -- and
+    "≠ schermo Y BB" when the stack read now differs (`_screen_stacks`,
+    redrawn whenever it moves), which is how a missed or misread action shows.
+    (The user once took the missing live stack for a reading that "did not
+    update after the bets"; it was being read, just not shown.)
+- **The spot screen rebuilds the actions from the screen** (at the user's
+  choice over a show-and-compare mode): `gui/action_sync.py`, pure Python over
+  `gui/spot.py`, run on every 0.5 s reading after cards/seats/dealer are applied
+  (`SpotFrame._sync_actions`). `ScreenReader` now also reads every bet zone and
+  the pot, in big blinds (`ScreenReading.bets`/`.pot`); the spot converts them
+  to chips with its own big blind.
+  - **States, not events.** Several players can act between two readings, so
+    nothing tries to *see* an action: while the engine's player to act can be
+    proven to have acted already, that action is appended and the engine asked
+    again; the first seat with no proof stops it until the next reading. Proof:
+    out of the hand -> FOLD (after first matching chips already put in);
+    chips in front above the engine's -> CALL / BET / RAISE to that amount /
+    ALL_IN; the board further on than the engine's street -> the street closed,
+    so CALL facing a bet, CHECK otherwise; someone due *after* this seat has
+    acted -> with chips unchanged it can only have been a CHECK. An action the
+    engine refuses, or an amount it cannot make, stops it without inventing.
+  - **Your countdown bar proves the checks.** A check leaves nothing on the
+    table, so a round of checks used to be discovered only when the next card
+    came. The vision screen's "Mio turno (barra del tempo)" section collects a
+    `turn_timer` zone with "Presente"/"Non presente" crops
+    (`vision_data/turn/`, `labels.save_turn_label`); `vision/turn.py` reads it
+    with a **fixed colour rule** (it started as a provisional 1-NN on
+    thumbnails, replaced once the crops were seen): the bar is bright green on
+    a dark track, measured 28-39 % saturated-and-bright pixels with it and
+    exactly 0 % without, so `PRESENT_SHARE` is 1 % -- low enough for a bar
+    nearly spent -- and *any* hue counts, since countdown bars commonly turn
+    yellow then red. Needs no examples (`python -m pokerlab.vision.turn` checks
+    it on the labelled ones; 4/4). `ScreenReading.my_turn` feeds
+    `TableView.my_turn`: while it is up and the engine still waits on a seat
+    before yours, that seat acted -- a CHECK with chips unchanged, a FOLD if
+    out; facing a bet with nothing changed it is still not guessed.
+  - **No "Chiedi ai modelli" button inside the spot screen** (removed at the
+    user's request): the models answer by themselves whenever it is your turn
+    with both cards known. The main menu's "Chiedi ai modelli (spot)" button,
+    which opens the screen, stays.
+  - **The client's pot excludes the current bets** (measured: empty preflop
+    with the blinds out, 8.5 BB with 8 and 2 BB still in front). So the check
+    `_pot_check` compares pot + bets in front with the engine's pot and prints
+    "ATTENZIONE piatto" on a mismatch -- which is how a reconstruction gone
+    wrong shows.
+  - **Limits, by construction**: a raise swept into the pot before any reading
+    saw it is invisible (the street then reads as calls; the pot check flags
+    it); stacks are not read, so the spot's stack setting decides what an
+    all-in is; the hero's own action is taken the same way, from the screen.
+    Manual edits are overridden by the screen on the next reading, since the
+    screen is the source of truth. Tests: `tests/unit/test_gui_action_sync.py`
+    and the spot-frame test in `test_gui_screen_reader.py`.
+- **Dealer recognition: `vision/dealer.py`, a fixed colour rule.** The button
+  is a gold disc with a "D" on green felt: share of gold pixels (HSV H 15-35,
+  S >= 100, V >= 120) >= `PRESENT_FRACTION` 0.20. Measured on 24 labelled crops:
+  present 58-66 %, absent exactly 0 % (felt H 67-70); 24/24, and read right
+  live on a seat with no "present" example at all -- the rule needs none.
+  `find_dealer` takes the most gold zone and flags `ambiguous` if several pass.
+  `python -m pokerlab.vision.dealer` checks it on `vision_data/dealer/`. Shown
+  in the vision screen's dealer "Anteprima" (gold share per seat).
+- **The spot screen reads the dealer in the same 0.5 s scan** (`ScreenReader`
+  `._read_dealer`, `ScreenReading.dealer` = client seat). Client 6-max seats map
+  to the spot's 9 chairs by nearest angle (`spot_table.CLIENT_SEAT_CHAIRS[6]` =
+  0,2,3,4,6,7; seat 3, straight across, falls between chairs 4 and 5 and 4 was
+  picked). A move puts the button on that chair, **seating a player there if it
+  was empty** (the button is always in front of someone), and clears the
+  actions (a new hand). Compared with the *last seat it was seen on*
+  (`_last_dealer`), so the button vanishing between hands and reappearing on
+  the same seat is not a move, and a manual dealer correction sticks. An
+  ambiguous reading is not applied. The dealer is read even when no card crop
+  exists yet, since its rule needs no examples.
+- **A crop is written only together with its label, on "Conferma"**
+  (`vision_view.py::CropLabeler`, one window per captured zone, in turn). The
+  capture is held in memory; the window shows it and the visible cards are
+  chosen with the same `CardPicker` buttons, **left to right as on screen**, the
+  slots filling in order so a label has no gaps. Conferma stays disabled until
+  the count is valid: hole cards 0 or 2, board 0/3/4/5 (`VALID_COUNTS`). The
+  "Nessuna carta visibile" tick is a real example (folded, street not dealt) and
+  is confirmed the same way; "Annulla" writes nothing. Output goes to
+  **`vision_data/crops/`** (`labels.CROPS_DIR`), deliberately *outside*
+  `checkpoints/`: `<zone>-<timestamp>.png` plus a same-named JSON
+  (`vision/labels.py`, pure Python: `{"zone", "cards": ["Th", "2c", ...]}`).
 - **The client runs on the user's Windows PC**, where pokerlab's GUI also has to
   run. Keep pokerlab's own window off the captured zones. Not verified on Windows
   yet; capture and the preview/save path were checked on Linux/X11.
-- **Next, as a direction and not a decision:** template matching with OpenCV
-  (one template per rank and per suit, cut from the crops) if the client draws
-  its cards identically every time; OCR/CNN only if that fails.
+- **Card recognition: `vision/recognize.py`, pattern matching, no network.**
+  `python -m pokerlab.vision.recognize` scores it on `vision_data/crops/` by
+  leave-one-image-out (each crop read by a recogniser built from all the others);
+  `--image <png>` reads one crop. The client uses a **four-colour deck**
+  (spades dark grey, hearts red, diamonds blue, clubs green) on a fixed layout:
+  - **Slices**: board 5 equal fifths; hand **not** halved but cut at 0.47
+    (`SLOT_EDGES`). The right hole card overlaps the left and its rank starts at
+    ~83/170 px, so an exact half left a 2-px sliver in the left slice that was
+    read as its rank: 11 of 31 hands wrong, all on the left card.
+  - **Empty slot**: white-pixel share below 0.06 (empty measured up to 0.027,
+    cards from 0.10). The board stops at its first gap; a hand is 2 cards or none.
+  - **Rank**: topmost white blob *starting in the left 40% of the slice*, plus
+    blobs touching it on the same row (a ten's two digits), padded square to
+    32x32 and matched by normalised correlation, 1-NN over every labelled glyph
+    (left, right and board pooled -- the slight rotations are covered by
+    examples, not modelled). The left-40% and touching rules come from a client
+    animation (a player's reaction) drawn white over a 9h, higher than the rank,
+    which the looser "whole row" rule merged into a ten.
+  - **Suit**: the card's background colour by a **fixed rule** (`SUIT_RULES`,
+    at the user's request, replacing a nearest-labelled-colour match): spades
+    black, diamonds blue, clubs bright green, hearts red; the symbols on top are
+    white. Read as the median non-white colour around the rank glyph. Measured
+    bands (HSV): spades S<=38 V 57-64, hearts H 3-4, clubs H 59-60 S ~200,
+    diamonds H 106-108; the felt sits at H 66-90 S 45-165, so clubs are told
+    from it by hue *and* saturation. The rule's bands are much wider than
+    measured and still do not overlap. A colour matching none reads as suit "?".
+    Rank and suit are matched **separately**, so a card never collected whole
+    (Qh, at the time) is still read, and a suit needs no examples at all.
+  - **Measured on 65 real crops**: 189/189 cards; the right rank correlates
+    >= 0.91 and beats the best wrong rank by >= 0.14 (closest: 5 vs 6, 3 vs 8);
+    with the colour rule, 205/205 on 73 crops.
+  - **No test section in the vision screen any more.** A "Test vision model"
+    section that read every zone on demand was removed at the user's request:
+    readings are checked in the spot screen, which reads every zone every 0.5 s.
+    What stays is an **"Anteprima" per section** (`_preview` card zones only,
+    `_preview_dealer`, `_preview_players`, all through `_show_preview`), which
+    shows that section's zones side by side as captured now, captioned with the
+    quick reading (gold share for the button, the seat state for a player).
+  - **The spot screen reads the screen by itself every 0.5 s** (`SCREEN_POLL_MS`, 2 s until
+    the user asked for it faster;
+    no button, at the user's request): `gui/screen_reader.py` (no Tk) captures
+    both zones and recognises them; `SpotFrame.apply_reading` puts them into the
+    spot. Measured live: 31 ms a reading (350 ms the first, which builds the
+    recogniser), so it runs on the Tk thread with no worker. Rules, each tested:
+    - **Applied only when the *screen* changed** (`diff_reading` compares with
+      the previous reading, not with the spot), so a manual correction sticks
+      until the client shows something else.
+    - **Different hole cards = new hand: the actions are cleared** (they belonged
+      to the last hand); seats, stacks and dealer stay. Recognised across a fold
+      (cards, none, other cards), and the same cards returning after a flicker
+      are not a new hand (`last_hand`).
+    - **Doubtful readings are not applied**: a suit "?", a card read in both hand
+      and board, a board of 1-2 cards (the flop mid-animation). The line under
+      the situation shows the reading, the time and any such problem.
+    - The recogniser is rebuilt when the number of crops changes, and the zones
+      are re-read every tick, so both can be updated from the vision screen
+      without reopening this one. A missing vision extra stops the polling.
+    - `SpotFrame(read_screen=...)` defaults to **off**; only `app.show_spot`
+      turns it on. Tests must leave it off (`show_spot(read_screen=False)`), or
+      they photograph whatever screen they happen to run on.
 
 ## Setup and running things
 

@@ -16,6 +16,7 @@ engine reached rather than something this frame tracked.
 
 from __future__ import annotations
 
+import itertools
 import tkinter as tk
 from tkinter import messagebox, ttk
 from types import SimpleNamespace
@@ -29,9 +30,12 @@ from pokerlab.gui.spot import (
     Spot,
     SpotState,
     advise,
+    bb_number,
     describe_action,
+    format_bb,
     format_card,
     load_advisors,
+    parse_bb,
     parse_card,
     position_names,
     replay,
@@ -40,15 +44,31 @@ from pokerlab.gui.spot_table import (
     CHAIRS,
     USER_CHAIR,
     TableLayout,
+    chair_for_client_seat,
     chair_position,
 )
-from pokerlab.vision.regions import BOARD, HOLE_CARDS, load_regions, save_regions
 
 # One wheel notch over a bet or raise amount moves it by this many big blinds.
 WHEEL_STEP_BIG_BLINDS = 1
+# The engine's blinds in chips: one chip is half a big blind. Fixed, since every
+# amount on screen is in big blinds; these are the blinds the models trained at.
+ENGINE_SMALL_BLIND = 1
+ENGINE_BIG_BLIND = 2
+DEFAULT_STACK_BB = "100"
+# How often the hand and the board are read off the poker client.
+# Half a second, at the user's request (it was 2 s): a reading costs ~60 ms on
+# the Tk thread (one grab of every zone, see `capture.grab_regions`), so this
+# keeps the screen ~88% free, and catches a raise before it is swept into the pot.
+SCREEN_POLL_MS = 500
+# How a seat state read off the screen is shown (`vision.labels.SEAT_STATES`).
+SEAT_STATE_LABELS = {"in_gioco": "in gioco", "fuori": "fold", "sit_out": "sit-out", "libero": "liberi"}
+SEAT_MARKS = {"fuori": "fold", "sit_out": "sit-out"}  # tagged on a seated player's chair
+OUT_OF_HAND = "#9e9e9e"
 
 CANVAS_WIDTH = 860
 CANVAS_HEIGHT = 650
+# Space kept between the outermost chair and the edge of the canvas.
+CANVAS_MARGIN = 8
 CENTER = (CANVAS_WIDTH / 2, 300)
 # Where the chairs sit, and the (smaller) felt inside them.
 CHAIR_RADII = (340, 225)
@@ -79,6 +99,87 @@ def card_color(card: Card | None) -> str:
     return "black"
 
 
+def _monitor_bounds(x: int, y: int, fallback: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    """`(left, top, right, bottom)` of the work area of the monitor holding the
+    point, so a popup is kept on the screen the mouse is on. Windows only (the
+    process is DPI-aware, see `app._make_windows_dpi_aware`, so these are the
+    same pixels Tk uses); anywhere else, or if the call fails, `fallback`."""
+    import sys
+
+    if sys.platform != "win32":
+        return fallback
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("rcMonitor", wintypes.RECT),
+                ("rcWork", wintypes.RECT),
+                ("dwFlags", wintypes.DWORD),
+            ]
+
+        monitor = ctypes.windll.user32.MonitorFromPoint(wintypes.POINT(x, y), 2)  # nearest
+        info = MONITORINFO(cbSize=ctypes.sizeof(MONITORINFO))
+        if not ctypes.windll.user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            return fallback
+        work = info.rcWork
+        return (work.left, work.top, work.right, work.bottom)
+    except (AttributeError, OSError):
+        return fallback
+
+
+_raise_tags = itertools.count()
+
+
+def _raise_tag(holder: tk.Widget) -> str:
+    """A bindtag unique to this holder for the life of the process. Not
+    `winfo_id()`: Windows reuses window handles, so a new chair could inherit a
+    destroyed one's class binding -- whose `lift()` then fails and aborts the
+    binding script before the new one runs."""
+    if not hasattr(holder, "_raise_tag"):
+        holder._raise_tag = f"RaiseChair{next(_raise_tags)}"
+    return holder._raise_tag
+
+
+def _make_raisable(holder: tk.Widget) -> None:
+    """Make a press anywhere on `holder` -- its own background or any widget in
+    it, a button included -- bring it in front of the chairs it overlaps.
+
+    Chairs are canvas windows, and overlapping embedded windows stack by widget
+    order, not by canvas item order, so `lift()` on the holder is what raises it.
+    Done with an extra bindtag, placed first, on every descendant: the press
+    raises the box and then carries on to the widget's own bindings, so the
+    button that was clicked still does its job. Re-run after the action buttons
+    are rebuilt, which `refresh` does at every step; a widget already tagged is
+    left alone."""
+    tag = _raise_tag(holder)
+    stack = [holder]
+    while stack:
+        widget = stack.pop()
+        tags = widget.bindtags()
+        if tag not in tags:
+            widget.bindtags((tag, *tags))
+        stack.extend(widget.winfo_children())
+
+
+def place_near_pointer(window: tk.Toplevel) -> tuple[int, int]:
+    """Open `window` where the mouse is -- centred on it horizontally, just
+    below it -- instead of wherever the window manager drops it (the top-left
+    corner of the first screen, on Windows). Kept inside that monitor."""
+    window.update_idletasks()
+    x, y = window.winfo_pointerxy()
+    width, height = window.winfo_reqwidth(), window.winfo_reqheight()
+    left, top, right, bottom = _monitor_bounds(
+        x, y, (0, 0, window.winfo_screenwidth(), window.winfo_screenheight())
+    )
+    px = min(max(x - width // 2, left), max(left, right - width))
+    py = min(max(y - 20, top), max(top, bottom - height))
+    window.geometry(f"+{px}+{py}")
+    return px, py
+
+
 class CardPicker(tk.Toplevel):
     """A popup with a button per rank and then a button per suit.
 
@@ -99,6 +200,7 @@ class CardPicker(tk.Toplevel):
         self.body = ttk.Frame(self, padding=10)
         self.body.pack()
         self._show_ranks()
+        place_near_pointer(self)
         try:
             self.grab_set()
         except tk.TclError:  # no display to grab on (headless tests)
@@ -157,7 +259,10 @@ class CardPicker(tk.Toplevel):
 
 
 class SpotFrame(ttk.Frame):
-    def __init__(self, master) -> None:
+    def __init__(self, master, *, read_screen: bool = False) -> None:
+        """`read_screen` starts reading the hand and the board off the poker
+        client every `SCREEN_POLL_MS` (the app turns it on; tests leave it off,
+        or they would photograph whatever screen they run on)."""
         super().__init__(master, padding=8)
         self.app = master
         self.layout = TableLayout()
@@ -167,37 +272,46 @@ class SpotFrame(ttk.Frame):
         self.hole: list[Card | None] = [None, None]
         self.board: list[Card] = []
 
-        self.stack_var = tk.StringVar(value="200")
-        self.sb_var = tk.StringVar(value="1")
-        self.bb_var = tk.StringVar(value="2")
+        # Every amount on this screen is in big blinds. Underneath, the engine
+        # counts chips at blinds of 1/2 -- one chip is half a big blind, and these
+        # are the blinds the models were trained at -- and the conversion happens
+        # only at the edges (`format_bb` to show, `parse_bb` to read input).
+        self.stack_var = tk.StringVar(value=DEFAULT_STACK_BB)
+        self.sb_var = tk.StringVar(value=str(ENGINE_SMALL_BLIND))
+        self.bb_var = tk.StringVar(value=str(ENGINE_BIG_BLIND))
         self.name_vars = [
             tk.StringVar(value="Tu" if chair == USER_CHAIR else f"Avv. {chair}")
             for chair in range(CHAIRS)
         ]
-        self.stack_vars = [tk.StringVar(value="200") for _ in range(CHAIRS)]
-        self._default_stack = "200"
+        self.stack_vars = [tk.StringVar(value=DEFAULT_STACK_BB) for _ in range(CHAIRS)]
+        self._default_stack = DEFAULT_STACK_BB
         self.status_var = tk.StringVar()
-        self.regions = load_regions()
-        self.vision_var = tk.StringVar()
-        self._preview_images: list[tk.PhotoImage] = []  # Tk drops an image nobody holds
         self.chair_ui: dict[int, SimpleNamespace] = {}
         self.board_buttons: list[tk.Button] = []
         self.hole_buttons: list[tk.Button] = []
+        self.screen_var = tk.StringVar(value="Schermo: lettura spenta")
+        self._reader = None
+        self._last_reading = None
+        self._last_hand: list[str] | None = None
+        self._last_dealer: int | None = None  # client seat of the button last seen
+        self._seat_states: dict[int, str] = {}  # chair -> state, from the last reading
+        self._seating_read = False  # whether the seats have been taken off the screen yet
+        self._sync_note = ""  # what the last action rebuild did, for the status line
+        self._screen_stacks: dict[int, float] = {}  # chair -> stack read now, in BB
+        self._screen_job: str | None = None
 
         self._build()
         self.refresh()
+        if read_screen:
+            self._start_screen_reading()
 
     # -- layout -------------------------------------------------------------
 
     def _build(self) -> None:
         top = ttk.Frame(self)
         top.pack(side="top", fill="x", pady=(0, 6))
-        for label, var in (("Small blind", self.sb_var), ("Big blind", self.bb_var)):
-            ttk.Label(top, text=label).pack(side="left", padx=(0, 3))
-            entry = ttk.Entry(top, textvariable=var, width=6)
-            entry.pack(side="left", padx=(0, 10))
-            entry.bind("<Return>", lambda _e: self.refresh())
-        ttk.Label(top, text="Stack di partenza").pack(side="left", padx=(0, 3))
+        ttk.Label(top, text="Blind 0,5 / 1 BB").pack(side="left", padx=(0, 12))
+        ttk.Label(top, text="Stack di partenza (BB)").pack(side="left", padx=(0, 3))
         stack = ttk.Entry(top, textvariable=self.stack_var, width=8)
         stack.pack(side="left", padx=(0, 10))
         stack.bind("<Return>", lambda _e: self._default_stack_changed())
@@ -221,121 +335,18 @@ class SpotFrame(ttk.Frame):
         self.warning.pack(anchor="w")
         self.situation = ttk.Label(side, justify="left", font=("TkDefaultFont", 10, "bold"))
         self.situation.pack(anchor="w", pady=(2, 4))
+        ttk.Label(side, textvariable=self.screen_var, foreground="#555555", wraplength=300,
+                  justify="left").pack(anchor="w", pady=(0, 4))
         ttk.Label(side, text="Azioni").pack(anchor="w")
         self.log = tk.Text(side, height=8, width=36, state="disabled")
         self.log.pack(fill="x")
-        self._build_vision(side)
         advisors = ttk.LabelFrame(side, text=f"Consiglio dei top {DEFAULT_ADVISORS}", padding=6)
         advisors.pack(fill="both", expand=True, pady=(8, 0))
-        self.ask_button = ttk.Button(advisors, text="Chiedi ai modelli", command=self._ask)
-        self.ask_button.pack(anchor="w")
+        # No "ask" button (removed at the user's request): the models answer by
+        # themselves whenever it is your turn with both your cards known.
         ttk.Label(advisors, textvariable=self.status_var, wraplength=300).pack(anchor="w", pady=2)
         self.advice = tk.Text(advisors, width=36, state="disabled", wrap="word")
         self.advice.pack(fill="both", expand=True)
-
-    # -- the screen ---------------------------------------------------------
-
-    def _build_vision(self, parent: ttk.Frame) -> None:
-        box = ttk.LabelFrame(parent, text="Schermo (vision)", padding=6)
-        box.pack(fill="x", pady=(8, 0))
-        zones = ttk.Frame(box)
-        zones.pack(fill="x")
-        ttk.Button(zones, text="Zona mie carte", command=lambda: self._set_zone(HOLE_CARDS)).pack(
-            side="left", padx=(0, 4)
-        )
-        ttk.Button(zones, text="Zona board", command=lambda: self._set_zone(BOARD)).pack(side="left")
-        actions = ttk.Frame(box)
-        actions.pack(fill="x", pady=(4, 0))
-        ttk.Button(actions, text="Anteprima", command=self._preview).pack(side="left", padx=(0, 4))
-        ttk.Button(actions, text="Salva ritaglio", command=self._save_crops).pack(side="left")
-        ttk.Label(box, textvariable=self.vision_var, wraplength=300, justify="left").pack(
-            anchor="w", pady=(4, 0)
-        )
-        self._update_vision_text()
-
-    def _update_vision_text(self, extra: str = "") -> None:
-        names = {HOLE_CARDS: "mie carte", BOARD: "board"}
-        parts = []
-        for name, label in names.items():
-            region = self.regions.get(name)
-            parts.append(
-                f"{label}: {region.width}x{region.height} a ({region.left}, {region.top})"
-                if region else f"{label}: non impostata"
-            )
-        self.vision_var.set("\n".join(parts) + (f"\n{extra}" if extra else ""))
-
-    def _set_zone(self, name: str) -> None:
-        """Drag a rectangle over the client; it is remembered between sessions."""
-        from pokerlab.vision.capture import VisionUnavailable
-        from pokerlab.vision.selector import select_region
-
-        try:
-            region = select_region(self)
-        except VisionUnavailable as exc:
-            self._update_vision_text(str(exc))
-            return
-        except Exception as exc:  # noqa: BLE001 - a screen grab can fail in many ways
-            self._update_vision_text(f"Cattura non riuscita: {exc}")
-            return
-        if region is None:
-            self._update_vision_text("Selezione annullata.")
-            return
-        self.regions.set(name, region)
-        save_regions(self.regions)
-        self._update_vision_text("Zona salvata.")
-
-    def _capture_zones(self) -> dict:
-        """A frame per configured zone, or an empty dict with the reason shown."""
-        from pokerlab.vision.capture import VisionUnavailable, grab_region
-
-        if not self.regions.regions:
-            self._update_vision_text("Imposta prima almeno una zona.")
-            return {}
-        frames = {}
-        try:
-            for name, region in self.regions.regions.items():
-                frames[name] = grab_region(region)
-        except VisionUnavailable as exc:
-            self._update_vision_text(str(exc))
-            return {}
-        except Exception as exc:  # noqa: BLE001
-            self._update_vision_text(f"Cattura non riuscita: {exc}")
-            return {}
-        return frames
-
-    def _preview(self) -> None:
-        """What the program sees in each zone right now."""
-        import base64
-
-        from pokerlab.vision.capture import frame_to_png_bytes
-
-        frames = self._capture_zones()
-        if not frames:
-            return
-        window = tk.Toplevel(self)
-        window.title("Anteprima delle zone")
-        self._preview_images = []
-        for name, frame in frames.items():
-            ttk.Label(window, text=name).pack(anchor="w", padx=8, pady=(8, 0))
-            image = tk.PhotoImage(data=base64.b64encode(frame_to_png_bytes(frame)).decode("ascii"))
-            self._preview_images.append(image)
-            ttk.Label(window, image=image).pack(padx=8, pady=4)
-        self._update_vision_text(f"{len(frames)} zone catturate.")
-
-    def _save_crops(self) -> None:
-        """Write the zones as PNG files: the examples the recognition is built from."""
-        import time
-
-        from pokerlab.vision.capture import save_png
-        from pokerlab.vision.regions import DEFAULT_REGIONS_PATH
-
-        frames = self._capture_zones()
-        if not frames:
-            return
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        folder = DEFAULT_REGIONS_PATH.parent / "crops"
-        written = [save_png(frame, folder / f"{name}-{stamp}.png") for name, frame in frames.items()]
-        self._update_vision_text(f"Salvati {len(written)} ritagli in {folder}")
 
     def _draw_table(self) -> None:
         cx, cy = CENTER
@@ -360,7 +371,14 @@ class SpotFrame(ttk.Frame):
     def _build_chair(self, chair: int) -> None:
         x, y = chair_position(chair, CENTER, CHAIR_RADII)
         holder = tk.Frame(self.canvas, bg="#2b2b2b")
-        self.canvas.create_window(x, y, window=holder, anchor="center")
+        if chair == USER_CHAIR:
+            # Your box holds your cards *and* your actions, so it is the tallest
+            # (314 px measured at 125% scaling). Centred on its chair it ran off
+            # the bottom of the canvas and cut the last action; it now hangs from
+            # just under the felt and the canvas grows to fit it (`_fit_canvas`).
+            self.canvas.create_window(x, CENTER[1] + TABLE_RADII[1] + 8, window=holder, anchor="n")
+        else:
+            self.canvas.create_window(x, y, window=holder, anchor="center")
         plus = tk.Button(
             holder, text="+", width=3, font=("TkDefaultFont", 12, "bold"),
             command=lambda c=chair: self.add_player(c),
@@ -378,7 +396,10 @@ class SpotFrame(ttk.Frame):
             )
         row = tk.Frame(box, bg="#f4f1ea")
         row.pack(fill="x", pady=1)
-        tk.Label(row, text="stack", bg="#f4f1ea").pack(side="left")
+        # The stack this hand *started* with: the engine takes every bet off it
+        # itself, which is why it is not rewritten from the screen mid-hand. What
+        # is left now is shown under it (`_show_state`, "resta").
+        tk.Label(row, text="inizio BB", bg="#f4f1ea").pack(side="left")
         entry = tk.Entry(row, textvariable=self.stack_vars[chair], width=7)
         entry.pack(side="left", padx=2)
         # Only Return applies a typed value. A FocusOut binding would rebuild the
@@ -400,8 +421,10 @@ class SpotFrame(ttk.Frame):
         actions = tk.Frame(box, bg="#f4f1ea")
         actions.pack(fill="x")
         self.chair_ui[chair] = SimpleNamespace(
-            plus=plus, box=box, dealer=dealer, info=info, actions=actions
+            plus=plus, box=box, dealer=dealer, info=info, actions=actions, holder=holder
         )
+        self.bind_class(_raise_tag(holder), "<ButtonPress-1>", lambda _e, h=holder: h.lift())
+        _make_raisable(holder)
 
     # -- the table ----------------------------------------------------------
 
@@ -481,14 +504,32 @@ class SpotFrame(ttk.Frame):
         except ValueError:
             raise ValueError(f"{name}: serve un numero intero") from None
 
+    def _big_blind(self) -> int:
+        """The engine's big blind in chips (2): what one BB on screen is worth."""
+        return self._number(self.bb_var, "Big blind")
+
+    def _chips(self, var: tk.StringVar, name: str) -> int:
+        """A big-blind amount typed by the user, in the engine's chips."""
+        try:
+            chips = parse_bb(var.get(), self._big_blind())
+        except ValueError:
+            raise ValueError(f"{name}: serve un numero di BB (es. 100 o 37,5)") from None
+        if chips <= 0:
+            raise ValueError(f"{name}: deve essere più di 0 BB")
+        return chips
+
+    def _bb(self, chips: int) -> str:
+        """Chips as big blinds for display ("18,5 BB")."""
+        return format_bb(chips, self._big_blind())
+
     def build_spot(self) -> Spot:
         if self.layout.players < 2:
             raise ValueError("Aggiungi almeno un avversario con il tasto +")
-        default = self._number(self.stack_var, "Stack di partenza")
+        default = self._chips(self.stack_var, "Stack di partenza")
         stacks = {}
         for seat, chair in enumerate(self.layout.order()):
             text = self.stack_vars[chair].get().strip()
-            stacks[seat] = self._number(self.stack_vars[chair], "Stack") if text else default
+            stacks[seat] = self._chips(self.stack_vars[chair], "Stack") if text else default
         hole = tuple(self.hole) if all(card is not None for card in self.hole) else None
         return Spot(
             num_players=self.layout.players,
@@ -506,6 +547,73 @@ class SpotFrame(ttk.Frame):
         return self.name_vars[chair].get().strip() or f"Posto {chair}"
 
     def refresh(self) -> None:
+        try:
+            self._refresh()
+        finally:
+            for ui in self.chair_ui.values():
+                _make_raisable(ui.holder)  # the action buttons were just rebuilt
+            if self.state is not None and not self.state.finished and self.state.to_act is not None:
+                # Whoever acts goes in front, so their actions are never hidden.
+                self.chair_ui[self.layout.chair_of(self.state.to_act)].holder.lift()
+            self._mark_seat_states()
+            self._fit_canvas()
+
+    def _fit_canvas(self) -> None:
+        """Keep every chair on the canvas: slide the whole table right/down when
+        a box would stick out of the top or the left (a chair at the top grows
+        upwards when its actions appear -- ~100 px to ~245 -- and was cut off),
+        then grow the canvas to the rest, and the window with it, within the
+        screen. Never shrinks or slides back, so the table does not jump around."""
+        self.update_idletasks()
+        bbox = self._content_bbox()
+        if bbox is None:
+            return
+        dx, dy = max(0, CANVAS_MARGIN - bbox[0]), max(0, CANVAS_MARGIN - bbox[1])
+        if dx or dy:
+            self.canvas.move("all", dx, dy)
+            bbox = (bbox[0] + dx, bbox[1] + dy, bbox[2] + dx, bbox[3] + dy)
+        width = max(CANVAS_WIDTH, bbox[2] + CANVAS_MARGIN)
+        height = max(CANVAS_HEIGHT, bbox[3] + CANVAS_MARGIN)
+        if (width, height) != (int(self.canvas.cget("width")), int(self.canvas.cget("height"))):
+            self.canvas.configure(width=width, height=height)
+            self.update_idletasks()
+        top = self.winfo_toplevel()
+        want_w = min(top.winfo_reqwidth(), top.winfo_screenwidth() - 40)
+        want_h = min(top.winfo_reqheight(), top.winfo_screenheight() - 80)
+        if want_w > top.winfo_width() or want_h > top.winfo_height():
+            top.geometry(f"{max(want_w, top.winfo_width())}x{max(want_h, top.winfo_height())}")
+
+    def _content_bbox(self) -> tuple[int, int, int, int] | None:
+        """What the canvas holds, from each chair's *requested* size.
+
+        `canvas.bbox` lags here: right after the action buttons are rebuilt it
+        still has the window items at their old size, so a box that had just
+        grown upwards was measured where it used to be and left 7 px off the
+        top. A widget's requested size is current as soon as it is packed."""
+        anchors = {"n": (0.5, 0), "s": (0.5, 1), "center": (0.5, 0.5), "e": (1, 0.5), "w": (0, 0.5),
+                   "nw": (0, 0), "ne": (1, 0), "sw": (0, 1), "se": (1, 1)}
+        boxes = []
+        for item in self.canvas.find_all():
+            if self.canvas.type(item) == "window":
+                widget = self.nametowidget(self.canvas.itemcget(item, "window"))
+                if not widget.winfo_ismapped() and not widget.winfo_reqwidth():
+                    continue
+                x, y = self.canvas.coords(item)
+                fx, fy = anchors[self.canvas.itemcget(item, "anchor")]
+                w, h = widget.winfo_reqwidth(), widget.winfo_reqheight()
+                boxes.append((x - fx * w, y - fy * h, x + (1 - fx) * w, y + (1 - fy) * h))
+            else:
+                box = self.canvas.bbox(item)
+                if box is not None:
+                    boxes.append(box)
+        if not boxes:
+            return None
+        return (
+            round(min(b[0] for b in boxes)), round(min(b[1] for b in boxes)),
+            round(max(b[2] for b in boxes)), round(max(b[3] for b in boxes)),
+        )
+
+    def _refresh(self) -> None:
         for chair, ui in self.chair_ui.items():
             ui.plus.pack_forget()
             ui.box.pack_forget()
@@ -564,10 +672,10 @@ class SpotFrame(ttk.Frame):
         turn_chair = self.layout.chair_of(state.to_act)
         mine = "  <- tocca a te" if state.to_act == spot.my_seat else ""
         self.situation.configure(
-            text=f"{state.street.name.lower()} | piatto {state.pot} | board {board}\n"
+            text=f"{state.street.name.lower()} | piatto {self._bb(state.pot)} | board {board}\n"
             f"Parla: {self._player_name(turn_chair)} ({names[state.to_act]}){mine}"
         )
-        self.canvas.itemconfigure(self.pot_item, text=f"Piatto {state.pot}")
+        self.canvas.itemconfigure(self.pot_item, text=f"Piatto {self._bb(state.pot)}")
         self.canvas.itemconfigure(self.street_item, text=state.street.name.lower())
         self.chair_ui[turn_chair].box.configure(highlightbackground=HIGHLIGHT)
         folded = {
@@ -578,7 +686,14 @@ class SpotFrame(ttk.Frame):
             if seat in folded:
                 text += "  FOLD"
             elif state.bets.get(seat):
-                text += f"  puntata {state.bets[seat]}"
+                text += f"  puntata {self._bb(state.bets[seat])}"
+            if seat in state.stacks:
+                text += f"\nresta {self._bb(state.stacks[seat])}"
+                shown = self._screen_stacks.get(chair)
+                if shown is not None and abs(shown - state.stacks[seat] / self._big_blind()) > 0.01:
+                    # The screen disagrees with what the rebuilt actions leave:
+                    # a missed or misread action, worth a look.
+                    text += f"  ≠ schermo {self._bb(round(shown * self._big_blind()))}"
             self.chair_ui[chair].info.configure(text=text)
         if len(state.board) > len(spot.board):
             self.warning.configure(
@@ -600,45 +715,46 @@ class SpotFrame(ttk.Frame):
     def _action_widget(self, parent: tk.Frame, legal: LegalAction, state: SpotState) -> None:
         if legal.action_type in (ActionType.BET, ActionType.RAISE):
             verb = "Bet" if legal.action_type is ActionType.BET else "Raise a"
-            var = tk.StringVar(value=str(legal.min_amount))
+            big_blind = self._big_blind()
+            var = tk.StringVar(value=bb_number(legal.min_amount, big_blind))
             line = tk.Frame(parent, bg="#f4f1ea")
             line.pack(fill="x", pady=1)
             entry = tk.Entry(line, textvariable=var, width=6)
             entry.pack(side="left")
             self._bind_wheel(entry, var, legal)
 
+            low, high = bb_number(legal.min_amount, big_blind), bb_number(legal.max_amount, big_blind)
+
             def go(legal=legal, var=var) -> None:
                 try:
-                    amount = int(var.get())
+                    amount = parse_bb(var.get(), big_blind)
                 except ValueError:
                     return
                 if not legal.min_amount <= amount <= legal.max_amount:
-                    messagebox.showwarning("Importo", f"Tra {legal.min_amount} e {legal.max_amount}.")
+                    messagebox.showwarning("Importo", f"Tra {low} e {high} BB.")
                     return
                 self._append(Action(legal.action_type, amount))
 
-            button = tk.Button(
-                line, text=f"{verb} ({legal.min_amount}-{legal.max_amount})", command=go
-            )
+            button = tk.Button(line, text=f"{verb} ({low}-{high} BB)", command=go)
             button.pack(side="left", padx=2)
             self._bind_wheel(button, var, legal)
             return
-        label = describe_action(Action(legal.action_type), state.observation).capitalize()
+        label = describe_action(Action(legal.action_type), state.observation, self._big_blind())
+        label = label[:1].upper() + label[1:]  # not .capitalize(): it would turn "BB" into "bb"
         tk.Button(
             parent, text=label, command=lambda t=legal.action_type: self._append(Action(t))
         ).pack(fill="x", pady=1)
 
     def _wheel_step(self, var: tk.StringVar, legal: LegalAction, direction: int) -> None:
-        """Move the amount by one big blind, kept inside what the engine allows."""
+        """Move the amount (in BB) by one big blind, kept inside what the engine allows."""
+        big_blind = self._big_blind()
         try:
-            current = int(var.get())
+            current = parse_bb(var.get(), big_blind)
         except ValueError:
             current = legal.min_amount
-        try:
-            step = max(1, WHEEL_STEP_BIG_BLINDS * int(self.bb_var.get()))
-        except ValueError:
-            step = 1
-        var.set(str(min(legal.max_amount, max(legal.min_amount, current + direction * step))))
+        step = max(1, WHEEL_STEP_BIG_BLINDS * big_blind)
+        chips = min(legal.max_amount, max(legal.min_amount, current + direction * step))
+        var.set(bb_number(chips, big_blind))
 
     def _bind_wheel(self, widget: tk.Widget, var: tk.StringVar, legal: LegalAction) -> None:
         """Wheel up raises the amount, wheel down lowers it.
@@ -654,6 +770,245 @@ class SpotFrame(ttk.Frame):
             "<MouseWheel>",
             lambda e: self._wheel_step(var, legal, 1 if e.delta > 0 else -1),
         )
+
+    # -- reading the screen -------------------------------------------------
+
+    def _start_screen_reading(self) -> None:
+        from pokerlab.gui.screen_reader import ScreenReader, VisionNotAvailable
+
+        try:
+            self._reader = ScreenReader()
+        except VisionNotAvailable as exc:
+            self.screen_var.set(f"Schermo: lettura non disponibile, {exc}")
+            return
+        self._screen_job = self.after(0, self._poll_screen)
+
+    def _poll_screen(self) -> None:
+        """Read the client and apply what changed; then again in a moment."""
+        from pokerlab.gui.screen_reader import VisionNotAvailable
+
+        self._screen_job = None
+        try:
+            reading = self._reader.read()
+        except VisionNotAvailable as exc:
+            self.screen_var.set(f"Schermo: lettura non disponibile, {exc}")
+            return  # permanent: no point retrying
+        except Exception as exc:  # noqa: BLE001 - a bad tick must not stop the reading
+            self.screen_var.set(f"Schermo: errore di lettura, {exc}")
+        else:
+            self.apply_reading(reading)
+        if self.winfo_exists():
+            self._screen_job = self.after(SCREEN_POLL_MS, self._poll_screen)
+
+    def apply_reading(self, reading) -> bool:
+        """Put what the screen shows into the spot, if the screen changed.
+
+        A new hand (different hole cards) clears the actions, which belonged to
+        the previous one; seats, stacks and dealer are kept. The button moving
+        puts it on the chair matching that client seat (`chair_for_client_seat`),
+        seating a player there if the chair was empty -- the button is always in
+        front of someone -- and, being a new hand too, clears the actions.
+        Returns whether anything was applied."""
+        import time
+
+        from pokerlab.gui.screen_reader import DEALER_PLAYERS, diff_reading
+
+        change = diff_reading(self._last_reading, reading, self._last_hand, self._last_dealer)
+        self._last_reading = reading
+        if reading.seats is not None:
+            self._seat_states = {
+                chair_for_client_seat(DEALER_PLAYERS, seat): state for seat, state in reading.seats.items()
+            }
+            # Who sits where changes only between hands: applied mid-hand it would
+            # wipe the actions being entered every time someone stood up.
+            if change.dealer is not None or change.new_hand or not self._seating_read:
+                self._apply_seating(reading.seats)
+                self._apply_stacks(reading)
+        if change.dealer is not None:
+            self._last_dealer = change.dealer
+            chair = chair_for_client_seat(DEALER_PLAYERS, change.dealer)
+            if self.layout.add(chair):
+                self.stack_vars[chair].set(self.stack_var.get())
+                self.name_vars[chair].set(f"Avv. {chair}")
+            self.layout.set_dealer(chair)
+            self.script.clear()
+        if change.hole is not None:
+            cards = [parse_card(c) for c in change.hole]
+            self.hole = cards if cards else [None, None]
+            if change.hole:
+                self._last_hand = change.hole
+            if change.new_hand:
+                self.script.clear()
+        if change.board is not None:
+            self.board = [parse_card(c) for c in change.board]
+        synced = self._sync_actions(reading)
+        stacks_moved = self._note_screen_stacks(reading)
+        hole = " ".join(card_text(c) for c in self.hole if c) or "-"
+        board = " ".join(card_text(c) for c in self.board) or "-"
+        problems = f" | {'; '.join(reading.problems)}" if reading.problems else ""
+        dealer = "" if reading.dealer is None else f", dealer posto {reading.dealer}"
+        seats = ""
+        if reading.seats is not None:
+            counts = {label: sum(state == key for state in reading.seats.values())
+                      for key, label in SEAT_STATE_LABELS.items()}
+            seats = ", posti: " + ", ".join(f"{n} {label}" for label, n in counts.items() if n)
+        self.screen_var.set(
+            f"Schermo ({time.strftime('%H:%M:%S')}): mano {hole}, board {board}{dealer}{seats}"
+            f"{self._sync_note}{problems}"
+        )
+        if change.any or synced or stacks_moved:
+            self.refresh()
+        return change.any or synced
+
+    def _table_view(self, reading):
+        """The reading in the engine's seat numbers and chips, for `action_sync`."""
+        from pokerlab.gui.action_sync import TableView
+        from pokerlab.gui.screen_reader import DEALER_PLAYERS
+
+        try:
+            big_blind = int(self.bb_var.get())
+        except ValueError:
+            return None
+        view = TableView(
+            board_cards=None if reading.board is None else len(reading.board), my_turn=reading.my_turn
+        )
+        for client_seat, amount in (reading.bets or {}).items():
+            chair = chair_for_client_seat(DEALER_PLAYERS, client_seat)
+            if chair in self.layout.chairs:
+                view.bets[self.layout.seat_of(chair)] = round(amount * big_blind)
+        for client_seat, state in (reading.seats or {}).items():
+            chair = chair_for_client_seat(DEALER_PLAYERS, client_seat)
+            if chair in self.layout.chairs and state in SEAT_MARKS:
+                view.out.add(self.layout.seat_of(chair))
+        return view
+
+    def _sync_actions(self, reading) -> bool:
+        """Append the actions the picture proves were taken (`action_sync`), and
+        check the pot read against the pot the actions add up to. Returns
+        whether any action was added."""
+        from pokerlab.gui.action_sync import sync_actions
+
+        self._sync_note = ""
+        if reading.bets is None and not reading.my_turn:
+            return False  # neither amounts nor your timer read: nothing to go on
+        view = self._table_view(reading)
+        if view is None:
+            return False
+        try:
+            spot = self.build_spot()
+            synced, result = sync_actions(spot, view)
+        except ValueError:
+            return False  # the table is not playable yet (one player, say)
+        if result.actions:
+            self.script = list(synced.script)
+        names = position_names(synced.num_players)
+        added = ", ".join(
+            f"{names[seat]} {describe_action(action, None, synced.big_blind)}"
+            for seat, action in result.actions
+        )
+        waiting = "" if result.waiting_for is None else f"tocca a {names[result.waiting_for]}"
+        parts = [p for p in (f"+ {added}" if added else "", waiting) if p]
+        self._sync_note = f" | azioni: {'; '.join(parts)}" if parts else ""
+        self._sync_note += self._pot_check(synced, reading, view)
+        return bool(result.actions)
+
+    def _pot_check(self, spot, reading, view) -> str:
+        """A warning when the pot the actions add up to is not the one shown:
+        the client's pot is the earlier streets, so the bets in front are added
+        to it before comparing. Silent when it matches or cannot be checked."""
+        if reading.pot is None or reading.bets is None:
+            return ""
+        try:
+            state = replay(spot)
+            big_blind = int(self.bb_var.get())
+        except ValueError:
+            return ""
+        if state.finished:
+            return ""
+        shown = round(reading.pot * big_blind) + sum(view.bets.values())
+        if shown == state.pot:
+            return ""
+        return (f" | ATTENZIONE piatto: letto {shown / big_blind:g} BB, "
+                f"dalle azioni {state.pot / big_blind:g} BB")
+
+    def _apply_seating(self, seats: dict[int, str]) -> bool:
+        """Seat the players the screen shows and stand up the ones it does not,
+        on the chairs mapped to client seats only (a chair the user filled by
+        hand elsewhere is left alone). Clears the actions if anything moved.
+        The button stays where it was if that chair is still occupied."""
+        from pokerlab.gui.screen_reader import DEALER_PLAYERS, seated_seats
+
+        self._seating_read = True
+        seated = seated_seats(seats)
+        moved = False
+        for seat in seats:
+            chair = chair_for_client_seat(DEALER_PLAYERS, seat)
+            if seat in seated and self.layout.add(chair):
+                self.stack_vars[chair].set(self.stack_var.get())
+                self.name_vars[chair].set(f"Avv. {chair}")
+                moved = True
+            elif seat not in seated and self.layout.remove(chair):
+                moved = True
+        if self._last_dealer is not None:
+            # `remove` hands the button back to you if its chair emptied; put it
+            # back where it was last seen, if that chair is still occupied.
+            self.layout.set_dealer(chair_for_client_seat(DEALER_PLAYERS, self._last_dealer))
+        if moved:
+            self.script.clear()
+        return moved
+
+    def _note_screen_stacks(self, reading) -> bool:
+        """Keep the stacks read now (by chair, in BB) to compare with what the
+        engine leaves each player; True if they changed, so the chairs redraw."""
+        from pokerlab.gui.screen_reader import DEALER_PLAYERS
+
+        if reading.stacks is None:
+            return False
+        stacks = {
+            chair_for_client_seat(DEALER_PLAYERS, seat): value
+            for seat, value in reading.stacks.items()
+            if value > 0
+        }
+        moved = stacks != self._screen_stacks
+        self._screen_stacks = stacks
+        return moved
+
+    def _apply_stacks(self, reading) -> None:
+        """Each seated player's stack at the start of the hand, from the screen:
+        the stack shown plus the chips already in front of it (the blinds,
+        preflop). Applied with the seating -- at a new hand -- and never mid-hand,
+        when a changed starting stack would rewrite a hand already rebuilt. A
+        seat whose stack was not read keeps the one it had."""
+        from pokerlab.gui.screen_reader import DEALER_PLAYERS
+
+        if not reading.stacks:
+            return
+        for client_seat, stack in reading.stacks.items():
+            chair = chair_for_client_seat(DEALER_PLAYERS, client_seat)
+            if chair in self.layout.chairs and stack > 0:
+                in_front = (reading.bets or {}).get(client_seat, 0.0)
+                self.stack_vars[chair].set(bb_number(round((stack + in_front) * ENGINE_BIG_BLIND), ENGINE_BIG_BLIND))
+
+    def _mark_seat_states(self) -> None:
+        """Grey out and tag the seated players the screen shows as out of the
+        hand ("fold") or sitting out -- information only: when they folded is
+        not known, so no FOLD is put into the actions."""
+        acting = None
+        if self.state is not None and not self.state.finished and self.state.to_act is not None:
+            acting = self.layout.chair_of(self.state.to_act)
+        for chair, state in self._seat_states.items():
+            if chair not in self.layout.chairs or state not in SEAT_MARKS or chair == acting:
+                continue
+            ui = self.chair_ui[chair]
+            text = ui.info.cget("text")
+            ui.info.configure(text=f"{text} · {SEAT_MARKS[state]}" if text else SEAT_MARKS[state])
+            ui.box.configure(highlightbackground=OUT_OF_HAND)
+
+    def destroy(self) -> None:
+        if self._screen_job is not None:
+            self.after_cancel(self._screen_job)
+            self._screen_job = None
+        super().destroy()
 
     def _append(self, action: Action) -> None:
         self.script.append(action)
@@ -672,7 +1027,7 @@ class SpotFrame(ttk.Frame):
         lines = []
         for number, (seat, action) in enumerate(state.taken, start=1):
             name = self._player_name(self.layout.chair_of(seat))
-            lines.append(f"{number}. {name} ({names[seat]}): {describe_action(action)}")
+            lines.append(f"{number}. {name} ({names[seat]}): {describe_action(action, None, self._big_blind())}")
         self._write(self.log, "\n".join(lines))
 
     @staticmethod
@@ -684,21 +1039,6 @@ class SpotFrame(ttk.Frame):
 
     # -- the models ---------------------------------------------------------
 
-    def _ask(self) -> None:
-        # Whatever is on the table is what gets asked: no separate "apply".
-        self.refresh()
-        state = self.state
-        if state is None or state.finished or state.observation is None:
-            self.status_var.set("Niente da chiedere: sistema prima il tavolo.")
-            return
-        spot = self.build_spot()
-        if state.to_act != spot.my_seat:
-            self.status_var.set("Tocca a un altro: premi le sue azioni fino al tuo turno.")
-            return
-        if spot.hole_cards is None:
-            self.status_var.set("Imposta le tue due carte.")
-            return
-        self._consult(state, spot)
 
     def _consult(self, state: SpotState, spot: Spot) -> None:
         if not self._load_models():
@@ -719,7 +1059,7 @@ class SpotFrame(ttk.Frame):
         for item in advice:
             lines.append(
                 f"{item.label}  (elo {item.rating:.0f})\n"
-                f"  -> {describe_action(item.best.action, state.observation)}"
+                f"  -> {describe_action(item.best.action, state.observation, spot.big_blind)}"
                 f"  {item.best.probability:.0%}   valore {item.value:+.2f}"
             )
             lines.append(

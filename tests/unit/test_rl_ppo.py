@@ -636,7 +636,7 @@ def test_discovery_skips_registry_entries_whose_file_is_gone(tmp_path):
     registry = PoolRegistry(directory=global_dir, max_models=10**9)
     registry.members["ghost"] = PoolMember(label="ghost", kind="model", ref="ghost.pt")
     registry.save()
-    assert discover_trained_models(tmp_path) == []
+    assert discover_trained_models(tmp_path, fallback_dir=None) == []
 
 
 def test_discovery_finds_a_model_whose_ref_is_stale_by_looking_it_up_by_label(tmp_path):
@@ -708,7 +708,53 @@ def test_discover_global_top_models_skips_missing_files(tmp_path):
 def test_discover_global_top_models_on_a_missing_registry_is_empty(tmp_path):
     from pokerlab.cli.play import discover_global_top_models
 
-    assert discover_global_top_models(tmp_path / "nope") == []
+    assert discover_global_top_models(tmp_path / "nope", fallback_dir=None) == []
+    assert discover_global_top_models(tmp_path / "nope", fallback_dir=tmp_path / "also-nope") == []
+
+
+def test_with_no_checkpoints_the_models_come_from_the_top_models_folder(tmp_path):
+    import json
+
+    from pokerlab.cli.play import discover_global_top_models, discover_trained_models
+
+    top = tmp_path / "top_models"
+    top.mkdir()
+    for label in ("mid", "best", "unrated"):
+        (top / f"{label}.pt").write_bytes(b"weights")
+    (top / "ratings.json").write_text(
+        json.dumps({"ratings": {"mid": 1820.0, "best": 1847.8, "gone": 1900.0}}), encoding="utf-8"
+    )
+    found = discover_global_top_models(tmp_path / "no-global", limit=5, fallback_dir=top)
+    # rated best first; a rating with no file is skipped; an unrated file comes last
+    assert [(label, rating) for label, _p, rating in found] == [
+        ("best", 1847.8), ("mid", 1820.0), ("unrated", 1500.0)
+    ]
+    assert discover_trained_models(tmp_path, fallback_dir=top)[0][0] == "best"
+    assert len(discover_global_top_models(tmp_path / "no-global", limit=2, fallback_dir=top)) == 2
+
+
+def test_the_registry_wins_over_the_top_models_folder(tmp_path):
+    from pokerlab.cli.play import discover_global_top_models
+    from pokerlab.rl.pool_registry import PoolMember, PoolRegistry
+
+    global_dir = tmp_path / "global"
+    global_dir.mkdir()
+    (tmp_path / "live.pt").write_bytes(b"weights")
+    registry = PoolRegistry(directory=global_dir, max_models=10**9)
+    registry.members["live"] = PoolMember(label="live", kind="model", ref=str(tmp_path / "live.pt"))
+    registry.save()
+    top = tmp_path / "top_models"
+    top.mkdir()
+    (top / "copy.pt").write_bytes(b"weights")
+    assert [label for label, _p, _r in discover_global_top_models(global_dir, fallback_dir=top)] == ["live"]
+
+
+def test_the_fallback_folder_is_the_one_push_top_models_writes():
+    from pokerlab.cli import play
+    from pokerlab.rl import push_top_models
+
+    assert str(play.TOP_MODELS_DIR) == push_top_models.DEFAULT_DIR
+    assert play.TOP_MODELS_RATINGS == push_top_models.RATINGS_FILE
 
 
 # ---- what a published model remembers about the run that made it --------------

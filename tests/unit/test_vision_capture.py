@@ -45,3 +45,35 @@ def test_a_frame_is_written_as_a_png_without_an_imaging_library(screen, tmp_path
     assert data.startswith(b"\x89PNG")
     path = save_png(frame, tmp_path / "crops" / "x.png")
     assert path.read_bytes() == data
+
+
+def test_several_regions_come_out_of_one_grab_each_in_its_place(monkeypatch):
+    np = pytest.importorskip("numpy")
+    from pokerlab.vision import capture
+    from pokerlab.vision.regions import Region
+
+    grabs = []
+
+    class FakeScreen:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def grab(self, monitor):
+            grabs.append(dict(monitor))
+            # every pixel holds its own absolute (x, y), BGRA
+            ys, xs = np.mgrid[monitor["top"]:monitor["top"] + monitor["height"],
+                              monitor["left"]:monitor["left"] + monitor["width"]]
+            return np.dstack([xs, ys, np.zeros_like(xs), np.zeros_like(xs)]).astype(np.int32)
+
+    monkeypatch.setattr(capture, "_screen", FakeScreen)
+    regions = [Region(100, 50, 20, 10), Region(-30, 200, 5, 5), Region(400, 60, 7, 3)]
+    frames = capture.grab_regions(regions)
+    assert len(grabs) == 1  # one grab for all of them
+    for region, frame in zip(regions, frames, strict=True):
+        assert frame.shape[:2] == (region.height, region.width)
+        assert (frame[0, 0, 0], frame[0, 0, 1]) == (region.left, region.top)
+        assert (frame[-1, -1, 0], frame[-1, -1, 1]) == (region.left + region.width - 1, region.top + region.height - 1)
+    assert capture.grab_regions([]) == []

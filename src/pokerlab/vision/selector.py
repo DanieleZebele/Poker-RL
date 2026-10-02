@@ -58,7 +58,12 @@ class RegionSelector(tk.Toplevel):
         png_data: bytes,
         image_size: tuple[int, int],
         origin: tuple[int, int] = (0, 0),
+        label: str | None = None,
     ) -> None:
+        """`label` names the zone being set at the top of the overlay: two
+        sections with identical "Posto 5" buttons once had the dealer zone of
+        seat 5 drawn round that player's whole box, with nothing on screen to
+        say which one was being set."""
         super().__init__(master)
         self.result: Region | None = None
         self._image_size = image_size
@@ -80,7 +85,8 @@ class RegionSelector(tk.Toplevel):
         self.canvas.create_rectangle(0, 0, width, height, fill="black", stipple="gray50", outline="")
         self.canvas.create_text(
             width / 2, 28, fill="white", font=("TkDefaultFont", 14, "bold"),
-            text="Trascina un rettangolo sulla zona  -  Invio conferma, Esc annulla",
+            text=(f"{label}:  " if label else "")
+            + "Trascina un rettangolo sulla zona  -  Invio conferma, Esc annulla",
         )
         self._box = self.canvas.create_rectangle(0, 0, 0, 0, outline="#ffd43b", width=2)
         # Buttons as well as keys: an override-redirect window gets no keyboard
@@ -164,7 +170,7 @@ class RegionSelector(tk.Toplevel):
         self.canvas.focus_set()
 
 
-def select_region(parent, monitor: int = 1) -> Region | None:
+def select_region(parent, monitor: int = 1, label: str | None = None) -> Region | None:
     """Photograph `monitor`, let the user drag a rectangle over it, return it.
 
     The calling window is hidden first and brought back whatever happens, so the
@@ -181,7 +187,8 @@ def select_region(parent, monitor: int = 1) -> Region | None:
         frame, geometry = grab_monitor(monitor)
         height, width = frame.shape[:2]
         selector = RegionSelector(
-            root, frame_to_png_bytes(frame), (width, height), (geometry["left"], geometry["top"])
+            root, frame_to_png_bytes(frame), (width, height), (geometry["left"], geometry["top"]),
+            label=label,
         )
         selector.present()
         root.wait_window(selector)

@@ -86,18 +86,6 @@ def test_advice_from_an_untrained_model():
     assert all(b.legal for b in out[0].bins)
 
 
-@pytest.fixture(scope="module")
-def app():
-    from pokerlab.gui.app import PokerGuiApp
-
-    application = PokerGuiApp()
-    application.withdraw()
-    yield application
-    gc.collect()
-    application.destroy()
-    gc.collect()
-
-
 def seat(frame, *chairs):
     for chair in chairs:
         frame.add_player(chair)
@@ -254,22 +242,22 @@ def test_the_wheel_over_a_raise_amount_moves_it_by_a_big_blind_within_the_limits
 
     frame = SpotFrame(app)
     try:
-        legal = LegalAction(ActionType.RAISE, 4, 10)
-        var = tk.StringVar(value="4")
+        legal = LegalAction(ActionType.RAISE, 4, 10)  # chips: 2 to 5 big blinds
+        var = tk.StringVar(value="2")  # the field is in big blinds
         frame._wheel_step(var, legal, 1)
-        assert var.get() == "6"  # one big blind (2) up
+        assert var.get() == "3"  # one big blind up
         for _ in range(5):
             frame._wheel_step(var, legal, 1)
-        assert var.get() == "10"  # never above the engine's maximum
+        assert var.get() == "5"  # never above the engine's maximum
         for _ in range(9):
             frame._wheel_step(var, legal, -1)
-        assert var.get() == "4"  # nor below the minimum
+        assert var.get() == "2"  # nor below the minimum
         var.set("abc")
         frame._wheel_step(var, legal, 1)
-        assert var.get() == "6"  # a half-typed amount starts from the minimum
-        frame.bb_var.set("x")
+        assert var.get() == "3"  # a half-typed amount starts from the minimum
+        var.set("2,5")  # a comma decimal, as the client writes it
         frame._wheel_step(var, legal, 1)
-        assert var.get() == "7"  # an unreadable big blind falls back to a step of 1
+        assert var.get() == "3,5"
     finally:
         frame.destroy()
         gc.collect()
@@ -291,6 +279,131 @@ def test_the_wheel_is_bound_on_the_raise_entry_in_both_directions(app):
         assert entries, "a raise amount is on offer in this spot"
         for sequence in ("<Button-4>", "<Button-5>", "<MouseWheel>"):
             assert entries[0].bind(sequence)
+    finally:
+        frame.destroy()
+        gc.collect()
+
+
+
+def test_a_popup_opens_under_the_mouse_and_stays_on_its_monitor(app, monkeypatch):
+    import tkinter as tk
+
+    from pokerlab.gui import spot_view
+
+    monkeypatch.setattr(spot_view, "_monitor_bounds", lambda x, y, fallback: (1920, 0, 3840, 1040))
+    window = tk.Toplevel(app)
+    try:
+        tk.Frame(window, width=300, height=200).pack()
+        monkeypatch.setattr(window, "winfo_pointerxy", lambda: (2500, 400))
+        assert spot_view.place_near_pointer(window) == (2500 - 150, 380)
+        monkeypatch.setattr(window, "winfo_pointerxy", lambda: (3830, 1030))  # bottom-right corner
+        assert spot_view.place_near_pointer(window) == (3840 - 300, 1040 - 200)
+        monkeypatch.setattr(window, "winfo_pointerxy", lambda: (1925, 5))  # left edge of monitor 2
+        assert spot_view.place_near_pointer(window) == (1920, 0)
+    finally:
+        window.destroy()
+        gc.collect()
+
+
+def test_your_box_and_all_its_actions_fit_on_the_table(app):
+    from pokerlab.gui.spot_view import SpotFrame
+
+    frame = SpotFrame(app)
+    try:
+        frame.pack()
+        seat(frame, 3, 6)  # three-handed the button acts first: your actions are showing
+        assert frame.layout.chair_of(frame.state.to_act) == 0
+        app.update()
+        holder = frame.chair_ui[0].box.master
+        assert frame.chair_ui[0].actions.winfo_children()
+        assert holder.winfo_y() + holder.winfo_reqheight() <= int(frame.canvas.cget("height"))
+    finally:
+        frame.destroy()
+        gc.collect()
+
+
+def test_no_chair_is_cut_off_whoever_is_to_act(app):
+    from pokerlab.gui.spot_view import SpotFrame
+
+    frame = SpotFrame(app)
+    app.deiconify()  # geometry and pointer events are only real on a mapped window
+    try:
+        frame.pack()
+        seat(frame, *range(1, 9))
+        for _ in range(8):  # the turn goes round every chair, top ones included
+            app.update()
+            holder = frame.chair_ui[frame.layout.chair_of(frame.state.to_act)].holder
+            assert holder.winfo_y() >= 0 and holder.winfo_x() >= 0
+            assert holder.winfo_y() + holder.winfo_reqheight() <= int(frame.canvas.cget("height"))
+            frame._append(Action(ActionType.CALL))
+    finally:
+        app.withdraw()
+        frame.destroy()
+        gc.collect()
+
+
+def test_a_press_anywhere_on_a_chair_brings_it_in_front(app):
+    from pokerlab.gui.spot_view import SpotFrame, _raise_tag
+
+    frame = SpotFrame(app)
+    app.deiconify()  # Tk delivers no pointer event to a withdrawn window
+    try:
+        frame.pack()
+        seat(frame, 3, 4, 6)
+        app.update()
+
+        def front():  # Tk's own child list is in stacking order, topmost last
+            return frame.nametowidget(frame.tk.splitlist(frame.tk.call("winfo", "children", frame.canvas))[-1])
+
+        acting = frame.chair_ui[frame.layout.chair_of(frame.state.to_act)].holder
+        assert front() == acting  # whoever acts is put in front by itself
+        other = next(ui for c, ui in frame.chair_ui.items() if c in (3, 4, 6) and ui.holder != acting)
+        button = next(w for w in other.box.winfo_children()[0].winfo_children() if w.winfo_class() == "Button")
+        tags = button.bindtags()
+        assert tags[0] == _raise_tag(other.holder) and "Button" in tags  # the click still reaches it
+        button.event_generate("<ButtonPress-1>", x=2, y=2)
+        app.update()
+        assert front() == other.holder
+        # action buttons are rebuilt at every step and must be raisable too
+        frame._append(Action(ActionType.CALL))
+        acting = frame.chair_ui[frame.layout.chair_of(frame.state.to_act)]
+        assert all(_raise_tag(acting.holder) in w.bindtags() for w in acting.actions.winfo_children())
+    finally:
+        app.withdraw()
+        frame.destroy()
+        gc.collect()
+
+
+def test_big_blind_amounts_are_shown_and_read_with_a_comma():
+    from pokerlab.gui.spot import bb_number, describe_action, format_bb, parse_bb
+
+    assert bb_number(37, 2) == "18,5" and bb_number(6, 2) == "3" and format_bb(1, 2) == "0,5 BB"
+    assert parse_bb("18,5", 2) == 37 and parse_bb("18.5", 2) == 37 and parse_bb(" 100 ", 2) == 200
+    with pytest.raises(ValueError):
+        parse_bb("tanti", 2)
+    assert describe_action(Action(ActionType.RAISE, 7), None, 2) == "raise a 3,5 BB"
+    assert describe_action(Action(ActionType.RAISE, 7)) == "raise a 7"  # chips without a big blind
+
+
+def test_the_models_page_shows_every_amount_in_big_blinds(app):
+    from pokerlab.gui.spot_view import SpotFrame
+
+    frame = SpotFrame(app)
+    frame._consult = lambda state, spot: None
+    try:
+        seat(frame, 3, 6)
+        frame._append(Action(ActionType.RAISE, 7))  # 3,5 BB
+        assert frame.build_spot().starting_stack == 200  # 100 BB, the default
+        assert "piatto 5 BB" in frame.situation.cget("text")  # 0,5 + 1 + 3,5
+        assert "raise a 3,5 BB" in frame.log.get("1.0", "end")
+        texts = [w.cget("text") for line in frame.chair_ui[frame.layout.chair_of(frame.state.to_act)]
+                 .actions.winfo_children() for w in ([line] + line.winfo_children())
+                 if w.winfo_class() == "Button"]
+        assert any(t.startswith("Raise a (") and t.endswith(" BB)") for t in texts)
+        assert any(t.startswith("Call ") and t.endswith(" BB") for t in texts)
+        frame.stack_var.set("37,5")
+        frame._default_stack_changed()
+        assert frame.build_spot().starting_stack == 75
     finally:
         frame.destroy()
         gc.collect()

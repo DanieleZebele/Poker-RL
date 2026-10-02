@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import random
 from collections.abc import Callable
 from pathlib import Path
@@ -24,10 +25,18 @@ from pokerlab.rl.global_store import load_ranking
 MODEL_PREFIX = "model:"
 
 DEFAULT_CHECKPOINT_ROOT = Path("checkpoints")
+# Where `rl/push_top_models.py` publishes the best models into git; the fallback
+# when no checkpoint store is reachable (same names as there, kept in step by a test).
+TOP_MODELS_DIR = Path("top_models")
+TOP_MODELS_RATINGS = "ratings.json"
+DEFAULT_RATING = 1500.0
 
 
 def discover_trained_models(
-    root: str | Path = DEFAULT_CHECKPOINT_ROOT, *, limit: int = 20
+    root: str | Path = DEFAULT_CHECKPOINT_ROOT,
+    *,
+    limit: int = 20,
+    fallback_dir: str | Path | None = TOP_MODELS_DIR,
 ) -> list[tuple[str, Path, float]]:
     """The best trained checkpoints available, `(label, path, rating)`, best first.
 
@@ -37,11 +46,43 @@ def discover_trained_models(
     code carries no torch -- so the GUI can list the models on a machine where
     the `rl` extra was never installed, and only fails if someone picks one.
     """
-    return discover_global_top_models(Path(root) / "global", limit=limit)
+    return discover_global_top_models(Path(root) / "global", limit=limit, fallback_dir=fallback_dir)
+
+
+def discover_top_models_folder(
+    folder: str | Path = TOP_MODELS_DIR, *, limit: int = 6
+) -> list[tuple[str, Path, float]]:
+    """The models in the git-tracked `top_models/` folder, best first.
+
+    `rl/push_top_models.py` copies the fleet's current best there as `<label>.pt`
+    plus a `ratings.json`, so a machine that has the repository but not the
+    training volume -- the Windows PC the GUI runs on -- still has models to
+    seat. A `.pt` missing from `ratings.json` is still offered, after the rated
+    ones, at the default rating; a rating whose file is gone is skipped.
+    """
+    folder = Path(folder)
+    try:
+        ratings = json.loads((folder / TOP_MODELS_RATINGS).read_text(encoding="utf-8"))["ratings"]
+        if not isinstance(ratings, dict):
+            ratings = {}
+    except (OSError, ValueError, KeyError, TypeError):
+        ratings = {}
+    found = []
+    for path in folder.glob("*.pt"):
+        try:
+            rating = float(ratings.get(path.stem, DEFAULT_RATING))
+        except (TypeError, ValueError):
+            rating = DEFAULT_RATING
+        found.append((path.stem, path, rating, path.stem in ratings))
+    found.sort(key=lambda item: (not item[3], -item[2], item[0]))
+    return [(label, path, rating) for label, path, rating, _rated in found[:limit]]
 
 
 def discover_global_top_models(
-    global_dir: str | Path = DEFAULT_GLOBAL_DIR, *, limit: int = 6
+    global_dir: str | Path = DEFAULT_GLOBAL_DIR,
+    *,
+    limit: int = 6,
+    fallback_dir: str | Path | None = TOP_MODELS_DIR,
 ) -> list[tuple[str, Path, float]]:
     """The top `limit` models by rating in the cross-machine global registry.
 
@@ -59,7 +100,20 @@ def discover_global_top_models(
     being skipped, so a top model is never dropped just because it changed
     directory. A model with no file anywhere is skipped, so one missing file
     cannot break the whole list.
+
+    **When nothing is found that way** -- no `checkpoints/` at all, as on a PC
+    that only cloned the repository -- the models come from `fallback_dir`
+    (`top_models/`, see `discover_top_models_folder`). `None` turns that off,
+    which `push_top_models` needs: it must never "find" the very copies it is
+    about to replace.
     """
+    found = _registry_top_models(global_dir, limit)
+    if not found and fallback_dir is not None:
+        found = discover_top_models_folder(fallback_dir, limit=limit)
+    return found
+
+
+def _registry_top_models(global_dir: str | Path, limit: int) -> list[tuple[str, Path, float]]:
     registry = load_ranking(global_dir)
     on_disk: dict[str, Path] | None = None
     found: list[tuple[str, Path, float]] = []

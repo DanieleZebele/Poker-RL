@@ -1,4 +1,3 @@
-import gc
 import queue
 import threading
 import time
@@ -15,7 +14,6 @@ from pokerlab.engine.table import HandResult
 from pokerlab.gui.app import (
     DEALER_BACKGROUND,
     ActionReporter,
-    PokerGuiApp,
     TableFrame,
     _bot_spec_label,
     _bot_spec_to_key_string,
@@ -30,26 +28,6 @@ from pokerlab.players.gui import GuiEvent, GuiPlayer
 
 def _card_item_counts(widgets: dict) -> list[int]:
     return [len(c.find_all()) for c in widgets["cards"]]
-
-
-@pytest.fixture(scope="module")
-def app():
-    # One Tk interpreter for the whole file: creating/destroying tk.Tk()
-    # repeatedly within a single process has proven unstable with this
-    # project's Tcl/Tk install (see _fix_tcl_tk_library_paths), so each
-    # test below gets a fresh TableFrame parented to this single long-lived
-    # root instead of its own PokerGuiApp.
-    application = PokerGuiApp()
-    application.withdraw()
-    yield application
-    # Collect the frames' StringVars here, on the main thread, while the Tk
-    # interpreter is still alive. Left to chance they are collected later by
-    # whichever thread happens to trigger a GC -- another test file's worker
-    # -- and `Variable.__del__` then raises "main thread is not in main
-    # loop" as an unraisable exception, failing an unrelated test.
-    gc.collect()
-    application.destroy()
-    gc.collect()
 
 
 @pytest.fixture

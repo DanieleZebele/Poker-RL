@@ -68,6 +68,29 @@ def grab_region(region: Region) -> object:
         return _to_frame(screen.grab(region.as_monitor()))
 
 
+def grab_regions(regions: list[Region]) -> list[object]:
+    """Several rectangles from **one** grab: the smallest rectangle holding them
+    all is captured once and each is cut out of it.
+
+    Measured on the spot screen's reading (2 card zones, 6 dealer, 6 player):
+    one `grab_region` each took 233 ms, mostly opening an `mss` session and
+    asking the OS for pixels fourteen times -- on the Tk thread, every two
+    seconds, a visible stutter. The cut-outs are copies, so a caller may keep or
+    modify one without holding the whole capture alive."""
+    if not regions:
+        return []
+    left = min(r.left for r in regions)
+    top = min(r.top for r in regions)
+    right = max(r.left + r.width for r in regions)
+    bottom = max(r.top + r.height for r in regions)
+    with _screen() as screen:
+        whole = _to_frame(screen.grab({"left": left, "top": top, "width": right - left, "height": bottom - top}))
+    return [
+        whole[r.top - top:r.top - top + r.height, r.left - left:r.left - left + r.width].copy()
+        for r in regions
+    ]
+
+
 def frame_to_png_bytes(frame) -> bytes:
     """A frame as PNG data, for Tk's `PhotoImage` or for a file -- no Pillow."""
     mss = _mss()

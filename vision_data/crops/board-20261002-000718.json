@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "image": "board-20261002-000718.png",
+  "zone": "board",
+  "cards": [
+    "2d",
+    "4h",
+    "2h",
+    "8s",
+    "Ks"
+  ]
+}

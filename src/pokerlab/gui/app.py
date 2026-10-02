@@ -27,6 +27,29 @@ def _fix_tcl_tk_library_paths() -> None:
 
 _fix_tcl_tk_library_paths()
 
+
+def _make_windows_dpi_aware() -> None:
+    """On a scaled Windows display (125%, 150%...) a DPI-unaware Tk works in
+    logical units -- 1536x864 on a 1920x1080 screen at 125% -- while `mss`
+    captures physical pixels, so the region selector drew a 1920-wide
+    screenshot into a window that ran off the edge of the screen. Worse, `mss`
+    switches the process to per-monitor awareness itself on its first capture,
+    with Tk already running. Declaring the awareness before any Tk window
+    exists makes Tk and the screenshots agree on one pixel. Must run before
+    `tk.Tk()`; a no-op off Windows, or if the awareness was already set."""
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor, as mss sets it
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except (AttributeError, OSError):
+            pass
+
+
 import tkinter as tk
 from tkinter import messagebox, ttk
 
@@ -435,8 +458,11 @@ class SetupFrame(ttk.Frame):
 
         button_row = next_row + 5
         ttk.Button(self, text="Avvia", command=self._start).grid(row=button_row, column=1, pady=(16, 0), sticky="e")
-        ttk.Button(self, text="Chiedi ai modelli (spot)", command=self.app.show_spot).grid(
-            row=button_row, column=0, pady=(16, 0), sticky="w"
+        left_buttons = ttk.Frame(self)
+        left_buttons.grid(row=button_row, column=0, pady=(16, 0), sticky="w")
+        ttk.Button(left_buttons, text="Chiedi ai modelli (spot)", command=self.app.show_spot).pack(side="left")
+        ttk.Button(left_buttons, text="Collect vision data", command=self.app.show_vision).pack(
+            side="left", padx=(8, 0)
         )
 
         self._render_bot_slots()
@@ -1064,12 +1090,17 @@ class PokerGuiApp(tk.Tk):
     def show_setup(self) -> None:
         self._show_frame(SetupFrame(self))
 
-    def show_spot(self) -> None:
+    def show_spot(self, read_screen: bool = True) -> None:
         from pokerlab.gui.spot_view import SpotFrame
 
         # The table and the side panel together are wider than the default window.
         self.geometry("1240x760")
-        self._show_frame(SpotFrame(self))
+        self._show_frame(SpotFrame(self, read_screen=read_screen))
+
+    def show_vision(self) -> None:
+        from pokerlab.gui.vision_view import VisionFrame
+
+        self._show_frame(VisionFrame(self))
 
     def start_session(
         self,
@@ -1153,6 +1184,7 @@ class PokerGuiApp(tk.Tk):
 
 
 def main() -> None:
+    _make_windows_dpi_aware()
     app = PokerGuiApp()
     app.mainloop()
 

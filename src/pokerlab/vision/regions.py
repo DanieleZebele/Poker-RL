@@ -14,12 +14,62 @@ import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-DEFAULT_REGIONS_PATH = Path("checkpoints/vision/regions.json")
+# Outside `checkpoints/` on purpose, next to the crops (`labels.CROPS_DIR`):
+# `checkpoints/` is training state, and these zones belong to the vision data.
+DEFAULT_REGIONS_PATH = Path("vision_data/regions.json")
 
 # The names of the regions the GUI knows about.
 HOLE_CARDS = "hole_cards"
 BOARD = "board"
 REGION_NAMES = (HOLE_CARDS, BOARD)
+
+# Where the dealer button can appear, one zone per seat, and the seat positions
+# depend on how many players the table seats. Seat 0 is you (the client draws
+# you at the bottom), then clockwise *as seen on screen* from your left -- the
+# same order as the chairs of the spot screen. Only 6-max is mapped so far.
+DEALER_TABLE_SIZES = (6,)
+# A dealer zone is drawn round the button alone (measured 36-41 px a side). One
+# twice that is almost certainly a player box drawn in the wrong section -- it
+# happened, seat 5 at 149x111 -- and the gold of that player's stack chip could
+# then be read as the button. Such a zone is flagged and not read.
+DEALER_ZONE_MAX_SIDE = 80
+
+
+# The zone around the pot's total, and one per seat around the chips a player has
+# put in this street (the number drawn in front of them). Same seat numbering.
+POT = "pot"
+# The zone where the client draws the countdown bar when it is *your* turn.
+TURN_TIMER = "turn_timer"
+
+
+def stack_region_name(players: int, seat: int) -> str:
+    """`stack_6_3`: where seat 3's stack (chips behind) is written at 6-max."""
+    if players not in DEALER_TABLE_SIZES or not 0 <= seat < players:
+        raise ValueError(f"nessuna zona stack per il posto {seat} a {players} giocatori")
+    return f"stack_{players}_{seat}"
+
+
+def bet_region_name(players: int, seat: int) -> str:
+    """`bet_6_3`: where seat 3's bet amount is written at a 6-max table."""
+    if players not in DEALER_TABLE_SIZES or not 0 <= seat < players:
+        raise ValueError(f"nessuna zona puntata per il posto {seat} a {players} giocatori")
+    return f"bet_{players}_{seat}"
+
+
+def player_region_name(players: int, seat: int) -> str:
+    """`player_6_3`: the zone around seat 3's player box (avatar, name, stack)
+    at a 6-max table, read to tell in hand / out of the hand / empty seat. Same
+    seat numbering as the dealer zones."""
+    if players not in DEALER_TABLE_SIZES or not 0 <= seat < players:
+        raise ValueError(f"nessuna zona giocatore per il posto {seat} a {players} giocatori")
+    return f"player_{players}_{seat}"
+
+
+def dealer_region_name(players: int, seat: int) -> str:
+    """`dealer_6_3`: the zone where seat 3 of a 6-max table shows the button."""
+    if players not in DEALER_TABLE_SIZES or not 0 <= seat < players:
+        raise ValueError(f"nessuna zona dealer per il posto {seat} a {players} giocatori")
+    return f"dealer_{players}_{seat}"
 
 
 @dataclass(frozen=True)

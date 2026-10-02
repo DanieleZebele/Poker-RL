@@ -25,6 +25,16 @@ OMP_NUM_THREADS=1 .venv/bin/poker-dashboard --host 0.0.0.0 --iterations 1000
 cd /mnt/shared_volume/POKER/Poker-RL
 DISPLAY=:1 .venv/bin/poker-gui
 
+# da Windows (PowerShell):
+cd C:\Users\zeppo\Desktop\POKER
+.venv\Scripts\poker-gui.exe
+# oppure, col venv attivato:  .venv\Scripts\Activate.ps1  poi  poker-gui
+# se Activate.ps1 e' bloccato:  Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+# i bot sono modelli addestrati: servono checkpoints/models/ e
+# checkpoints/global/registry.json anche su questo PC.
+# "Chiedi ai modelli" vuole l'extra rl, le zone di cattura l'extra vision:
+.venv\Scripts\pip install -e ".[rl,vision]"
+
 
 # ── RICALIBRARE ELO BENCHMARK ───────────────────────────
 

@@ -115,7 +115,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     from pokerlab.cli.play import discover_global_top_models
 
-    top = discover_global_top_models(args.global_dir, limit=args.limit)
+    # No fallback to top_models/: those are the very copies being replaced.
+    top = discover_global_top_models(args.global_dir, limit=args.limit, fallback_dir=None)
     if not top:
         raise SystemExit("nessun modello nella classifica globale")
     repo = repo_root(Path.cwd())

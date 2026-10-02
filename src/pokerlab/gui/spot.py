@@ -426,8 +426,32 @@ class ModelAdvice:
     value: float
 
 
-def describe_action(action: Action | None, observation: Observation | None = None) -> str:
-    """A short label for an action bin.
+def bb_number(chips: int, big_blind: int) -> str:
+    """`37` chips at a big blind of 2 -> "18,5": big blinds, a comma for the
+    decimals (as the poker client writes them), no trailing zeros."""
+    value = chips / big_blind
+    text = f"{value:.2f}".rstrip("0").rstrip(".")
+    return text.replace(".", ",")
+
+
+def format_bb(chips: int, big_blind: int) -> str:
+    return f"{bb_number(chips, big_blind)} BB"
+
+
+def parse_bb(text: str, big_blind: int) -> int:
+    """ "18,5" (or "18.5") big blinds -> chips at that big blind, rounded to
+    the nearest chip. ValueError if it is not a number."""
+    value = float(text.strip().replace(",", "."))
+    if value < 0:
+        raise ValueError(f"importo negativo: {text!r}")
+    return round(value * big_blind)
+
+
+def describe_action(
+    action: Action | None, observation: Observation | None = None, big_blind: int | None = None
+) -> str:
+    """A short label for an action bin; amounts in big blinds when `big_blind`
+    is given, in chips otherwise.
 
     CALL and ALL_IN carry no meaningful `Action.amount` -- the engine fills that
     in itself -- so the amount is read off the observation instead, exactly as
@@ -435,6 +459,10 @@ def describe_action(action: Action | None, observation: Observation | None = Non
     """
     if action is None:
         return "-"
+
+    def amount(chips: int) -> str:
+        return format_bb(chips, big_blind) if big_blind else str(chips)
+
     kind = action.action_type
     if kind is ActionType.FOLD:
         return "fold"
@@ -443,14 +471,14 @@ def describe_action(action: Action | None, observation: Observation | None = Non
     if kind is ActionType.CALL:
         if observation is not None:
             owed = observation.current_bet_to_match - observation.my_current_bet
-            return f"call {owed}"
+            return f"call {amount(owed)}"
         return "call"
     if kind is ActionType.ALL_IN:
         if observation is not None:
-            return f"all-in {observation.my_stack + observation.my_current_bet}"
+            return f"all-in {amount(observation.my_stack + observation.my_current_bet)}"
         return "all-in"
     verb = "bet" if kind is ActionType.BET else "raise a"
-    return f"{verb} {action.amount}"
+    return f"{verb} {amount(action.amount)}"
 
 
 def advise(

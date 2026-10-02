@@ -22,6 +22,19 @@ CHAIRS = 9
 USER_CHAIR = 0
 
 
+# Where a seat of the poker client sits among these nine chairs, by table size:
+# client seat k (0 = you at the bottom, then clockwise on screen) goes to the
+# chair nearest its angle. 6-max seats are 60 degrees apart and chairs 40, so
+# seats 2 and 4 land exactly (chairs 3, 6), seats 1 and 5 symmetrically 20
+# degrees off (chairs 2, 7), and seat 3, straight across, between two chairs:
+# chair 4 was picked, 5 would be as good.
+CLIENT_SEAT_CHAIRS = {6: (0, 2, 3, 4, 6, 7)}
+
+
+def chair_for_client_seat(players: int, seat: int) -> int:
+    return CLIENT_SEAT_CHAIRS[players][seat]
+
+
 def chair_position(
     chair: int, center: tuple[float, float], radii: tuple[float, float]
 ) -> tuple[float, float]:
