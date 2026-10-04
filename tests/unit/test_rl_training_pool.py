@@ -150,7 +150,7 @@ def test_the_training_registry_is_in_memory_and_writes_nothing(tmp_path):
 def test_parents_are_distinct_rated_models_from_the_top():
     ranking = ranking_of(top=(20, 2000.0, 100), weak=(50, 1000.0, 100))
 
-    parents = pick_parents(ranking, list(ranking), 8, rng=random.Random(0), top_n=20)
+    parents = pick_parents(ranking, list(ranking), 8, rng=random.Random(0), tiers=(20,))
 
     assert len(parents) == 8 and len(set(parents)) == 8
     assert all(label.startswith("top") for label in parents)
@@ -267,3 +267,13 @@ def test_a_legacy_snapshot_only_registry_is_still_readable(tmp_path):
     registry.save()
     assert json.loads((tmp_path / "registry.json").read_text())["members"]
     assert load_ranking(tmp_path).members["old"].rating == pytest.approx(1550.0)
+
+
+def test_parents_come_from_every_band_of_the_ranking():
+    ranking = ranking_of(m=(3000, 1500.0, 10))
+    ranked = sorted(ranking.values(), key=lambda m: (-m.rating, m.label))
+    position = {m.label: i for i, m in enumerate(ranked)}
+    rng = random.Random(0)
+    ranks = [position[pick_parents(ranking, list(ranking), 1, rng=rng)[0]] for _ in range(2000)]
+    assert 0.22 < sum(r < 10 for r in ranks) / 2000 < 0.36
+    assert 0.10 < sum(r >= 1000 for r in ranks) / 2000 < 0.24

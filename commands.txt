@@ -40,7 +40,7 @@ cd C:\Users\zeppo\Desktop\POKER
 
 cd /mnt/shared_volume/POKER/Poker-RL
 OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1 .venv/bin/python -m pokerlab.rl.benchmark_arena \
-    --games-per-model 20 --workers 20 \
+    --games-per-model 20 --workers 10 \
     --tolerance 1 --window 20 --min-rounds 50 --max-rounds 200 \
     2>&1 | tee checkpoints/logs/arena-$(date +%Y%m%d-%H%M%S).log
 
@@ -55,15 +55,10 @@ OMP_NUM_THREADS=1 .venv/bin/python -m pokerlab.rl.benchmark_arena --max-rounds 0
 # ── AGGIORNARE L'ELO DI TUTTI I MODELLI (giro di fine training, a mano) ──────────────────────────
 
 cd /mnt/shared_volume/POKER/Poker-RL
-OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1 .venv/bin/poker-elo \
-    --rounds 100 --workers 20 --hands 1000 \
-    2>&1 | tee checkpoints/logs/elo-$(date +%Y%m%d-%H%M%S).log
-
-# ~95 min per giro con --hands 1000, e un giro siede ~55 modelli su ~9.200:
-# per coprirli tutti servono ~170 giri. Le varianti:
-#   --hands 200         giro da ~20 min, rating meno precisi ma molti piu' modelli
-#   --coverage random   estrazione uniforme, come i giri automatici
-#   --prune             permetti anche l'eliminazione, che CANCELLA i file
+OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1 .venv/bin/python -m pokerlab.rl.benchmark_arena \
+    --games-per-model 20 --workers 20 \
+    --tolerance 1 --window 20 --min-rounds 50 --max-rounds 200 \
+    2>&1 | tee checkpoints/logs/arena-$(date +%Y%m%d-%H%M%S).log
 
 
 # ── QUANTE MANI SERVONO PER SAPERE CHI E' PIU' FORTE ──────────────────────────

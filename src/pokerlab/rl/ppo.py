@@ -29,20 +29,6 @@ class PPOConfig:
     learning_rate: float = 3e-4
     clip_epsilon: float = 0.2
     value_coefficient: float = 0.5
-    # **Zero, deliberately.** It was 0.01, and a per-worker sweep over it was
-    # built and then removed: raising it does not make the agent try different
-    # *strategies*, it makes it dither. The bonus perturbs every decision
-    # independently, while a bluff is a sequence (bet the flop, barrel the turn,
-    # shove the river) whose probability under independent noise is the product of
-    # three unlikely deviations -- so it essentially never happens, and when it
-    # does the hand was played with three uncoordinated random actions, loses, and
-    # the gradient learns not to repeat it. The bonus is also symmetric, pushing
-    # mass toward actions that are simply wrong in the spot. Measured: a fixed
-    # 0.01 left runs ending at entropy ~0.5 of a possible ln 11 = 2.40 anyway, and
-    # the best-rated model shows fold logits of 21.4 against ~11 for everything
-    # else. Exploration of *strategy* has to come from somewhere the gradient
-    # cannot absorb -- see "Observation v2" in CLAUDE.md's TODO section.
-    # `--entropy-coef` still exists, so putting a bonus back is one flag.
     entropy_coefficient: float = 0.0
     epochs: int = 4
     minibatch_size: int = 1024

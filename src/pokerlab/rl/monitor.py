@@ -140,6 +140,7 @@ _EVAL = re.compile(
 # draw. Without it the `eval` and `rating` columns cannot be read: they say how
 # the learner did, this says against whom -- and every worker draws its own pool,
 # so the same rating means different things in two rows of the same table.
+_PARENT_RATING = re.compile(r"rating ereditato (-?\d+)")
 _POOL_RATING = re.compile(r"^pool rating: media (-?\d+) min (-?\d+) max (-?\d+)\s*$")
 # The one line `train.py` prints when the round against the frozen anchors ends.
 # It carries the bb/100, the rating the model is published with and the session
@@ -176,6 +177,9 @@ class WorkerProgress:
     name: str
     iterations: int = 0
     inherited: bool = False
+    # The parent's published rating, from the `resumed from` line; None when the
+    # worker did not inherit or the log predates the figure.
+    parent_rating: int | None = None
     stage: str = STAGE_STARTING
     train_bb100: float | None = None
     # How many hands `train_bb100` is averaged over. Below `REWARD_WINDOW_HANDS`
@@ -228,6 +232,7 @@ def parse_worker_log(name: str, text: str, *, age: float | None = None) -> Worke
     """
     iterations = 0
     inherited = False
+    parent_rating: int | None = None
     stage = STAGE_STARTING
     rewards: list[float] = []
     entropy = eval_bb100 = rating = pool_rating = "-"
@@ -243,6 +248,9 @@ def parse_worker_log(name: str, text: str, *, age: float | None = None) -> Worke
             break
         if line.startswith("resumed from "):
             inherited = True
+            found = _PARENT_RATING.search(line)
+            if found:
+                parent_rating = int(found.group(1))
         elif line.startswith("device "):
             header = _HANDS_PER_ITERATION.search(line)
             if header:
@@ -320,6 +328,7 @@ def parse_worker_log(name: str, text: str, *, age: float | None = None) -> Worke
         name=name,
         iterations=iterations,
         inherited=inherited,
+        parent_rating=parent_rating,
         stage=stage,
         train_bb100=(
             sum(window) / len(window) * HANDS_PER_RATE if window else None

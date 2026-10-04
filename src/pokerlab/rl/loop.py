@@ -31,7 +31,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
@@ -104,10 +104,12 @@ from pokerlab.rl.train import (
     DEFAULT_FILL_GAMES_PER_MODEL,
     DEFAULT_FILL_MIN_SESSIONS,
     RUN_METADATA_VERSION,
+    TrainConfig,
 )
 from pokerlab.rl.training_pool import (
     DEFAULT_TOP_N,
     DEFAULT_TOP_SHARE,
+    PARENT_TIERS,
     available_labels,
     pick_parents,
 )
@@ -401,6 +403,21 @@ HP_LADDERS: dict[str, tuple[float, ...]] = {
     "opponent_probability": (0.32, 0.40, 0.50, 0.62, 0.78),
     "ppo_epochs": (2, 3, 4, 5, 6),
     "clip_epsilon": (0.13, 0.16, 0.20, 0.25, 0.31),
+    # Added later, centred on the values every earlier run used (`PPOConfig`'s
+    # defaults and `TrainConfig.lam`), so the sampled arm is again a draw around
+    # the known-good point. `minibatch_size` sets how many gradient steps an
+    # epoch takes, `gae_lambda` the bias/variance of the advantages,
+    # `value_coef` how loudly the critic speaks against the policy, and
+    # `max_grad_norm` how large one step may be.
+    "minibatch_size": (512, 724, 1024, 1448, 2048),
+    "gae_lambda": (0.90, 0.93, 0.95, 0.97, 0.99),
+    "value_coef": (0.25, 0.35, 0.5, 0.7, 1.0),
+    "max_grad_norm": (0.25, 0.35, 0.5, 0.7, 1.0),
+    # Centred on 0.0, which is what the fleet runs (see
+    # `PPOConfig.entropy_coefficient` for why it is off). Reopened at the user's
+    # request; a positive bonus buys per-decision dithering, not strategy, so
+    # selection is what decides whether any lineage keeps one.
+    "entropy_coef": (0.0, 0.0, 0.0, 0.001, 0.003),
     # **How strong a field the worker trains against.** These two were held
     # fixed with `--pool-models` at first, on the grounds that who a run trains
     # against decides what its result means; they were then opened at the user's
@@ -429,7 +446,25 @@ HP_LADDERS: dict[str, tuple[float, ...]] = {
 # else is a float. This exists so `HP_LADDERS` is the only place an axis has to
 # be added: both arms build a `Hyperparameters` from the dict generically, and
 # the type is the one thing the ladder itself cannot say (0.0 and 0 look alike).
-_HP_INT_AXES = frozenset({"hands", "ppo_epochs", "pool_top_n"})
+_HP_INT_AXES = frozenset({"hands", "ppo_epochs", "pool_top_n", "minibatch_size"})
+
+# What a parent that predates an axis was effectively trained with. Without it
+# every published model (none carries the four newest axes) would look unusable
+# to `perturb_hyperparameters` and the whole fleet would fall back to sampling
+# at once. Only axes added after the metadata schema was fixed belong here; the
+# original ones stay strict, so a half-written parent is still refused.
+_HP_DEFAULTS: dict[str, float] = {
+    "minibatch_size": PPOConfig.minibatch_size,
+    "gae_lambda": TrainConfig.lam,
+    "value_coef": PPOConfig.value_coefficient,
+    "max_grad_norm": PPOConfig.max_grad_norm,
+    "entropy_coef": PPOConfig.entropy_coefficient,
+}
+
+# Zero is absorbing under a multiplier, and 0.0 is where this axis lives, so an
+# upward draw from exactly zero lands on this value instead of staying put.
+# Downward draws from zero stay zero; from a positive value they decay as usual.
+_HP_SEED_FROM_ZERO: dict[str, float] = {"entropy_coef": 1e-3}
 
 # What the inherit arm multiplies its parent's value by, one independent draw per
 # axis. This is ordinary PBT's x{0.8, 1.0, 1.25} with the user's own 1.2, and it
@@ -458,6 +493,14 @@ HP_MULTIPLIERS: tuple[float, ...] = (0.8, 1.0, 1.2)
 # come from the top band). There is deliberately no lower cap, here or anywhere:
 # multiplying a positive value by 0.8 can never reach 0.
 _HP_PROBABILITY_AXES = frozenset({"opponent_probability", "pool_top_share"})
+
+# Axes perturbed through their complement, `1 - value`. For the GAE lambda the
+# quantity that matters is `1 - lambda`: the effective horizon is
+# `1 / (1 - lambda)`, so x0.8 / x1.2 on lambda itself would jump 0.95 to 0.76
+# (horizon 20 -> 4) or past 1.0, while on the complement they give 0.96 / 0.94
+# and can never reach 1. Stored, passed and reported as lambda everywhere else.
+_HP_COMPLEMENT_AXES = frozenset({"gae_lambda"})
+_COMPLEMENT_FLOOR = 1e-3
 
 # Which arm produced a worker's settings, recorded in its published model as
 # `hp_arm`. Still recorded, and still not cosmetic: an inherited point
@@ -494,6 +537,11 @@ class Hyperparameters:
     # seats come from the best-rated band, and how deep that band is.
     pool_top_share: float
     pool_top_n: int
+    minibatch_size: int = PPOConfig.minibatch_size
+    gae_lambda: float = TrainConfig.lam
+    value_coef: float = PPOConfig.value_coefficient
+    max_grad_norm: float = PPOConfig.max_grad_norm
+    entropy_coef: float = PPOConfig.entropy_coefficient
     arm: str = HP_ARM_SAMPLED
 
 
@@ -580,11 +628,17 @@ def perturb_hyperparameters(
         return None
     moved: dict[str, float] = {}
     for axis in HP_LADDERS:
-        inherited = parent.get(axis)
+        inherited = parent.get(axis, _HP_DEFAULTS.get(axis))
         if not isinstance(inherited, (int, float)) or isinstance(inherited, bool):
             return None
         multiplier = rng.choice(HP_MULTIPLIERS)
+        if axis in _HP_COMPLEMENT_AXES:
+            complement = max(1.0 - float(inherited), _COMPLEMENT_FLOOR)
+            moved[axis] = max(0.0, 1.0 - complement * multiplier)
+            continue
         value = float(inherited) * multiplier
+        if inherited == 0 and multiplier > 1.0 and axis in _HP_SEED_FROM_ZERO:
+            value = _HP_SEED_FROM_ZERO[axis]
         if axis in _HP_PROBABILITY_AXES:
             value = min(value, 1.0)
         if axis in _HP_INT_AXES:
@@ -692,7 +746,7 @@ def inheritance_plan(
     fraction: float,
     *,
     rng: random.Random,
-    top_n: int = DEFAULT_TOP_N,
+    tiers: Sequence[int | None] = PARENT_TIERS,
 ) -> list[Path | None]:
     """Which model, if any, each worker starts from.
 
@@ -706,12 +760,12 @@ def inheritance_plan(
     same loop.
 
     Inheritors take distinct parents drawn at random from the best-rated models
-    on disk (`pick_parents`), so the deep half is competing lineages rather than
+    on disk (`pick_parents`: top 10/100/1000/all, a quarter each), so the deep half is competing lineages rather than
     copies of one, and a different set every generation.
     """
     inheriting = min(workers, max(0, round(workers * fraction)))
     parents = pick_parents(
-        ranking.members, available_labels(models_dir), inheriting, rng=rng, top_n=top_n
+        ranking.members, available_labels(models_dir), inheriting, rng=rng, tiers=tiers
     )
     plan: list[Path | None] = [None] * workers
     for index, label in enumerate(parents):
@@ -748,6 +802,11 @@ def launch_worker(
             clip_epsilon=args.clip_epsilon,
             pool_top_share=args.pool_top_share,
             pool_top_n=args.pool_top_n,
+            minibatch_size=args.minibatch_size,
+            gae_lambda=args.gae_lambda,
+            value_coef=args.value_coef,
+            max_grad_norm=args.max_grad_norm,
+            entropy_coef=args.entropy_coef,
             arm=HP_ARM_SAMPLED,
         )
     hp = effective_hyperparameters(hp, inheriting=inheriting, fresh_lr=args.fresh_lr)
@@ -779,6 +838,11 @@ def launch_worker(
         "--opponent-probability", str(hp.opponent_probability),
         "--ppo-epochs", str(hp.ppo_epochs),
         "--clip-epsilon", str(hp.clip_epsilon),
+        "--minibatch-size", str(hp.minibatch_size),
+        "--gae-lambda", str(hp.gae_lambda),
+        "--value-coef", str(hp.value_coef),
+        "--max-grad-norm", str(hp.max_grad_norm),
+        "--entropy-coef", str(hp.entropy_coef),
         # Recorded by the worker into the model it publishes, never acted on:
         # which arm drew these values is what separates the runs an analysis can
         # read a response curve from.
@@ -1196,7 +1260,6 @@ def run_loop(args: argparse.Namespace) -> None:
             args.workers,
             args.inherit_fraction,
             rng=plan_rng,
-            top_n=args.pool_top_n,
         )
         # Read once per generation, off the very checkpoints the workers are
         # about to resume from: at most `--workers` files, and only for the
@@ -1356,6 +1419,11 @@ def main() -> None:
     # that do not are the ones that cannot.)
     parser.add_argument("--ppo-epochs", type=int, default=PPOConfig.epochs)
     parser.add_argument("--clip-epsilon", type=float, default=PPOConfig.clip_epsilon)
+    parser.add_argument("--minibatch-size", type=int, default=PPOConfig.minibatch_size)
+    parser.add_argument("--gae-lambda", type=float, default=TrainConfig.lam)
+    parser.add_argument("--value-coef", type=float, default=PPOConfig.value_coefficient)
+    parser.add_argument("--max-grad-norm", type=float, default=PPOConfig.max_grad_norm)
+    parser.add_argument("--entropy-coef", type=float, default=PPOConfig.entropy_coefficient)
     parser.add_argument(
         "--opponent-probability", type=float, default=0.5,
         help="chance that a non-learner seat gets an opponent instead of another "

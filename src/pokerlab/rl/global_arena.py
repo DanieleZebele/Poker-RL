@@ -59,10 +59,10 @@ DEFAULT_GLOBAL_DIR = Path("checkpoints/global")
 # could reach, rather than by branching around `_eliminate`: one pruning rule,
 # one place. Two callers pass it -- `poker-elo`, whose job is to refresh ratings
 # and which must not delete checkpoints as a side effect of being run, and the
-# Elo fill-in phase, which uses `top_biased_draw` and therefore *must* not prune
+# Elo fill-in phase, which uses `tiered_draw` and therefore *must* not prune
 # (a biased draw makes the often-seated eligible sooner and the rarely-seated
 # immune, so a pass would eat the middle of the population instead of its
-# bottom -- see `top_biased_draw`).
+# bottom -- see `tiered_draw`).
 NO_PRUNE_TRIGGER = 10**9
 # Every frozen Elo anchor lives under this one directory of the checkpoint
 # root, all in one flat directory.
@@ -83,7 +83,7 @@ DEFAULT_BENCHMARK_SAMPLE = 5
 # than the `BENCHMARK_GAMES_PERCENTILE` of the population and a rating more than
 # `BENCHMARK_MARGIN` points above the best anchor joins the frozen set. Pruning
 # no longer promotes anything: every eliminated model is deleted.
-BENCHMARK_GAMES_PERCENTILE = 75.0
+BENCHMARK_GAMES_PERCENTILE = 90.0
 BENCHMARK_MARGIN = 10.0
 # A thousand hands per rated session, up from a hundred. Elo reads only the
 # *sign* of each pair's chip delta, so the length of a session is what decides
@@ -345,38 +345,42 @@ def sample_population(
     return chosen + remainder[: count - half]
 
 
-def top_biased_draw(
+# The rating bands `tiered_draw` splits the ranking into, as `(first, last)`
+# ranks (0-based, `last` exclusive, `None` = to the end) with an equal quarter
+# of the seats each: the top 10, the rest of the top 100, the rest of the top
+# 1,000, and everybody else.
+DRAW_BANDS: tuple[tuple[int, int | None], ...] = ((0, 10), (10, 100), (100, 1000), (1000, None))
+
+
+def tiered_draw(
     ratings: Mapping[str, dict],
     *,
-    top_n: int = 1000,
-    share: float = 0.5,
+    bands: tuple[tuple[int, int | None], ...] = DRAW_BANDS,
 ) -> Callable[[list[Candidate], int, random.Random], list[Candidate]]:
-    """A draw that spends half its seats on the `top_n` best-rated models.
+    """A draw that gives each rating band an equal share of the seats.
 
     **Why bias at all.** A round seats ~50 of ~9,600 models, so a given model
     comes up about 0.5% of the time and a rating can sit on the number its
-    training run published for many generations. Spread evenly that budget buys
-    a little precision everywhere, including on model #5000, whose exact rating
-    nothing reads. What *is* read is the top: `pick_parents` draws from the best
-    100, and the ordering there was measured wrong (see "The ranking is wrong at
-    the top"). Half the seats reserved for the top 1,000 raises a top model's
-    chance per round from ~0.5% to ~2.8% while halving everyone else's to
-    ~0.26% -- five times the evidence where it is used, at the cost of letting
-    the tail go staler, which is the right trade.
+    training run published for many generations. What is read is the top:
+    `pick_parents` draws from the best 100, and the ordering there was measured
+    wrong (see "The ranking is wrong at the top"). With a quarter of the seats on
+    each of ranks 1-10, 11-100, 101-1,000 and the rest, the best ten are seated
+    in nearly every round, the next ninety about every other round, and the
+    long tail keeps a quarter of the seats rather than none.
 
-    **Only for rounds that cannot delete anyone.** The automatic end-of-run
-    round draws uniformly on purpose, because it decides who gets *pruned* and
-    an honest draw is what that decision deserves. Biasing it would also invert
-    what pruning removes: eligibility requires `games` at or above the median,
-    so models drawn ten times as often become eligible far sooner while the
-    rarely-drawn weak tail stays permanently protected, and the pass would eat
-    the middle of the population instead of its bottom. Use this only where
-    `trigger_size` is lifted to `NO_PRUNE_TRIGGER`.
+    The bands are disjoint (a model belongs to one), seats are split by largest
+    remainder with the leftover seats given to random bands so the average share
+    is exact, and models inside a band are drawn uniformly without repetition.
+    A band too small for its seats (the top ten against 12 or 13) hands the
+    shortfall to the models not yet drawn, uniformly, so the round always comes
+    out at `count` while the disk holds that many models. A model with no rating
+    yet belongs to the last band: it is untested, not excluded.
 
-    A model with no rating yet counts as untested and is reachable only through
-    the uniform half -- it is not excluded, and `rate_against_benchmark` gives a
-    freshly published model a rating immediately, so newcomers reach the top
-    band on their own merits rather than being locked out.
+    **Pruning and this draw do not go together.** Eligibility for deletion is a
+    percentile of `games`, so seating some models far more often than others
+    makes them eligible sooner and leaves the rarely-seated tail immune (see
+    `DEFAULT_PROTECT_PERCENTILE`). Pass `trigger_size=NO_PRUNE_TRIGGER` unless
+    that is wanted.
     """
 
     def draw(
@@ -388,14 +392,24 @@ def top_biased_draw(
             (c for c in population if c.label in ratings),
             key=lambda c: (-ratings[c.label].get("rating", 0.0), c.label),
         )
-        top = rated[:top_n]
-        wanted = min(round(count * share), len(top))
-        chosen = rng.sample(top, wanted) if wanted else []
+        unrated = [c for c in population if c.label not in ratings]
+        groups: list[list[Candidate]] = []
+        for index, (first, last) in enumerate(bands):
+            group = rated[first:last]
+            if index == len(bands) - 1:
+                group = group + unrated
+            groups.append(group)
+
+        base, extra = divmod(count, len(bands))
+        quotas = [base] * len(bands)
+        for index in rng.sample(range(len(bands)), extra):
+            quotas[index] += 1
+
+        chosen: list[Candidate] = []
+        for group, quota in zip(groups, quotas):
+            chosen.extend(rng.sample(group, min(quota, len(group))))
         taken = {c.label for c in chosen}
         rest = [c for c in population if c.label not in taken]
-        # Whatever the top half could not fill spills into the uniform half, so
-        # the round always comes out at `count` as long as the disk holds that
-        # many models.
         chosen.extend(rng.sample(rest, min(count - len(chosen), len(rest))))
         return chosen
 

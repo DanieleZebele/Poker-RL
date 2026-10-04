@@ -205,7 +205,7 @@ DEFAULT_K_SCHEDULE: tuple[tuple[int, float], ...] = (
 # a network needs to count as reliably rated (the `DEFAULT_PROTECT_PERCENTILE`
 # of games played among the models rated so far).
 DEFAULT_POPULATION_TRIGGER = 10_000
-DEFAULT_ELIMINATION_FRACTION = 0.25
+DEFAULT_ELIMINATION_FRACTION = 0.05
 # **The 25th percentile, lowered from the 50th.** The protection exists so a
 # rating built on a handful of games is never grounds for deletion, and at the
 # real population that bar is still comfortably met: measured over the 9,588
@@ -218,8 +218,8 @@ DEFAULT_ELIMINATION_FRACTION = 0.25
 # well-played ones eligible sooner and leaves the rarely-drawn tail permanently
 # immune -- and the pass then eats the middle of the population instead of its
 # bottom, which is the opposite of what pruning is for. That pressure grows
-# with `top_biased_draw` (see `global_arena.py`), which deliberately seats the
-# top band five times as often. Lowering the bar to the 25th percentile widens
+# with `tiered_draw` (see `global_arena.py`), which deliberately seats the
+# top bands far more often. Lowering the bar to the 25th percentile widens
 # the eligible set from 50% to 75% of the population, so the tail comes back
 # within reach.
 #

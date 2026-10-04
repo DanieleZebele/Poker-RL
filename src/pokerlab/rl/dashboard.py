@@ -416,6 +416,7 @@ function machine(m){
     const p = Math.min(100, Math.round(w.iterations / Math.max(1, m.iterations_target) * 100));
     const key = `${m.machine}|${w.name}|${m.generation}`;
     hpByKey.set(key, w.hyperparameters || null);
+    parentByKey.set(key, w.parent_rating);
     return `<tr class="worker${openPanels.has(key) ? ' open' : ''}" data-key="${esc(key)}">
       <td class="mono">${esc(w.name)}<span class="dim" title="${w.inherited ? 'eredita i pesi' : 'parte da zero'}"> ${w.inherited ? '^' : '.'}</span></td>
       <td><span class="bar"><i style="width:${p}%"></i></span><span class="dim">${w.iterations}/${m.iterations_target}</span></td>
@@ -461,6 +462,7 @@ const openPanels = new Set();    /* machine|worker|gen currently expanded */
    attribute because `esc` does not escape quotes, and settings do not belong in
    an HTML attribute just to be read back out of it two lines later. */
 const hpByKey = new Map();
+const parentByKey = new Map();
 const drawn = new Map();         /* last history fetched, so a redraw is free */
 
 const ITER_CHARTS = [
@@ -606,7 +608,8 @@ function renderCharts(host, hist){
    its own name, so an axis added to the sweep appears here without a change. */
 const HP_LABELS = {
   lr: 'lr', hands: 'mani/iter', ppo_epochs: 'epoche PPO',
-  clip_epsilon: 'clip', opponent_probability: 'prob. avversario',
+  clip_epsilon: 'clip', minibatch_size: 'minibatch', gae_lambda: 'lambda GAE',
+  value_coef: 'coef. value', max_grad_norm: 'max grad norm', entropy_coef: 'coef. entropia', opponent_probability: 'prob. avversario',
   /* Together these two are the strength of the field the worker trains against:
      what share of its seats come from the best-rated band, and how deep that
      band is. The `pool` column shows the strength they actually produced. */
@@ -624,13 +627,16 @@ const HP_ARM_LABELS = {
 
 function hpHtml(key){
   const hp = hpByKey.get(key);
+  const parent = parentByKey.get(key);
+  const parentChip = parent == null ? '' : '<span class="chip"><b>Elo genitore</b> ' + esc(parent) + '</span>';
   if (!hp || !Object.keys(hp).length){
     return '<div class="hp"><span class="dim">iperparametri non registrati: log di un worker '
-      + 'avviato prima dello sweep</span></div>';
+      + 'avviato prima dello sweep</span>' + parentChip + '</div>';
   }
   const arm = hp.hp_arm || '';
   const chips = ['<span class="chip arm" title="solo un braccio campionato in modo indipendente si legge come curva di risposta">'
     + esc(HP_ARM_LABELS[arm] || arm) + '</span>'];
+  if (parentChip) chips.push(parentChip);
   const known = Object.keys(HP_LABELS).filter(k => k in hp);
   const extra = Object.keys(hp).filter(k => k !== 'hp_arm' && !(k in HP_LABELS));
   for (const k of known.concat(extra)){

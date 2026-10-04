@@ -460,7 +460,7 @@ def test_half_the_workers_inherit_and_half_start_from_scratch(tmp_path):
 
 def test_inheritors_get_distinct_parents_from_the_top_of_the_ranking(tmp_path):
     models, ranking = store_with_ranking(tmp_path, 30)
-    plan = inheritance_plan(ranking, models, 8, 0.5, rng=random.Random(1), top_n=10)
+    plan = inheritance_plan(ranking, models, 8, 0.5, rng=random.Random(1), tiers=(10,))
     parents = [p.stem for p in plan if p is not None]
     assert len(parents) == 4 and len(set(parents)) == 4, "every parent is different"
     assert all(int(label[1:]) < 10 for label in parents), "only the top_n are eligible"
@@ -469,8 +469,8 @@ def test_inheritors_get_distinct_parents_from_the_top_of_the_ranking(tmp_path):
 def test_the_parents_differ_from_one_generation_to_the_next(tmp_path):
     models, ranking = store_with_ranking(tmp_path, 60)
     rng = random.Random(7)
-    first = inheritance_plan(ranking, models, 8, 0.5, rng=rng, top_n=50)
-    second = inheritance_plan(ranking, models, 8, 0.5, rng=rng, top_n=50)
+    first = inheritance_plan(ranking, models, 8, 0.5, rng=rng)
+    second = inheritance_plan(ranking, models, 8, 0.5, rng=rng)
     assert first != second
 
 
@@ -507,6 +507,8 @@ def launch_args(tmp_path, **overrides):
         "models_dir": tmp_path / "models",
         "machine": "host-a", "pool_models": 20, "pool_top_share": 0.5, "pool_top_n": 100,
         "ppo_epochs": 4, "clip_epsilon": 0.2, "eval_every": 10,
+        "minibatch_size": 1024, "gae_lambda": 0.95, "value_coef": 0.5, "max_grad_norm": 0.5,
+        "entropy_coef": 0.0,
         "eval_sessions": 2, "archive_every": 5,
         "benchmark_dir": tmp_path / "benchmark", "benchmark_seed": 1,
         "global_dir": tmp_path / "global", "global_lock_seconds": 120, "global_round": False,
@@ -604,6 +606,11 @@ def a_parent(**overrides):
         "clip_epsilon": 0.20,
         "pool_top_share": 0.50,
         "pool_top_n": 100,
+        "minibatch_size": 1024,
+        "gae_lambda": 0.95,
+        "value_coef": 0.5,
+        "max_grad_norm": 0.5,
+        "entropy_coef": 0.0,
     }
     values.update(overrides)
     return values
@@ -653,6 +660,12 @@ def test_an_inheriting_worker_multiplies_every_axis_by_one_of_the_multipliers():
                 round(was * m) if isinstance(got, int) else was * m
                 for m in HP_MULTIPLIERS
             ]
+            if axis in loop_module._HP_COMPLEMENT_AXES:
+                allowed = [1 - (1 - was) * m for m in HP_MULTIPLIERS]
+            if axis in loop_module._HP_PROBABILITY_AXES:
+                allowed = [min(v, 1.0) for v in allowed]
+            if was == 0:
+                allowed.append(loop_module._HP_SEED_FROM_ZERO[axis])
             assert any(got == pytest.approx(value) for value in allowed), (axis, got, allowed)
         assert child.arm == HP_ARM_INHERITED
 
@@ -891,6 +904,7 @@ def test_the_settings_are_read_back_out_of_a_real_checkpoint(tmp_path):
         hands=640, players=6, stack=200, sb=1, bb=2, lr=3.8e-4, ppo_epochs=5,
         clip_epsilon=0.25, entropy_coef=0.0, opponent_probability=0.62,
         pool_models=20, pool_top_share=0.5, pool_top_n=100,
+        minibatch_size=1024, gae_lambda=0.95, value_coef=0.5, max_grad_norm=0.5,
     )
     path = tmp_path / "agent.pt"
     save_checkpoint(path, PokerActorCritic(), iteration=100, metadata=run_metadata(args))
@@ -2061,3 +2075,36 @@ def test_a_log_without_a_header_gets_no_mean_curve():
 
     assert history.train_bb100  # the raw series is still there
     assert history.train_bb100_mean == []
+
+
+def test_a_parent_without_the_newest_axes_still_gets_perturbed():
+    """Every model published before minibatch/lambda/value/grad-norm became axes
+    lacks them; treating that as unusable would drop the fleet to sampling."""
+    child = perturb_hyperparameters(a_parent(), random.Random(0))
+    assert child is not None and child.arm == loop_module.HP_ARM_INHERITED
+    assert child.minibatch_size in {round(1024 * m) for m in loop_module.HP_MULTIPLIERS}
+    assert child.gae_lambda <= 1.0
+
+
+def test_the_newest_axes_are_inherited_from_a_parent_that_has_them():
+    parent = a_parent(minibatch_size=2000, gae_lambda=0.99, value_coef=1.0, max_grad_norm=0.1)
+    seen = {perturb_hyperparameters(parent, random.Random(s)).minibatch_size for s in range(50)}
+    assert seen <= {1600, 2000, 2400}
+
+
+def test_entropy_coefficient_can_leave_zero_but_only_upwards():
+    """Zero is where the fleet lives and a multiplier alone never leaves it."""
+    up = {perturb_hyperparameters(a_parent(entropy_coef=0.0), random.Random(s)).entropy_coef for s in range(60)}
+    assert up == {0.0, 1e-3}
+    down = {perturb_hyperparameters(a_parent(entropy_coef=1e-3), random.Random(s)).entropy_coef for s in range(60)}
+    assert down == {0.8e-3, 1e-3, 1.2e-3}
+
+
+def test_the_gae_lambda_moves_through_its_complement():
+    """x0.8 / x1.2 on lambda would jump 0.95 to 0.76 or past 1; on 1 - lambda it
+    stays near the parent and can never reach 1."""
+    got = {round(perturb_hyperparameters(a_parent(gae_lambda=0.95), random.Random(s)).gae_lambda, 4)
+           for s in range(60)}
+    assert got == {0.96, 0.95, 0.94}
+    top = {perturb_hyperparameters(a_parent(gae_lambda=1.0), random.Random(s)).gae_lambda for s in range(60)}
+    assert max(top) < 1.0

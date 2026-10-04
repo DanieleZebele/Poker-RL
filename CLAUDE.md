@@ -837,40 +837,6 @@ and run at the speed of one), organised into generations.
   touched. **Never run the sweep on one machine against another machine's
   `work/` directory from a shell** — this host's `/proc` cannot see that machine's
   workers, so a live one would look abandoned.
-- **The entropy bonus is off: `PPOConfig.entropy_coefficient = 0.0`**
-  (`poker-train --entropy-coef` to put one back). It was a fixed 0.01, and a
-  per-worker log-uniform sweep over it was built and then **removed at the user's
-  decision**. The reasoning, which is worth keeping because the bonus is the
-  reflexive wrong answer whenever "more exploration" comes up: raising it does not
-  make the agent try different *strategies*, it makes it **dither**.
-  - The bonus perturbs every decision **independently**, while a bluff is a
-    *sequence* — bet the flop, barrel the turn, shove the river — whose
-    probability under independent noise is the product of three unlikely
-    deviations. It essentially never happens, and when it does the hand was played
-    with three uncoordinated random actions, so it loses and the gradient learns
-    not to repeat it. The bonus is also **symmetric**, pushing mass toward
-    actions that are simply wrong in the spot.
-  - Measured, at the old fixed 0.01: a **fresh** worker starts at entropy 1.62 and
-    collapses to 0.51 within the run; an **inheriting** one starts at 0.48 and
-    ends at 0.55 — both at ~1.7 effective actions of a possible 11 (ceiling
-    ln 11 = 2.40). On the best-rated model (1687), fold is 49.8% of all decisions
-    and **70.6% when legal**, and in one fold spot the logits read fold **21.40**
-    against ~11 for everything else: 100.0% vs 0.0%, entropy 0.002. Softening
-    those logits (temperature 3) does produce 14.6% aggression, but spread evenly
-    over all ten alternatives including the ones correctly played ~0% of the time.
-  - **A fixed additive bias on the logits does not work either**, and this is the
-    trap: if the policy is `softmax(net(s) + b)` and PPO optimises `net`, the
-    optimum becomes `net_opt − b` — the network simply learns to cancel the bias,
-    and at convergence nothing changed. Adding +4.0 to every aggressive bin of the
-    trained model above moved fold from 100.0% only to 99.3%.
-  - So strategy-level exploration has to live somewhere the gradient **cannot
-    absorb**: in the data distribution (tilt the *behaviour* policy at collection
-    time only, coherently for the whole run — PPO's ratio already supports it,
-    since `DecisionRecord.log_prob` stores the acting policy's probability), as a
-    KL penalty toward a tilted reference distribution, or in the environment
-    itself (stack depth, table size — both TODO items). And the reading the
-    project currently favours is that the binding constraint is not exploration at
-    all but what the agent can *see*: see "Observation v2" in the TODO section.
 - **Every worker inherits weights; none starts from scratch any more**
   (`--inherit-fraction`, default **1.0**, via `inheritance_plan`). It was 0.5,
   and the fresh half was removed at the user's decision after being measured
@@ -1183,434 +1149,18 @@ and run at the speed of one), organised into generations.
     every round because the previous one just moved it. What it does not avoid is
     loading the drawn models, ~203 MB and a few seconds a round, which is why it
     is not made shorter still.
-  - **It draws through `top_biased_draw` and can never prune**, and the two go
-    together. Half the seats go to the 1,000 best-rated models, which is where a
-    waiting worker's time is worth spending — the top is the only part of the
-    ranking anything reads, `pick_parents` draws from the best 100, and the
-    ordering there was measured wrong. It is also the only place that bias is
-    *safe*: eligibility for deletion is a percentile of `games`, so a biased draw
-    makes the often-seated eligible sooner and leaves the rarely-drawn tail
-    permanently immune, and a pruning pass under it would eat the middle of the
-    population instead of its bottom. These rounds therefore lift `trigger_size`
-    to `NO_PRUNE_TRIGGER` (which moved to `global_arena.py`, next to the pruning
-    rule it disables). Pinned by `test_a_fill_in_round_can_never_prune`.
-  - **The worker counts `sessions_played`, not `sessions`.** The latter counts
-    what the merge folded in from *every* machine, which on a busy fleet is
-    thousands and would satisfy the 50-session floor on the first round without
-    this worker having played anything. `PopulationRoundReport` carries both, and
-    `play_population_round_sharded` now returns a `PlayedRound` with the
-    candidate count and the session count rather than one bare integer.
-  - **A failure costs the extra rounds and nothing else.** By this point the run
-    has trained, published and been rated; the phase is wrapped in the same kind
-    of guard as the end-of-run round, so a broken round ends the fill-in instead
-    of turning a successful run into a failed process exit.
-  - **`--status` shows it as `elo: extra`** (`phases.ELO_FILL`) and — this
-    matters — **a filling worker is excluded from the `fine :` ETA**. Its only
-    known number is its own safety cap, hours away, and being the longest it
-    would become the machine's answer to "how much longer" for the one worker
-    the generation is certainly *not* waiting for. The line counts them
-    separately instead. The progress line deliberately carries no ETA at all.
-  - The e2e suite runs with `--no-elo-fill-in` except in the one test that is
-    about the handshake, which exercises it with a floor of one session: the
-    phase does not end until its floor is met, which is minutes per worker, and
-    that is paid once rather than by every test.
-- **`rl/benchmark.py` is the only cross-generation measurement.** Ratings are
-  relative by construction: the pool a model is rated against is replaced as
-  training goes on, so a rating steady at 1600 across forty generations could
-  mean no progress *or* progress exactly matching the opposition's. The
-  benchmark fixes the opposition instead -- whatever models currently sit in
-  `checkpoints/benchmark/`, the same deals, the same seats, every generation --
-  so the only thing that differs between two measurements is the model being
-  scored. (The set's *size* is not fixed at any one number that this file can
-  assume: it is
-  every model under `checkpoints/benchmark/`, read recursively, and it grows
-  whenever a run adds a model by the rule in "How a model becomes a benchmark
-  anchor" below. It only ever changes by that explicit, logged action -- never
-  silently -- but a generation-by-generation trend is only meaningful across a
-  stretch where nothing was added.)
-  - **The benchmark models are held out of training.** They live in
-    `--benchmark-dir` (default `checkpoints/benchmark`), which the training pool
-    never reads. Seating them in training would make the number measure
-    memorisation of specific opponents instead of strength -- training on the
-    test set.
-  - **It is exactly reproducible, and that is the whole point.** `Table`
-    consumes its `random.Random` only to shuffle the deck, once per hand, so a
-    fixed seed deals an identical sequence no matter how the betting goes or
-    which model is playing. Seats and opponent draws are functions of the block
-    index rather than sampled, and `torch.manual_seed` is called at the start.
-    Verified directly: the same model measured twice returns the identical
-    number (-253.25 bb/100 both times), while a different model returns a
-    different one (-196.92). Contrast the pool evaluation, which spreads
-    ~350-570 bb/100 on one fixed model across seeds. Two tests guard this:
-    same-model-twice must match, different-models must not.
-  - A missing or too-small benchmark directory is not fatal; the generation
-    simply records no comparable number.
-  - **Two models are benchmarked per generation, and the second is the one that
-    matters**: the best-rated model in the store, and the best model *that
-    generation produced* on this machine (`<machine>-gen<N>-`, by the rating it
-    published with). Benchmarking only the overall best is not enough, and this was
-    found the hard way -- for generations 3 and 4 the best was
-    `seed16-iter00100`, a *pre-loop* model, so the headline benchmark printed
-    the identical -10.5 twice while saying nothing at all about the newly
-    trained models. The per-generation series is what answers "is the loop
-    improving". (The identical repeat is also a live demonstration that the
-    benchmark is deterministic: same model, same number.)
-  - `poker-loop --status` prints both series with their trends. **Those, not
-    the ratings, are what say whether the loop is working.**
-- Tests: `tests/unit/test_rl_loop.py` covers the choreography (inheritance, the
-  hyperparameter sweep, the command a worker is launched with, the fill-in
-  handshake, the sweep of residues, atomic state);
-  `tests/integration/test_rl_loop_e2e.py` runs the real loop with real workers for
-  two generations and pins the contract between `poker-loop` and `poker-train`
-  (every flag the loop passes must be one train accepts) and the whole life of a
-  model — drawn, trained, published, registered, rated, cleaned up — plus one
-  real run of the fill-in handshake, which is the kind of bug (a mutual wait)
-  that only a real run can catch; the worker's own half of the fill-in is in
-  `tests/unit/test_rl_ppo.py`, and `tests/unit/test_rl_benchmark.py` covers the
-  benchmark. All three need the `rl` extra.
-
-## Monitoring the fleet in a browser (`rl/dashboard.py`)
-
-`poker-dashboard` serves one page showing **every machine at once**, refreshing
-itself, which `poker-loop --status --watch` cannot do: that is one machine in one
-terminal. Same data, same files, read-only.
-
-- **It must not import torch, and that is a hard requirement.** Measured on the
-  NFS server while it was serving 60 remote workers, `import torch` took **over
-  five minutes** (load 29, all of it I/O wait, page cache thrashed). A monitoring
-  tool that takes five minutes to start is not a monitoring tool. `rl/monitor.py`
-  exists for this: it holds `LoopState`, the whole log-parsing and formatting path
-  and `benchmark_series`, all pure Python, and `loop.py` and `benchmark.py`
-  re-export from it so there is one definition each. The dashboard imports
-  `monitor`, `global_store` and `training_pool` only, and starts in **0.10 s**.
-- **Standard library only** (`http.server`), no Flask and no build step. The
-  project's one firm rule about dependencies is not to add them for convenience —
-  the GUI is Tkinter for exactly this reason — and a page a few people look at
-  does not need a framework. The whole page is one self-contained HTML string
-  with inline CSS and a small `fetch` loop; there are no static assets.
-- **It only reads**, and reads what `--status` reads: each machine's
-  `loop_state.json`, the current generation's worker logs (through
-  `loop.worker_progress`, so the columns cannot drift from the terminal view),
-  the models directory and the frozen set. A test asserts no file's mtime
-  changes across a snapshot, because it is pointed at a live training volume and
-  left open for hours.
-- **A client hanging up is not an error** (`QuietServer.handle_error`, plus a
-  guard in `_send`). Every open page polls every few seconds, so a tab closed or
-  reloaded mid-response is routine, and left alone `socketserver` prints a 25-line
-  `BrokenPipeError` traceback — into the very terminal the dashboard is running in,
-  which is where the operator is reading everything else. Only the
-  connection-reset family is swallowed; anything else still gets the default
-  traceback, because a real bug here has to stay visible. Both halves are tested.
-- **Three routes**: `/` is the page, `/api/status` the JSON it polls, and
-  `/api/history` one worker's training curves. Keeping the data behind endpoints
-  is what lets the page update without reloading, and makes the same numbers
-  available to anything else that wants them.
-- **The `fase` cell carries the progress of the two long end-of-run rounds**, a
-  narrow bar plus the percentage and the ETA, and the machine header a
-  `fine ~38m` pill (the slowest worker's, since that is when the generation
-  ends). Same source as the terminal view — `worker_progress` reads the
-  `avanzamento` lines and `read_machines` passes `WorkerProgress.progress`
-  straight through — so the two cannot say different things. The percentage is
-  computed in the page from `done`/`total` rather than sent as a third number.
-- **The expanded panel opens with the settings that worker was given**, read
-  from the `hyperparameters` field of the status payload rather than fetched
-  separately -- the page already has them. A worker whose log predates the sweep
-  shows a plain "non registrati" instead, which for one generation after a
-  rolling restart is every worker. The panel's markup is built by `panelHtml`,
-  in one place: three call sites used to repeat the same string, and the
-  settings block has to appear in all of them. The machine header also carries a
-  pill with the arm split, so the sweep is visible without opening anything.
-- **The `training (bb/100)` chart carries two series**: the per-iteration value,
-  faint, and the **trailing 100,000-hand mean**, drawn heavier, whose last point
-  is by construction the same number as the table's `train/100` cell (pinned by
-  `test_the_chart_carries_the_same_rolling_mean_the_table_shows`). One iteration
-  has a standard deviation of ~42 bb/100, so the raw line alone is unreadable as
-  a level; it is kept anyway, because a chart of a noisy metric is read for its
-  outliers and the mean would hide the single collapsed iteration the curve
-  exists to reveal. **The mean is computed before `thin` runs**, over every
-  iteration, and then subsampled with the same indices: `thin` deliberately does
-  not average, so a mean taken after it would be the mean of a sample rather
-  than of the window. A log with no header line gets no mean curve at all,
-  rather than one drawn to a different rule than the cell above it.
-- **Training curves, drawn by hand on a `<canvas>`.** Clicking a worker's row
-  expands eight charts under it: the six per-iteration metrics `train.py` prints
-  (training bb/100, entropy, kl, clip fraction, value loss, policy loss), one for the
-  sparse `eval` bb/100 readings, and one for the in-run
-  rating. (It was the same eight with `benchmark` plotted alongside `eval`; that
-  series went with the per-worker benchmark — see the loop section.) A latest-value column cannot show what these are read for — a value
-  loss that climbs instead of staying flat, a `kl` spike, an entropy collapse —
-  so the curve is the whole point. The `kl` chart carries a dashed line at 0.05,
-  the one unambiguous threshold in the diagnostics; no other band is drawn,
-  because the "healthy" figures recorded above are from a *fresh* run and an
-  inheriting worker legitimately starts at entropy ~0.47, so a band would flag
-  half the fleet as broken.
-  - **No chart library.** Same rule as the rest of the page: no build step, no
-    static assets, and the machines are on a private network with no reason to
-    reach a CDN. A line, an axis and a last-value badge is about sixty lines of
-    canvas drawing.
-  - **Served on demand, not in the status poll.** Every open tab polls
-    `/api/status` every few seconds; 140 workers x 400 points x 6 metrics would
-    be megabytes per poll for curves nobody is looking at. One worker's history
-    is ~10-20 KB and is fetched only while its panel is open.
-  - **`monitor.parse_worker_history` is separate from `parse_worker_log`**, and
-    deliberately: the status table wants the latest value of a couple of fields,
-    a chart wants every value of eight. Both tolerate a half-written final line — the
-    logs are read while the workers append to them — and `thin` subsamples to
-    `DEFAULT_MAX_POINTS` (400) *without averaging*, because a chart of noisy
-    per-iteration numbers is read for its outliers and averaging would hide the
-    single 0.2 `kl` spike it exists to reveal. The last point always survives, or
-    a chart stopping short of the present reads as a stalled worker.
-  - **`machine` and `worker` reach the filesystem, so both are whitelisted**:
-    the worker must match `^w\d{1,4}$`, and the machine directory is resolved
-    and required to be a direct child of `--machines-dir`. Anything else is a
-    404 rather than something sanitised.
-  - **Gotcha, and it cost a blank page once**: `PAGE` is an ordinary Python
-    string, so a `\uXXXX` escape written into the JavaScript is resolved by
-    *Python* before a browser ever sees it. `\u0027` became a bare `'` that
-    closed the JS string literal it sat inside. Write the character itself, and
-    syntax-check the script before trusting it — there is no Node on these
-    machines, but `gjs` is installed and `new Function(src)` parses without
-    executing.
-- **The four summary tiles carry the rating *scale*, not just counts**
-  (`store_ratings`): the store's mean and median rating, and the **mean of the top
-  1%**, which is the number worth watching -- the population's best models have sat
-  flat at ~1578-1610 across every age cohort, and that flatness is the evidence
-  behind "The ranking is wrong at the top". Read straight out of the
-  `registry.json` snapshot rather than through `load_ranking`, since four numbers
-  do not need ~9,200 `PoolMember` objects built; a missing or unparseable snapshot
-  leaves the tiles blank rather than taking the page down.
-- **The fleet-wide counts are cached for 30 s** (`FLEET_CACHE_SECONDS`): counting
-  the store walks ~9,000 files, reading the ranking snapshot is 0.2 s, and the page
-  polls every few seconds. Per-machine
-  reads are not cached — they are ~10 log files each and must be live. A full
-  snapshot measured 0.2 s for 7 machines and 90 workers.
-- **Binds to 127.0.0.1 by default**; `--host 0.0.0.0` to reach it from the other
-  machines. The volume is on a private network, but a monitoring page appearing
-  on every interface unasked is not a default worth having.
-- `--iterations` must match the running loop's, exactly as for `--status`: every
-  progress bar is scaled against it.
-
-## Running on several machines (`run.sh`)
-
-`./run.sh start` takes a machine from nothing to a running loop; `status`,
-`watch`, `stop`, `kill`, `kill-dry` and `setup` are the other subcommands. It is
-idempotent. **A bare `./run.sh` prints the help and starts nothing**: it used to
-default to `start`, and a command that looks like it only asks for usage put a
-30-worker production loop on the machine (it happened — the workers were killed
-before finishing an iteration, so nothing reached the shared store, and the
-sweep reclaimed the 47 MB they left). `start` now has to be spelled out.
-
-**The project directory is on an NFS export mounted by several VMs.** This is
-not obvious from the host that owns it: on `zebele-tracewin-rl`, `findmnt` says
-`/dev/vdb ext4`, because that machine is the NFS *server*. The sharing shows up
-in `/etc/exports` (networks `10.64.10.0/24` and `10.64.5.0/24`), in
-`systemctl is-active nfs-server`, and in `ss -tn | grep :2049`. Everything below
-follows from it.
-
-- **Models are shared, state is not.** Every trained model goes into ONE store,
-  `checkpoints/models/`: files are written once, under machine-prefixed names,
-  and never modified, so any machine can read any model with no coordination and
-  no host ever writes a file another host owns. The ratings are one small file per
-  model under `checkpoints/global/`, updated under a per-model lock (see
-  "Population-wide Elo and pruning"). Only a machine's *own* state lives in its
-  subtree, `checkpoints/machines/<hostname>/` (`loop_state.json`, `STOP`, `work/`,
-  `logs/`): those are rewritten whole, so two supervisors on one directory would
-  clobber each other, and NFS locking is not dependable enough to arbitrate.
-  (This replaced per-machine pools linked by an append-only `exchange/`, which
-  multiplied every network into several copies and gave each machine a private,
-  incomparable Elo scale.)
-- **`checkpoints/benchmark/` is shared and read-only**, which is what makes the
-  benchmark numbers comparable *between* machines and not just across
-  generations on one.
-- **A venv is not portable across these machines even though the directory is.**
-  Its interpreter is a symlink into the local disk of whoever created it (a
-  uv-managed CPython under `~/.local`, on `/dev/vda4`), so another VM sees
-  `.venv/bin/python` and gets a dangling symlink. `run.sh` therefore tests that
-  the venv *runs* rather than that it exists, and falls back to `.venv-<machine>`.
-  Checking for the file alone is the trap here.
-- **Seeds are derived from the hostname** (`machine_seed`). Without that every VM
-  would run identical seeds, train identical models, and contribute nothing to
-  each other.
-- **Worker count defaults to 25**, not to as many as the machine can hold.
-  `default_workers` takes the lowest of `DEFAULT_WORKER_CEILING` (25),
-  `nproc - 2` and `(available_mb - 3000) / 700` -- the last two still cap it on
-  a small VM, since each worker is its own Python+torch process at roughly
-  700 MB once its pool is loaded. On an idle 32-core box the ceiling is what
-  binds (cores give 30, memory at ~30 GB free gives 38); on a *busy* one the
-  memory term binds hard and much lower, because `default_workers` measures the
-  machine at the moment `./run.sh start` runs -- measured on the NFS server with
-  a 20-shard arena in flight, it chose **10**. That is correct behaviour, not a
-  bug, but it means the number a machine actually starts with is not always 25.
-  - **`poker-loop`'s own `--workers` default is the same 25**
-    (`loop.py::DEFAULT_WORKERS`), so a loop started by hand behaves like
-    `./run.sh start` on the same box. Unlike run.sh's, it is *not* reduced by
-    cores or free memory, so a small VM driven by hand should pass `--workers`
-    explicitly.
-  - **The history, because it is the number to suspect first if the machines go
-    unresponsive again.** It used to be just the lower of cores and memory,
-    which meant 30 on the 32-core boxes; the fleet ran that way and five of
-    seven machines went unresponsive (see "An unexplained fleet incident"), and
-    while the cause was never established, a machine at its own ceiling has no
-    headroom for the end-of-run phases, where every worker of a generation
-    arrives at once and each loads models it did not hold while training. The
-    ceiling went to 10, which left two thirds of a 32-core box idle, then to 20,
-    and now to 25 at the user's decision -- a deliberate step back up, not a
-    measured safe value.
-  - **What has grown since the ceiling was first set**, all of it widening the
-    window where workers overlap in the expensive phases: twenty-five workers
-    all in the population round want ~18 GB of transient model-loading on top of
-    training; that round is ten times longer than it was
-    (`global_arena.DEFAULT_HANDS_PER_GAME` is 1000); and `rate_against_benchmark`
-    plays 500 rated sessions of 1,000 hands, which is 500,000 hands per
-    published model. The two dials if it
-    goes wrong are this and `--global-games-per-model`, and `POKER_WORKERS`
-    overrides this one without editing the file.
-
-## Population-wide Elo and pruning (`rl/global_arena.py`, `rl/global_store.py`)
-
-Every trained model lives in one store, `checkpoints/models/`, and has **one
-rating on one scale**, kept by `rl/global_arena.py` and `rl/global_store.py`.
-(Ratings used to be private to each machine's pool, which made them incomparable:
-Shark, identical code on every host, was measured rating 1387 on one machine and
-1487 on another, and a model measured at +155.5 bb/100 — the best ever seen — was
-once retired locally because its local rating had not caught up. A single shared
-scale, earned against the whole population, removes both problems.)
-
-- **One file and one lock per model, no registry-wide lock**
-  (`rl/global_store.py`, pure Python). The global registry is
-  `checkpoints/global/members/<label>.json`, one small file per model
-  (`PoolMember` as JSON), and a writer locks only the models it is about to
-  change (`locks/<label>.lock`, `acquire_locks`/`release_locks`: an atomic
-  `O_CREAT | O_EXCL` create, which NFS does provide, plus a TTL of
-  `--global-lock-seconds`, default 120 s, so a machine that dies holding one
-  does not block anyone for long). Acquisition is all-or-nothing with rollback,
-  so overlapping sets cannot deadlock. This replaced a single `registry.json`
-  rewritten whole under one lease: that forced every merge through one gate, so
-  merges queued behind each other and very few games ever reached the ratings.
-  Sessions on different models now never wait for each other.
-  **`registry.json` still exists, but only as a read-only snapshot** of the
-  member files (`write_snapshot`, refreshed by whichever merge finds it more than
-  5 minutes old and wins a `__snapshot__` lock; best effort). Nothing decides
-  anything from it — the GUI's default table and `--status` read it because
-  reading one file beats reading ~10,000. To get the authoritative whole
-  registry use `load_global_registry(global_dir)`, which reads the member files
-  in parallel. An old single-file `registry.json` is split into member files
-  automatically, once (`migrate_legacy_registry`).
-- **Merging is claim-then-apply, in two steps.** *Playing*
-  (`play_population_round_sharded`) takes no lock at all and leaves its sessions
-  in `global/pending/<machine>-<time>-<id>.json`. *Merging*
-  (`apply_pending_population_rounds`) first **claims** each pending file by an
-  atomic rename to `.claim-<id>-<name>` (exactly one of several racing mergers
-  wins a file, which is what stops the same sessions being folded in twice with
-  no global lock; a claim whose owner died is returned to the queue after an
-  hour), then applies each **session** under the locks of just its own ~6
-  participants (`_apply_session`): read those member files, rate, write them
-  back, unlock — milliseconds. A session that cannot get its locks within
-  `lock_wait` (20 s) is written back as a new pending file rather than blocking
-  (`deferred_sessions` in the report). A member is only *admitted* if its
-  checkpoint still exists, so a model eliminated while its result waited in the
-  queue is not resurrected as a ghost. A pending file that does not parse is set
-  aside as `<name>.bad`, never retried automatically.
-- **A round is 12 rated sessions per drawn model** (`--global-games-per-model`,
-  `DEFAULT_GAMES_PER_MODEL`), **1000 hands each** (`DEFAULT_HANDS_PER_GAME`).
-  With the usual 55 models drawn that is **128 sessions and ~128,000 hands**, so
-  **~25 minutes** of a worker's time on an idle core (~43 on a loaded fleet
-  machine) against ~150 minutes of training at `--iterations 1000`. The session
-  count is reproduced exactly by simulating the `due` queue, and the cost is very
-  nearly linear in both numbers (~1.1 s per 100-hand session, plus a one-off ~3 s
-  to load the 55 models), so `--global-games-per-model` is the dial to turn if the
-  Elo phase has to shrink — and at a fixed hand budget fewer, longer sessions is
-  the better trade, for the reason below.
-  - **It was 50 until it was cut by 75% at the user's decision**, which took the
-    round from 481 sessions and ~94 minutes to 128 and ~25 (both simulated from
-    the `due` queue, both measured at 85 hands/s idle and ~50 loaded). It is the
-    biggest single block of wall time a worker spends after it stops training.
-    The cost is real: a round is the only thing that turns played hands into
-    ratings, so each run now contributes ~3.8x less rated evidence to a ranking
-    that was *already* power-limited near the top, where a 1000-hand session
-    picks the stronger of two adjacent models only ~58% of the time.
-    **What makes the trade defensible is where the lost evidence comes back
-    from**: the Elo fill-in phase has workers that finish early play extra
-    rating rounds while they wait for the slowest worker of their generation,
-    and those cores would otherwise be idle. So this moves rating work off the
-    critical path rather than deleting it, and if the ratings visibly stop
-    converging the dial to raise is `--fill-games-per-model`, not this one.
-  - **Session length was 100 hands, and that was the single thing most wrong with
-    the ranking.** Elo reads only the *sign* of each pair's chip delta, so how
-    long a session is decides how often that sign is right. The spread of a
-    100-hand 6-max chip delta is of the order of ±290 bb/100 while the real gap
-    between two adjacent models is 10-40 bb/100, so the stronger of the two
-    finished ahead about **54%** of the time. That does not merely add noise:
-    Elo settles at the rating reproducing the *observed* win frequency, so a 54%
-    edge equilibrates ~28 points above instead of the ~150 it deserves, and the
-    whole scale comes out **compressed**, not just jittery. Session length is the
-    only lever that moves that equilibrium — lowering K shrinks the jitter around
-    it and cannot touch it. Ten times the hands cuts the spread ~3.2x. This is
-    the direct answer to "The ranking is wrong at the top": the ordering was
-    being decided by near-coin-flips. `games` still counts sessions, so the K
-    schedule is untouched and each rated result simply carries 10x the evidence
-    at the same K.
-  - **The number has moved four times, and one of the moves was a panic.**
-    500 → 12 → 50 → briefly 12 → 50 → 12 (today). The 12 → 50 step bought ~3.8x
-    the rated results for a few more minutes at the old 100-hand session length;
-    the *brief* revert to 12 was a response to the fleet incident below and was
-    not justified (see there); today's 12 is the deliberate 75% cut above, for
-    wall time, and is not a repeat of that revert.
-    **The number lives in exactly one place**: it used to be
-    `DEFAULT_GAMES_PER_MODEL = 500` while both CLIs *and*
-    `run_population_round` carried a hard-coded 12, so the constant described
-    nothing that ever ran. A test pins all three together by reading the argparse
-    defaults out of the source, because a value comparison would only catch a
-    stray literal while it still happened to agree.
-  - **An unexplained fleet incident followed the raise, and is worth knowing
-    about before blaming this setting again.** Hours after 50 went live, five of
-    the seven machines stopped making progress (0 iterations in 90 s, two of them
-    too slow to finish an SSH banner exchange) while one kept running normally.
-    Every stopped machine had at least one worker in `elo_play` and the running
-    one had none — but **that correlation is confounded**: a machine early in its
-    generation both has nobody in the round yet and has had less time to hit any
-    problem. The memory explanation does not survive measurement either: the
-    round's 55 loaded models cost **203 MB** on top of a worker's ~514 MB, so
-    even all 30 workers being in the round at once adds ~6 GB, not enough to take
-    a machine down by itself. The NFS server was idle throughout (load 1.5, 0%
-    iowait, `load_global_registry` 1.5 s for 9,493 members), so it was not the
-    bottleneck. **No cause was established** — no machine could be inspected,
-    since the server has no SSH access to them. If it recurs, the thing to
-    capture first is `free`, `vmstat` and the `D`-state process count *on a
-    stopped machine*, which is the evidence that was missing.
-- **`poker-elo` (`rl/population_arena.py`) runs the same round by hand**, in a
-  loop, for when the ratings need refreshing without waiting for training runs to
-  come round to each model. It calls `run_population_round` — the identical
-  machinery `train.py` calls — with two differences that both follow from nobody
-  being deleted:
-  - **It draws for coverage, not uniformly.** `--coverage played` (the default)
-    passes `sample_population` through the new `draw` hook on
-    `play_population_round_sharded`: least-played half deterministically, the rest
-    at random. That function had existed, tested and unused, exactly because the
-    automatic rounds want an honest uniform draw — a round that can *delete*
-    people should not favour anyone. Here coverage is the whole point: at ~55
-    models seated out of ~9,200, a given model has ~0.5% chance per round, so a
-    rating can sit on its published number for many generations. `--coverage
-    random` restores the uniform draw. The ranking is re-read every round, since
-    the previous one just changed the game counts the draw orders by.
-  - **Pruning is off unless `--prune` is passed**, implemented by lifting
-    `trigger_size` to `NO_PRUNE_TRIGGER` (10**9) rather than by branching around
-    `_eliminate` — one pruning rule, one place. A tool whose job is to refresh
-    ratings must not delete checkpoints as a side effect of being run.
-  - **Freezes hold because nothing here bypasses them**: the merge is
-    `apply_pending_population_rounds`, and `record_session_with_ratings` scores a
-    frozen member normally, counts its `games`, and never applies its own delta.
-    Verified end to end on an isolated store — three anchors kept 1600.0/1601.0/
-    1602.0 exactly while their `games` went 500 → 516-518, and no file was
-    removed. `rl/benchmark_arena.py` stays the only code that moves an anchor.
-  - **It refreshes the `registry.json` snapshot after every round**, forced.
-    The merge inside `run_population_round` already asks for one, but unforced —
-    it rewrites the snapshot only if it has gone stale *and* only if it wins the
-    `__snapshot__` lock — and a round here runs for minutes to hours, so
-    everything that reads the snapshot could sit on ratings the run had already
-    superseded. Same trade as `benchmark_arena` above: ~2 s a round, and a
-    failure is reported rather than fatal. Pinned by
-    `test_every_round_refreshes_the_shared_snapshot`.
+  - **It draws through `tiered_draw`, and so does the end-of-run round**
+    (changed at the user's request, replacing `top_biased_draw`, which spent
+    half the seats on the 1,000 best). A quarter of the seats goes to each of
+    ranks 1-10, 11-100, 101-1,000 and everyone else (`DRAW_BANDS`, disjoint,
+    unrated models in the last band). The top ten cannot fill their 12-13 seats,
+    so they are all seated in every round and the shortfall spills uniformly
+    over the models not yet drawn. The top is the only part of the ranking
+    anything reads — `pick_parents` draws from the best 100 and the ordering
+    there was measured wrong. **The fill-in rounds still lift `trigger_size` to
+    `NO_PRUNE_TRIGGER` and can never prune**; the end-of-run round does *not*,
+    see the next section for what that costs. Pinned by
+    `test_a_fill_in_round_can_never_prune`.
   - **Torch-free at import** (it reaches torch only through `global_arena`'s
     function-local imports), so its tests run in the ordinary suite and it starts
     instantly. Pinned by a test.
@@ -1619,31 +1169,25 @@ scale, earned against the whole population, removes both problems.)
   `--no-global-round` to opt out) is checked as the very last thing `main()`
   does, in both standalone `poker-train` and every worker `poker-loop` spawns.
   Many workers finishing together is fine: they merge concurrently.
-- **Sampling is plain uniform random in the rounds that can delete someone**:
-  `run_population_round`
-  draws `--global-sample` (~50) models from
-  `discover_population(root)` — every model in `checkpoints/models/` — plus
-  `--global-benchmark-sample` (~5) from `discover_benchmark_population`. Both
-  draws use `rng.sample` directly, not `sample_population`'s least-played-first
-  bias (that function still exists, tested, just unused here): a round decides
-  who might get *deleted*, so an honest uniform draw is the right fit.
-  - **`top_biased_draw` is the deliberate exception, for rounds that cannot.**
-    It spends half its seats on the `top_n` (1,000) best-rated models, raising a
-    top model's chance per round from ~0.5% to ~2.8% while halving everyone
-    else's to ~0.26%. The reasoning: a round seats ~50 of ~9,600, so spread
-    evenly the budget buys a little precision everywhere including on model
-    #5000, whose exact rating nothing reads — while `pick_parents` reads the top
-    100 and the ordering *there* was measured wrong. Five times the evidence
-    where it is used, at the cost of a staler tail.
-  - **It must only be used where `trigger_size` is lifted to
-    `NO_PRUNE_TRIGGER`**, and the reason is the coupling above: eligibility for
-    deletion is a percentile of `games`, so a biased draw makes the
-    often-seated eligible sooner and protects the rarely-seated forever. The
-    end-of-run round keeps its uniform draw; the fill-in rounds, which never
-    prune, get the bias. Reached through the same `draw` hook `poker-elo` uses
-    for its coverage draw, so it is a function, not new plumbing. A model
-  never before seen is bootstrapped at the default rating when it first plays; a
-  benchmark draw is bootstrapped `frozen=True`.
+- **Sampling is by rating band, in every round that draws from the population**
+  (`global_arena.tiered_draw`, passed through the `draw` hook): `run_population_round`
+  draws `--global-sample` (~50) models from `discover_population(root)` — every
+  model in `checkpoints/models/` — plus `--global-benchmark-sample` (~5)
+  uniformly from `discover_benchmark_population`. The population draw gives a
+  quarter of the seats to each of ranks 1-10, 11-100, 101-1,000 and the rest
+  (the end-of-run round and the fill-in rounds alike, at the user's request; it
+  used to be uniform here and half-top-1,000 in the fill-in).
+  - **Cost, accepted and not yet measured: the end-of-run round now prunes under
+    a biased draw.** Eligibility for deletion is a percentile of `games`, so the
+    top bands (seated every round or every other round) become eligible sooner
+    and the tail (a quarter of the seats over ~8,600 models) stays below the
+    percentile and immune; `eliminate_lowest_rated` then removes the lowest
+    rated *among the eligible*. Watch what the first passes delete — the
+    population is within a few hundred of `--global-trigger-size` (10,000). The
+    fix, if it shows, is `trigger_size=NO_PRUNE_TRIGGER` on that call in
+    `train.py::main`, as the fill-in does.
+  - A model never before seen is bootstrapped at the default rating when it
+    first plays; a benchmark draw is bootstrapped `frozen=True`.
 - **K follows a 10-step staircase approximating the optimal gain, and one
   schedule rates everything.** A flat K made a model with a thousand games move
   as much per session as a newcomer, so a well-determined rating still jumped
@@ -1910,7 +1454,7 @@ scale, earned against the whole population, removes both problems.)
   non-frozen models on disk is **627 rated sessions** of 1,000 hands, against
   962 at the 50th. It was lowered because eligibility is a *percentile of
   games*, so any draw that seats some models more often than others — and
-  `top_biased_draw` deliberately does — makes the well-played eligible sooner
+  `tiered_draw` deliberately does — makes the well-played eligible sooner
   and leaves the rarely-drawn tail permanently immune, which would have the
   pass eat the middle of the population instead of its bottom. The eligible set
   goes from 50% to 75% of the population, and the accepted cost is that a pass
@@ -1930,7 +1474,7 @@ scale, earned against the whole population, removes both problems.)
   `promote_to_benchmark`, `next_benchmark_dir`, `DEFAULT_BENCHMARK_REFRESH`,
   `poker-loop --no-arena-after-prune` and `benchmark_arena`'s regroup. The rule now:
   - Population = non-frozen members whose checkpoint is in `models/`. A model
-    qualifies when its `games` are **above the 75th percentile**
+    qualifies when its `games` are **above the 90th percentile**
     (`BENCHMARK_GAMES_PERCENTILE`) of that population's games and its rating is
     **more than 10 points** (`BENCHMARK_MARGIN`) above the best anchor.
   - Candidates are taken from the lowest rating upwards and each must also clear
@@ -2612,8 +2156,7 @@ dependency (Flask, etc.) — it ships with Python. Architecture:
     returns the full softmax; torch is imported lazily and the models are loaded on
     the first "Chiedi", not when the screen opens.
   - Sanity-checked on the live top 5: 72o folds, AA/AKs call -- but at ~100%
-    everywhere, which is the collapsed low-entropy policies documented under
-    "The entropy bonus is off", not a pipeline bug.
+    everywhere, which is the collapsed low-entropy policies, not a pipeline bug.
 - **Cards are drawn on a `tk.Canvas`, not image files** (`gui/cards_canvas.py`):
   a plain rectangle plus rank/suit text (Unicode ♠♥♦♣, red for hearts/
   diamonds, black for spades/clubs) for a face-up card, a solid-fill
@@ -3173,6 +2716,17 @@ così"). None is a bug; the current behaviour is coherent.
     per hand (blinds included) run median 12, mean 11.9, max 25; a window of 16
     covers a whole hand 91.2% of the time and 20 covers **99.3%**. When it does
     truncate it keeps the most recent actions, which are the informative ones.
+  - **Fix how each new feature is scaled, in the same change as the version.**
+    Every feature in `features.py` is a bounded ratio (`_clip01`, with
+    chip amounts divided by the big blind and passed through `log1p` over a fixed
+    scale), and the network has no input normalisation of its own beyond the
+    `LayerNorm` after each `Linear`. The 24 per-action features must follow the
+    same convention: `amount / pot_before` and `log(amount / big_blind)` clipped
+    to [0, 1] with a stated scale, the one-hots left as they are. A feature left
+    unbounded (a raw `amount / pot_before` can be many times the pot on an
+    overbet) would dominate the first `Linear` and change what `FEATURE_VERSION`
+    means without anyone noticing, so the scale is part of the version's
+    definition, not a detail.
   - **Why not a GRU over `ActionRecord`s**, which is the textbook answer and is
     mentioned elsewhere in this file as the natural v2: it also changes
     `PokerActorCritic`'s architecture rather than just the features, multiplying
@@ -3213,6 +2767,18 @@ così"). None is a bug; the current behaviour is coherent.
     keep the current scale and mix sizes into it, or keep a separate rating per
     size. No `FEATURE_VERSION` bump is needed: the meaning of the features does
     not change.
+  - Open decision 3 — **the scale of the reward and of the value target.**
+    `reward_scale` is a fixed constant (`big_blind / starting_stack`) and the
+    critic's `MSE` target is not normalised adaptively, so it is calibrated for one
+    table. The spread of a hand's result changes with the table size (more
+    opponents, more chips in play per hand), so a constant tuned at 6-max would
+    leave heads-up and 9-max with value targets on different scales and the
+    `value_loss` out of balance with the policy loss — the failure `reward_scale`
+    was introduced to prevent (9,300-14,000 unscaled against ~1.1). Decide whether
+    to scale per table size or to normalise the return adaptively (running
+    mean/std, or PopArt); the second also covers "Vary the starting stack". Either
+    one means saving its statistics in the checkpoint, or `--resume` and
+    inheritance start on a different scale from the one the model was trained at.
 - **Save Adam's state in the archived models — measured, and dropped.** Only the
   live checkpoint (`agent.pt`, what `--resume` reads) carries the optimizer; the
   archives that become pool models hold weights alone, so an inheriting worker
@@ -3323,12 +2889,45 @@ così"). None is a bug; the current behaviour is coherent.
   which is half the head-to-head margin `duel_power` reports.** Cost at the
   40 anchors there are now: 820 matches, ~16M hands at 10,000 — a few hours on
   20 processes, so `--max-models` exists for a first look.
+- **Handle all-in differently, or remove it as a choice.** The 11th action bin
+  (`ALL_IN_BIN`) lets a model shove its whole stack at will, in any spot. The rule
+  to move to: **an all-in happens only when the amount to bet is larger than the
+  remaining stack** — a bet, raise or call that the stack cannot cover becomes an
+  all-in by itself, and there is no free choice to shove. Measured (October 2026)
+  (6 models per band, 3,000 hands at a 6-max table, models of one band against
+  each other): all-ins per 100 hands per model were **1.6** at ~1500, **0.5** at
+  ~1600, **0.4** at ~1700 and **4.5** for the top models (range 1.0-8.5), i.e.
+  15.5% of the top models' aggressive actions against 1.4-4.4% below them, almost
+  always postflop. The choice is rare in the lower bands and not rare where the
+  ratings are highest, so it is part of what the top models do.
+  - **The catch, and why it is not a one-line change:** `action_dim` is part of
+    what `check_compatible` (`rl/ppo.py`) compares, so deleting the bin changes the
+    shape of the policy head and makes **every stored model and anchor unloadable
+    at once** — the same population reset described under "Observation v2". The
+    non-breaking route is to keep all 11 bins and **mask the all-in bin unless the
+    sizing rule above applies** (the mask is already how out-of-range bins are
+    handled: masked, never clamped), which needs no new feature version and no
+    migration; only a real removal needs the versioned-encoder groundwork first.
+  - Decide the rule for a **call** that costs the whole stack too: it is
+    `CHECK_CALL_BIN` today, and `ALL_IN` only when the action maps there.
+  - Whatever is chosen changes how every rating was earned (the models were
+    selected with the shove available), so readings from before are not
+    comparable with later ones.
 - **Vary the starting stack.** Every hand begins with all seats at 200 chips
   (100 bb), reset after each hand (`rebuy=True`, `SelfPlayCollector`), so the
   model never sees a genuinely short or deep starting stack — only the depth a hand
   itself reaches. Randomising the stack per hand (in big blinds) would teach
   those regimes; `reward_scale` (`big_blind / starting_stack`) would then have to
   follow the stack in use, and it shares the rating question above.
+  - **The reward scale is the part that breaks first.** The features already adapt
+    (pot, stack and bets are divided by the big blind), but the critic's target is
+    `MSE` on returns scaled by one constant and is not normalised adaptively, so a
+    stack that changes per hand changes the spread of the target hand by hand and
+    a single `reward_scale` stops being right. Following the stack in use is the
+    minimum; a running normalisation of the returns (running mean/std, or PopArt)
+    is the robust option and also serves "Train on 2 to 9 players". Its statistics
+    would have to be saved in the checkpoint, or a resumed or inherited model
+    starts on a different scale from its own training.
 - **Rolling workers: drop the generation barrier entirely.** A generation today
   is a *barrier*: N workers are launched together and the supervisor does not
   start the next N until the last one is done. That was harmless while every
@@ -3501,6 +3100,82 @@ così"). None is a bug; the current behaviour is coherent.
   - Deferred at the user's decision: no compatibility shims and no code written
     only to paper over a mismatch, so this belongs to a new version of the
     project rather than to the running fleet.
+- **Study how the network evaluates the state, to size it (decided to do, not
+  yet done).** The network size (`hidden`/`num_layers`, 512/3 today, see "Bigger
+  networks") has never been chosen from evidence about what the network can
+  actually *see* in a state. The study should find out at what capacity, and at
+  what point in training, the networks start to recognise the structures that
+  decide a hand: straights, flushes, full houses and the other made hands and
+  draws, and how strong the hand is relative to the board.
+  - **What to measure.** Probe the value head and the policy (e.g. linear probes
+    on the trunk's activations, or the value/action response to controlled
+    states) for each concept: pair/two pair/trips, straight and straight draw
+    (the wheel included), flush and flush draw, full house, quads, hand rank
+    percentile on the board. For each one, the capacity (a ladder of
+    `hidden`/`num_layers`) at which it becomes decodable, and the training
+    iteration at which it appears within a run.
+  - **Why it matters.** The card input is 6 binary 4x13 planes, so a straight is
+    a pattern across ranks and a flush a pattern across suits; the first `Linear`
+    has to build those from raw planes. If a concept only becomes readable above
+    some size, a 512x3 network may be capped below it, and a bigger one would be
+    worth its cost (see the throughput table in "Bigger networks"). If every
+    concept is already read at 256, the current size is wasteful.
+  - **Feeds three other items:** "Bigger networks" (which shape to try),
+    "Observation v2" (whether explicit hand-strength features would help or the
+    network already derives them) and the suit-isomorphic canonicalisation idea
+    in "Where to extend".
+- **Aggression/style constraints on the models, to keep the population's
+  strategies diverse (idea for the next version, not yet designed).** Today
+  every model is trained toward the same objective (bb won against the drawn
+  field) and the fleet's selection pressure is a single number, the Elo, so the
+  population tends to collapse onto one style — the measured fold rate of the
+  best model (70.6% of the decisions where folding is legal) is already a sign of
+  it. The idea: impose constraints on playing-style metrics during training, so
+  that different lineages are trained to different profiles (VPIP, PFR, AF
+  aggression factor, 3-bet %, fold-to-bet %, WTSD, c-bet %, ...) and the pool
+  keeps genuinely different opponents instead of near-copies.
+  - **Why it would help.** Opponent diversity is what the training pool exists
+    for, and `HP_LADDERS` diversifies only the *settings*, not the resulting
+    *behaviour*. A model forced to play loose-aggressive and one forced to play
+    tight-passive are different tests for a learner, and a top-ranked model that
+    beats only one style is a weaker anchor than its rating says.
+  - **Things to decide before building it.** (1) *How to constrain*: a penalty or
+    Lagrangian term in the PPO loss on the measured metric vs. a target band, a
+    reward bonus, or masking/biasing action bins — the first is the cleanest, the
+    last repeats the "masked, never clamped" argument in reverse. (2) *Where the
+    target lives*: as a per-run hyperparameter in the sweep (a new axis of
+    `HP_LADDERS`, inherited and perturbed like the others) or as a fixed list of
+    named profiles. (3) *How a style interacts with the Elo*: a constrained model
+    will rate below an unconstrained one, so parent selection (`pick_parents`, top
+    100 by rating) would discard every constrained lineage — selection would have
+    to be per-style, or rate relative to the style's own niche (quality-diversity
+    in the MAP-Elites sense). (4) *Measuring the metrics*: they can be computed
+    from the hand history / `ActionRecord`s with no engine change, but VPIP and
+    AF need a definition fixed once and tested, and a metric measured over a
+    rollout is noisy, so the penalty needs a window like `REWARD_WINDOW_HANDS`.
+  - **The metrics must carry their sample size, over a window of at most ~200
+    hands.** Wherever VPIP, AF and the like are measured — as the quantity being
+    constrained, or later as per-opponent stats the agent sees in its observation
+    (a HUD) — two rules apply. (1) *Report the number of hands behind each
+    figure*, not the figure alone: a VPIP of 60% over 8 hands and over 200 hands
+    are different facts, and a model fed the bare percentage would trust both
+    equally. In an observation it means a hands-played count (normalised) next to
+    each stat, or the stat shrunk toward a prior in proportion to the count. (2)
+    *Keep only the most recent ~200 hands per player* (a sliding window, not a
+    cumulative mean), because in a real room players change often — a new person
+    sits in the seat, or the same one changes style — and a long history describes
+    someone who is no longer there. The same window is the right size for the
+    constraint's own measurement: the rollout's metric is noisy over few hands, so
+    the penalty should read the window and know how full it is, as
+    `REWARD_WINDOW_HANDS` and its partial-window marker already do for
+    `train/100`. Note the training setup resets stacks and swaps the opponents
+    seat by seat (`SeatProxy`), so a "player" in training has no persistent
+    identity across hands; per-opponent stats would need that identity defined
+    first.
+  - **Likely needs a population reset or the versioned encoder**: a style target
+    given to the network as an input feature would change `OBS_DIM` (see
+    "Observation v2"); constraining only the loss changes no shape and keeps
+    every stored model loadable.
 
 ## Where to extend each future section
 

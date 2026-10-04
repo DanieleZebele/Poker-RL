@@ -768,6 +768,7 @@ def _train_args(**overrides):
         "iterations": 1000, "hands": 512, "players": 6, "stack": 200, "sb": 1, "bb": 2,
         "lr": 3e-4, "ppo_epochs": 4, "clip_epsilon": 0.2, "entropy_coef": 0.0,
         "opponent_probability": 0.5,
+        "minibatch_size": 1024, "gae_lambda": 0.95, "value_coef": 0.5, "max_grad_norm": 0.5,
         "pool_models": 20, "pool_top_share": 0.5, "pool_top_n": 100,
     }
     values.update(overrides)
@@ -785,6 +786,7 @@ def test_run_metadata_records_every_swept_axis():
     for axis in (
         "lr", "hands", "ppo_epochs", "clip_epsilon",
         "opponent_probability", "pool_top_share", "pool_top_n",
+        "minibatch_size", "gae_lambda", "value_coef", "max_grad_norm",
     ):
         assert axis in recorded, axis
     assert (recorded["lr"], recorded["hands"], recorded["ppo_epochs"]) == (7e-4, 1024, 2)

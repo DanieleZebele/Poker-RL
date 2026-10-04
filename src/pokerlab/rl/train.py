@@ -551,6 +551,11 @@ REPORTED_AXES = (
     "hands",
     "ppo_epochs",
     "clip_epsilon",
+    "minibatch_size",
+    "gae_lambda",
+    "value_coef",
+    "max_grad_norm",
+    "entropy_coef",
     "opponent_probability",
     # How strong a field this run drew. Reported like the rest, and worth
     # reading next to the `pool rating: media ...` line printed just below,
@@ -595,6 +600,10 @@ def run_metadata(args: argparse.Namespace) -> dict:
         "lr": args.lr,
         "ppo_epochs": args.ppo_epochs,
         "clip_epsilon": args.clip_epsilon,
+        "minibatch_size": args.minibatch_size,
+        "gae_lambda": args.gae_lambda,
+        "value_coef": args.value_coef,
+        "max_grad_norm": args.max_grad_norm,
         "entropy_coef": args.entropy_coef,
         "opponent_probability": args.opponent_probability,
         "pool_models": args.pool_models,
@@ -650,6 +659,14 @@ DEFAULT_FILL_DEADLINE_MINUTES = 150
 DEFAULT_FILL_GAMES_PER_MODEL = 1
 
 
+def ranking_for_draw(global_dir) -> dict[str, dict]:
+    """The ratings `tiered_draw` ranks by, read fresh from the shared store."""
+    return {
+        label: {"rating": member.rating, "games": member.games}
+        for label, member in load_ranking(global_dir).members.items()
+    }
+
+
 def run_elo_fill_in(args, game) -> tuple[int, int]:
     """Play rating rounds until the rest of the generation catches up.
 
@@ -660,20 +677,19 @@ def run_elo_fill_in(args, game) -> tuple[int, int]:
 
     **Pruning is off and the draw is biased, and the two go together.** These
     rounds lift `trigger_size` to `NO_PRUNE_TRIGGER` and draw through
-    `top_biased_draw`, which spends half its seats on the 1,000 best-rated
-    models. That is the right place to spend a waiting worker's time -- the top
-    is the only part of the ranking anything reads, `pick_parents` draws from the
-    best 100, and the ordering there was measured wrong. It is also the only
-    place the bias is *safe*: eligibility for deletion is a percentile of
-    `games`, so a biased draw makes the often-seated eligible sooner and leaves
-    the rarely-drawn tail permanently immune, and a pruning pass under it would
-    eat the middle of the population instead of its bottom. A fill-in round that
-    could prune would be that bug; it cannot.
+    `tiered_draw`, which gives a quarter of the seats to each of ranks 1-10,
+    11-100, 101-1,000 and the rest. That is the right place to spend a waiting
+    worker's time -- the top is the only part of the ranking anything reads,
+    `pick_parents` draws from the best 100, and the ordering there was measured
+    wrong. Eligibility for deletion is a percentile of `games`, so a biased draw
+    makes the often-seated eligible sooner and leaves the rarely-drawn tail
+    permanently immune: a fill-in round that could prune would eat the middle of
+    the population instead of its bottom, and it cannot.
     """
     from pokerlab.rl.global_arena import (
         NO_PRUNE_TRIGGER,
         run_population_round,
-        top_biased_draw,
+        tiered_draw,
     )
 
     scratch = Path(args.scratch_dir)
@@ -694,10 +710,7 @@ def run_elo_fill_in(args, game) -> tuple[int, int]:
                 break
             # Re-read every round: the previous one just moved the ratings the
             # bias is computed from, and other machines moved them too.
-            ratings = {
-                label: {"rating": member.rating, "games": member.games}
-                for label, member in load_ranking(args.global_dir).members.items()
-            }
+            ratings = ranking_for_draw(args.global_dir)
             report = run_population_round(
                 global_dir=args.global_dir,
                 root=args.global_root,
@@ -710,7 +723,7 @@ def run_elo_fill_in(args, game) -> tuple[int, int]:
                 device=args.device,
                 lock_ttl=args.global_lock_seconds,
                 trigger_size=NO_PRUNE_TRIGGER,
-                draw=top_biased_draw(ratings),
+                draw=tiered_draw(ratings),
                 on_skip=lambda path, why: print(f"  riempimento elo, saltato {path}: {why}"),
             )
             if report.played == 0:
@@ -806,6 +819,22 @@ def main() -> None:
         "--clip-epsilon", type=float, default=PPOConfig.clip_epsilon,
         help="PPO's ratio clip: how far the updated policy may move from the "
         "one that collected the batch",
+    )
+    parser.add_argument(
+        "--minibatch-size", type=int, default=PPOConfig.minibatch_size,
+        help="decisions per PPO minibatch; smaller means more gradient steps per epoch",
+    )
+    parser.add_argument(
+        "--gae-lambda", type=float, default=TrainConfig.lam,
+        help="GAE lambda: how far advantages look ahead before trusting the critic",
+    )
+    parser.add_argument(
+        "--value-coef", type=float, default=PPOConfig.value_coefficient,
+        help="weight of the value loss in the PPO loss",
+    )
+    parser.add_argument(
+        "--max-grad-norm", type=float, default=PPOConfig.max_grad_norm,
+        help="gradient clipping norm",
     )
     parser.add_argument(
         "--entropy-coef", type=float, default=PPOConfig.entropy_coefficient,
@@ -1055,12 +1084,16 @@ def main() -> None:
         TrainConfig(
             hands_per_iteration=args.hands,
             opponent_probability=args.opponent_probability,
+            lam=args.gae_lambda,
         ),
         PPOConfig(
             learning_rate=args.lr,
             entropy_coefficient=args.entropy_coef,
             epochs=args.ppo_epochs,
             clip_epsilon=args.clip_epsilon,
+            minibatch_size=args.minibatch_size,
+            value_coefficient=args.value_coef,
+            max_grad_norm=args.max_grad_norm,
         ),
         device=args.device,
         rng=random.Random(args.seed),
@@ -1289,7 +1322,7 @@ def main() -> None:
 
     if args.global_round:
         try:
-            from pokerlab.rl.global_arena import run_population_round
+            from pokerlab.rl.global_arena import run_population_round, tiered_draw
 
             report = run_population_round(
                 global_dir=args.global_dir,
@@ -1302,6 +1335,7 @@ def main() -> None:
                 hands_per_game=args.global_hands_per_game,
                 device=args.device,
                 lock_ttl=args.global_lock_seconds,
+                draw=tiered_draw(ranking_for_draw(args.global_dir)),
                 trigger_size=args.global_trigger_size,
                 eliminate_fraction=args.global_eliminate_fraction,
                 protect_percentile=args.global_protect_percentile,

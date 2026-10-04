@@ -117,19 +117,28 @@ def build_training_registry(models_dir: str | Path, drawn: Sequence[PoolMember])
     return registry
 
 
+# Where a parent comes from: each slot picks one of these bands with equal
+# probability, then a model uniformly inside it. `None` is the whole store.
+PARENT_TIERS: tuple[int | None, ...] = (10, 100, 1000, None)
+
+
 def pick_parents(
     ranking: Mapping[str, PoolMember],
     labels: Sequence[str],
     count: int,
     *,
     rng: random.Random,
-    top_n: int = DEFAULT_TOP_N,
+    tiers: Sequence[int | None] = PARENT_TIERS,
 ) -> list[str]:
-    """`count` distinct parents to inherit weights from, drawn from the best-rated
-    models that exist on disk; cycling only if there are fewer than `count`.
+    """`count` distinct parents to inherit weights from; cycling only if there are
+    fewer rated models than `count`.
 
-    Distinct so the inheriting half of a generation is competing lineages rather
-    than copies of one model.
+    Every parent first draws a band of the ranking (the top 10, 100, 1000 or all
+    rated models, equally likely) and then a model uniformly inside it, so the
+    top band is deep but the lineage is not confined to it. Distinct so the
+    inheriting half of a generation is competing lineages rather than copies of
+    one model; a band already exhausted by earlier picks falls back to the
+    unused models of the whole ranking.
     """
     if count <= 0:
         return []
@@ -137,8 +146,17 @@ def pick_parents(
         (m for m in (_known(label, ranking) for label in labels) if m.games > 0 and not m.frozen),
         key=lambda m: (-m.rating, m.label),
     )
-    pool = [m.label for m in rated[:top_n]]
-    if not pool:
+    ranked = [m.label for m in rated]
+    if not ranked or not tiers:
         return []
-    picked = rng.sample(pool, min(count, len(pool)))
+    picked: list[str] = []
+    taken: set[str] = set()
+    for _ in range(min(count, len(ranked))):
+        band = rng.choice(list(tiers))
+        candidates = [x for x in ranked[:band] if x not in taken]
+        if not candidates:
+            candidates = [x for x in ranked if x not in taken]
+        choice = rng.choice(candidates)
+        picked.append(choice)
+        taken.add(choice)
     return [picked[index % len(picked)] for index in range(count)]

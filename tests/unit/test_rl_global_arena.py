@@ -26,7 +26,7 @@ from pokerlab.rl.global_arena import (
     prune_ghost_members,
     repair_member_refs,
     sample_population,
-    top_biased_draw,
+    tiered_draw,
 )
 from pokerlab.rl.global_store import (
     acquire_locks,
@@ -412,7 +412,7 @@ def _store(tmp_path, anchors, models):
 
 
 def test_a_well_played_model_above_the_best_anchor_is_added(tmp_path):
-    # games percentile 75 of [10, 20, 30, 40, 100] is 40: only 100 is above it.
+    # games percentile 90 of [10, 20, 30, 40, 100] is 76: only 100 is above it.
     root, global_dir = _store(
         tmp_path,
         anchors=[(1500.0, 500)],
@@ -915,7 +915,7 @@ def test_the_module_is_runnable_as_a_shard():
     assert "--candidates" in finished.stderr
 
 
-# ---- a draw that spends half its seats on the top ------------------------------
+# ---- a draw that gives each rating band a quarter of the seats ------------------------------
 
 
 def _population(n):
@@ -927,54 +927,73 @@ def _ratings(n):
     return {f"m{i:04d}": {"rating": 2000.0 - i} for i in range(n)}
 
 
-def test_half_the_seats_go_to_the_top_band():
+def _band(label):
+    rank = int(label[1:])
+    return 0 if rank < 10 else 1 if rank < 100 else 2 if rank < 1000 else 3
+
+
+def test_each_band_gets_a_quarter_of_the_seats():
     """`pick_parents` reads the top 100 and the ordering there was measured
-    wrong, while nothing reads model #5000's exact rating. Half the seats
-    reserved for the top band buy five times the evidence where it is used."""
-    population, ratings = _population(1000), _ratings(1000)
+    wrong, so ranks 1-10, 11-100, 101-1000 and the rest get equal shares."""
+    population, ratings = _population(3000), _ratings(3000)
 
-    drawn = top_biased_draw(ratings, top_n=100, share=0.5)(population, 50, random.Random(0))
+    drawn = tiered_draw(ratings)(population, 48, random.Random(0))
 
-    assert len(drawn) == 50
-    assert len({c.label for c in drawn}) == 50, "no model seated twice"
-    from_top = sum(1 for c in drawn if int(c.label[1:]) < 100)
-    # 25 reserved, plus however many the uniform half happens to land there.
-    assert from_top >= 25
+    assert len(drawn) == 48
+    assert len({c.label for c in drawn}) == 48, "no model seated twice"
+    counts = [sum(1 for c in drawn if _band(c.label) == band) for band in range(4)]
+    # The top ten cannot fill 12 seats: they are all there, the shortfall spills.
+    assert counts[0] == 10
+    assert counts[1] >= 12 and counts[2] >= 12 and counts[3] >= 12
+
+
+def test_the_leftover_seats_go_to_random_bands_so_the_average_is_exact():
+    population, ratings = _population(3000), _ratings(3000)
+    totals = [0, 0, 0, 0]
+    rounds = 400
+    for seed in range(rounds):
+        for c in tiered_draw(ratings)(population, 50, random.Random(seed)):
+            totals[_band(c.label)] += 1
+
+    # 50 seats over 4 bands is 12.5 each. The top ten are capped at 10 and the
+    # ~2.5 seats they cannot fill spill over the models not yet drawn.
+    assert totals[0] / rounds == 10
+    assert 12.0 < totals[1] / rounds < 14.0
+    assert 12.0 < totals[2] / rounds < 14.0
+    assert sum(totals) == 50 * rounds
 
 
 def test_the_tail_is_still_reachable():
-    """Biased, not restricted: the uniform half still reaches anyone, or the
-    rest of the population would never be rated again at all."""
-    population, ratings = _population(1000), _ratings(1000)
+    population, ratings = _population(3000), _ratings(3000)
     seen = set()
-    for seed in range(40):
-        for c in top_biased_draw(ratings, top_n=100)(population, 50, random.Random(seed)):
+    for seed in range(60):
+        for c in tiered_draw(ratings)(population, 50, random.Random(seed)):
             seen.add(int(c.label[1:]))
 
-    assert max(seen) > 900, "the worst-rated end of the population is never drawn"
+    assert max(seen) > 2900, "the worst-rated end of the population is never drawn"
 
 
-def test_an_unrated_model_is_reachable_through_the_uniform_half():
+def test_an_unrated_model_is_reachable_through_the_last_band():
     """A model with no rating yet is untested, not excluded -- and
     `rate_against_benchmark` gives a freshly published one a rating immediately."""
-    population = _population(200)
-    ratings = _ratings(100)  # the other 100 have never been rated
+    population = _population(2000)
+    ratings = _ratings(1000)  # the other 1000 have never been rated
 
     seen = set()
     for seed in range(30):
-        for c in top_biased_draw(ratings, top_n=50)(population, 20, random.Random(seed)):
+        for c in tiered_draw(ratings)(population, 20, random.Random(seed)):
             seen.add(c.label)
 
-    assert any(int(label[1:]) >= 100 for label in seen)
+    assert any(int(label[1:]) >= 1000 for label in seen)
 
 
-def test_the_draw_fills_its_count_even_when_the_top_band_is_short():
-    """Whatever the top half cannot fill spills into the uniform half, so a
+def test_the_draw_fills_its_count_even_when_the_top_bands_are_short():
+    """Whatever a band cannot fill spills to the models not yet drawn, so a
     round is never short just because the store has few rated models."""
     population = _population(60)
-    ratings = _ratings(3)  # a top band of three
+    ratings = _ratings(3)
 
-    drawn = top_biased_draw(ratings, top_n=1000, share=0.5)(population, 30, random.Random(1))
+    drawn = tiered_draw(ratings)(population, 30, random.Random(1))
 
     assert len(drawn) == 30
     assert len({c.label for c in drawn}) == 30
@@ -983,6 +1002,6 @@ def test_the_draw_fills_its_count_even_when_the_top_band_is_short():
 def test_a_draw_larger_than_the_population_returns_everyone():
     population, ratings = _population(10), _ratings(10)
 
-    drawn = top_biased_draw(ratings)(population, 50, random.Random(0))
+    drawn = tiered_draw(ratings)(population, 50, random.Random(0))
 
     assert {c.label for c in drawn} == {c.label for c in population}
