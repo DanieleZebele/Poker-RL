@@ -1852,6 +1852,12 @@ dependency (Flask, etc.) — it ships with Python. Architecture:
     `push_top_models` passes `fallback_dir=None` -- it must not "find" the very
     copies it is replacing -- and so must any test asserting an empty result,
     because the tests run from the repo root, where `top_models/` exists.
+    **On the `v2` branch the models in `top_models/` are the v1 ones and are
+    provisional**: the folder stays, but its contents must be replaced with the
+    first good v2 models (via `push_top_models`) as soon as they exist. Once v2
+    changes `OBS_DIM` or `FEATURE_VERSION`, `check_compatible` rejects these files,
+    so the GUI's default table, the bot picker and the spot advisors would find
+    nothing loadable until they are replaced.
 - **Busted players disappear from the table**: `TableFrame._hide_seat`
   calls `grid_remove()` (not just blanking the labels) on a seat's box once
   its stack hits 0, called from both `_render_observation` (seat missing
