@@ -8,7 +8,6 @@ model that is never published), and it is testable without training anything.
 from __future__ import annotations
 
 import importlib.util
-import itertools
 import json
 import os
 import random
@@ -28,7 +27,7 @@ from pokerlab.rl.loop import (
     HP_ARM_FALLBACK,
     HP_ARM_INHERITED,
     HP_ARM_SAMPLED,
-    HP_LADDERS,
+    HP_AXES,
     HP_MULTIPLIERS,
     REWARD_WINDOW_HANDS,
     STAGE_ERROR,
@@ -45,10 +44,9 @@ from pokerlab.rl.loop import (
     launch_worker,
     parse_worker_log,
     perturb_hyperparameters,
-    render_trend,
-    sample_hyperparameters,
     stage_cell,
     stage_label,
+    starting_hyperparameters,
     sweep_stale_work,
     wait_for_workers,
     worker_progress,
@@ -179,47 +177,6 @@ def test_worker_progress_survives_a_partially_written_line(tmp_path):
     )
 
 
-def test_a_worker_no_longer_reports_a_live_benchmark(tmp_path):
-    """The per-worker benchmark was removed at the user's request: the reading
-    was not wanted any more and the hands it played cost every worker time.
-
-    An old log still holding the line must parse cleanly -- a worker that was
-    running when the change landed keeps writing the code it loaded at launch --
-    so the line is simply ignored, and it must not leave the row stuck in a
-    stage nobody announces any more either.
-    """
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    (tmp_path / "gen0001-w00.log").write_text(
-        "iter    1  reward +1.0 bb  policy -0.01  value 1.0  entropy 0.900  kl 0.01  clip 0.1\n"
-        "        eval vs pool: +10.0 bb/100  rating 1523\n"
-        "phase: benchmark\n"
-        "        benchmark: -4.2 bb/100 vs 12 avversari fissi\n",
-        encoding="utf-8",
-    )
-    rows = worker_progress(tmp_path, 1)
-    assert not hasattr(rows[0], "benchmark")
-    assert rows[0].rating == "1523", "the rest of an old log still reads"
-    assert rows[0].stage == STAGE_TRAINING
-
-
-def test_the_trend_needs_at_least_two_points(tmp_path):
-    assert render_trend([]) == ""
-    assert render_trend([12.0]) == ""
-
-
-def test_the_trend_renders_one_mark_per_generation(tmp_path):
-    rendered = render_trend([-100.0, 0.0, 50.0, 120.0])
-    assert "-100" in rendered and "+120" in rendered
-    bars = rendered.split()[1]
-    assert len(bars) == 4
-
-
-def test_a_flat_trend_does_not_divide_by_zero(tmp_path):
-    """Identical benchmark results across generations is a real outcome -- and
-    exactly the one worth seeing clearly."""
-    assert render_trend([42.0, 42.0, 42.0])
-
-
 def test_the_final_pool_summary_is_not_mistaken_for_a_rating(tmp_path):
     """A finished worker prints a leaderboard whose header reads
     "membro  rating  partite"; matching "rating " anywhere reads the column
@@ -260,7 +217,7 @@ def test_a_result_line_puts_the_worker_back_into_training():
 
 
 def test_the_elo_stages_follow_each_other():
-    """The three stages of the population round are distinct: playing thousands
+    """The three stages of the population pass are distinct: playing thousands
     of hands, merging under per-model locks, and the rare pruning pass."""
     text = "\n".join(marker(s) for s in (ELO_PLAY, ELO_MERGE, PRUNING, ELO_MERGE, DONE))
     assert parse_worker_log("w00", text).stage == DONE
@@ -278,20 +235,9 @@ def test_a_crashed_worker_is_reported_as_an_error_and_stays_that_way():
     assert parse_worker_log("w00", text).stage == STAGE_ERROR
 
 
-def test_an_old_log_without_markers_still_ends_as_done():
-    """Logs written before the phase markers existed end with the round summary;
-    reading one must not leave a finished worker looking stuck in training."""
-    text = (
-        "iter    1  reward +1.0 bb  entropy 0.9\n"
-        "published host-a-gen0001-w00-agent-x (rating 1523)\n"
-        "global round: 129 sessioni, 55 modelli coinvolti\n"
-    )
-    assert parse_worker_log("w00", text).stage == DONE
-
-
 def test_the_last_stretch_of_a_run_is_named_for_what_it_is():
     """At the target iteration count 'training' is really the wrap-up: saving,
-    publishing and the round against the frozen anchors. A stage the worker
+    publishing and the pass against the frozen anchors. A stage the worker
     announces itself keeps its own name, whenever it happens."""
     done = parse_worker_log("w00", "iter 1\n" * 100)
     assert stage_label(done, 100) == "fine training"
@@ -448,19 +394,17 @@ def store_with_ranking(tmp_path, count: int, *, games: int = 10):
     return models, ranking
 
 
-def test_half_the_workers_inherit_and_half_start_from_scratch(tmp_path):
+def test_every_worker_inherits_when_the_store_has_parents(tmp_path):
     """Without inheritance the loop only ever produces models exactly
-    --iterations deep; with everyone inheriting from one parent a dead end
-    traps the whole population."""
+    --iterations deep, and from-scratch runs trained worse in every group."""
     models, ranking = store_with_ranking(tmp_path, 30)
-    plan = inheritance_plan(ranking, models, 24, 0.5, rng=random.Random(0))
-    assert sum(1 for parent in plan if parent is not None) == 12
-    assert sum(1 for parent in plan if parent is None) == 12
+    plan = inheritance_plan(ranking, models, 24, rng=random.Random(0))
+    assert all(parent is not None for parent in plan)
 
 
 def test_inheritors_get_distinct_parents_from_the_top_of_the_ranking(tmp_path):
     models, ranking = store_with_ranking(tmp_path, 30)
-    plan = inheritance_plan(ranking, models, 8, 0.5, rng=random.Random(1), tiers=(10,))
+    plan = inheritance_plan(ranking, models, 4, rng=random.Random(1), tiers=(10,))
     parents = [p.stem for p in plan if p is not None]
     assert len(parents) == 4 and len(set(parents)) == 4, "every parent is different"
     assert all(int(label[1:]) < 10 for label in parents), "only the top_n are eligible"
@@ -469,14 +413,14 @@ def test_inheritors_get_distinct_parents_from_the_top_of_the_ranking(tmp_path):
 def test_the_parents_differ_from_one_generation_to_the_next(tmp_path):
     models, ranking = store_with_ranking(tmp_path, 60)
     rng = random.Random(7)
-    first = inheritance_plan(ranking, models, 8, 0.5, rng=rng)
-    second = inheritance_plan(ranking, models, 8, 0.5, rng=rng)
+    first = inheritance_plan(ranking, models, 8, rng=rng)
+    second = inheritance_plan(ranking, models, 8, rng=rng)
     assert first != second
 
 
 def test_parents_are_recycled_when_there_are_more_inheritors_than_models(tmp_path):
     models, ranking = store_with_ranking(tmp_path, 2)
-    plan = inheritance_plan(ranking, models, 8, 1.0, rng=random.Random(0))
+    plan = inheritance_plan(ranking, models, 8, rng=random.Random(0))
     assert sorted({p.stem for p in plan}) == ["m00", "m01"]
     assert all(p is not None for p in plan)
 
@@ -484,17 +428,12 @@ def test_parents_are_recycled_when_there_are_more_inheritors_than_models(tmp_pat
 def test_an_empty_store_means_everyone_starts_from_scratch(tmp_path):
     """Generation 1 has nothing to inherit from."""
     ranking = PoolRegistry(directory=tmp_path / "global", max_models=10**9)
-    assert inheritance_plan(ranking, tmp_path / "models", 4, 0.5, rng=random.Random(0)) == [None] * 4
+    assert inheritance_plan(ranking, tmp_path / "models", 4, rng=random.Random(0)) == [None] * 4
 
 
 def test_a_model_that_was_never_rated_is_not_a_parent(tmp_path):
     models, ranking = store_with_ranking(tmp_path, 3, games=0)
-    assert inheritance_plan(ranking, models, 4, 1.0, rng=random.Random(0)) == [None] * 4
-
-
-def test_a_zero_fraction_disables_inheritance(tmp_path):
-    models, ranking = store_with_ranking(tmp_path, 5)
-    assert inheritance_plan(ranking, models, 4, 0.0, rng=random.Random(0)) == [None] * 4
+    assert inheritance_plan(ranking, models, 4, rng=random.Random(0)) == [None] * 4
 
 
 # ---- launching a worker ------------------------------------------------------
@@ -502,25 +441,28 @@ def test_a_zero_fraction_disables_inheritance(tmp_path):
 
 def launch_args(tmp_path, **overrides):
     values = {
-        "workers": 4, "seed_base": 1000, "iterations": 5, "hands": 8, "players": 3, "stack": 100,
-        "sb": 1, "bb": 2, "lr": 3e-4, "fresh_lr": 1e-3, "device": "cpu",
+        "workers": 4, "seed_base": 1000, "iterations": 5, "hands": 8,
+        "table_weights": [0.0, 1.0, 0, 0, 0, 0, 0, 0], "stack_min_bb": 50.0, "stack_max_bb": 50.0,
+        "sb": 1, "bb": 2, "lr": 3e-4, "device": "cpu",
+        "hidden": 512, "num_layers": 3, "head_hidden": 256, "head_layers": 1,
         "models_dir": tmp_path / "models",
         "machine": "host-a", "pool_models": 20, "pool_top_share": 0.5, "pool_top_n": 100,
         "ppo_epochs": 4, "clip_epsilon": 0.2, "eval_every": 10,
         "minibatch_size": 1024, "gae_lambda": 0.95, "value_coef": 0.5, "max_grad_norm": 0.5,
-        "entropy_coef": 0.0,
-        "eval_sessions": 2, "archive_every": 5,
-        "benchmark_dir": tmp_path / "benchmark", "benchmark_seed": 1,
-        "global_dir": tmp_path / "global", "global_lock_seconds": 120, "global_round": False,
-        "benchmark_sessions": 10, "opponent_probability": 0.5,
-        "elo_fill_in": False, "fill_min_sessions": 50, "fill_deadline_minutes": 150.0,
-        "fill_games_per_model": 1,
+        "entropy_coef": 0.0, "k_schedule": "0:16, 100:2", "draw_tiers": "10, 100, 1000, all",
+        "eval_sessions": 2,
+        "benchmark_dir": tmp_path / "benchmark",
+        "global_dir": tmp_path / "global", "global_lock_seconds": 120, "global_elo": False,
+        "benchmark_sessions": 10, "benchmark_resident": 10, "benchmark_rotate_every": 50,
+        "opponent_probability": 0.5,
+        "elo_fill_in": False, "fill_deadline_minutes": 150.0,
+        "fill_sessions": 10,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
 
 
-def capture_launch(tmp_path, monkeypatch, *, inherit_from=None):
+def capture_launch(tmp_path, monkeypatch, *, inherit_from=None, hp=None):
     captured = {}
 
     class FakePopen:
@@ -530,7 +472,7 @@ def capture_launch(tmp_path, monkeypatch, *, inherit_from=None):
     monkeypatch.setattr(loop_module.subprocess, "Popen", FakePopen)
     worker_dir = tmp_path / "work" / "gen0007-w02"
     launch_worker(
-        launch_args(tmp_path), 2, 7, worker_dir, tmp_path / "logs" / "w.log", inherit_from
+        launch_args(tmp_path), 2, 7, worker_dir, tmp_path / "logs" / "w.log", inherit_from, hp
     )
     return captured["command"], worker_dir
 
@@ -549,7 +491,7 @@ def test_a_worker_is_told_where_the_store_is_and_where_to_keep_its_scratch(tmp_p
     assert worker_dir.is_dir()  # created for it
     # The old per-machine pool is gone from the interface entirely.
     assert "--pool-dir" not in command and "--pool-size" not in command
-    assert "--no-global-round" in command
+    assert "--no-global-elo" in command
 
 
 def test_an_inheriting_worker_resumes_from_a_copy_of_its_parent(tmp_path, monkeypatch):
@@ -564,39 +506,56 @@ def test_an_inheriting_worker_resumes_from_a_copy_of_its_parent(tmp_path, monkey
     assert parent.read_bytes() == b"parent weights"  # the store's file is only read
 
 
+def test_an_inheriting_worker_is_told_which_parent_it_came_from(tmp_path, monkeypatch):
+    parent = tmp_path / "models" / "m-gen0003-w01-agent-20260101-000000.pt"
+    parent.parent.mkdir()
+    parent.write_bytes(b"w")
+
+    inherited = loop_module.perturb_hyperparameters(a_parent(), random.Random(1))
+    command, _ = capture_launch(tmp_path, monkeypatch, inherit_from=parent, hp=inherited)
+
+    assert command[command.index("--parent-label") + 1] == parent.stem
+
+
+def test_a_worker_that_runs_the_fleets_own_settings_took_no_step_from_its_parent(tmp_path, monkeypatch):
+    """Its settings are not its parent's perturbed, so recording a step would put
+    the parent's lineage drift into the optimizer's evidence as if it were an effect."""
+    parent = tmp_path / "models" / "m-gen0003-w01-agent-20260101-000000.pt"
+    parent.parent.mkdir()
+    parent.write_bytes(b"w")
+
+    command, _ = capture_launch(tmp_path, monkeypatch, inherit_from=parent)
+
+    assert "--resume" in command and "--parent-label" not in command
+
+
+def test_every_worker_is_handed_the_fleets_network_shape(tmp_path, monkeypatch):
+    """The shape is the fleet's, resolved from `config.toml` when the generation
+    started, so a worker never has to read the file to know what to build."""
+    command, _ = capture_launch(tmp_path, monkeypatch)
+    for flag, value in (("--hidden", "512"), ("--num-layers", "3"),
+                        ("--head-hidden", "256"), ("--head-layers", "1")):
+        assert command[command.index(flag) + 1] == value
+
+
 def test_a_worker_without_a_parent_starts_fresh(tmp_path, monkeypatch):
     command, _ = capture_launch(tmp_path, monkeypatch)
     assert "--resume" not in command
+    assert "--parent-label" not in command
 
 
-def test_a_fresh_worker_takes_larger_steps_than_an_inheriting_one(tmp_path, monkeypatch):
-    """A random network has much further to travel than a trained one, so the
-    two halves of a generation do not train at the same learning rate."""
-    parent = tmp_path / "models" / "parent.pt"
-    parent.parent.mkdir()
-    parent.write_bytes(b"parent weights")
-
-    fresh, _ = capture_launch(tmp_path, monkeypatch)
-    inheriting, _ = capture_launch(tmp_path, monkeypatch, inherit_from=parent)
-
-    assert fresh[fresh.index("--lr") + 1] == str(1e-3)
-    assert inheriting[inheriting.index("--lr") + 1] == str(3e-4)
-
-
-def test_a_parent_that_vanished_leaves_the_worker_fresh_in_both_respects(tmp_path, monkeypatch):
-    """The rate and `--resume` read one decision, so a parent that is gone by
-    launch time cannot produce a fresh run at the inheriting rate."""
+def test_a_parent_that_vanished_leaves_the_worker_fresh(tmp_path, monkeypatch):
+    """`--resume` reads whether the parent file is still there at launch time."""
     command, _ = capture_launch(tmp_path, monkeypatch, inherit_from=tmp_path / "models" / "gone.pt")
 
     assert "--resume" not in command
-    assert command[command.index("--lr") + 1] == str(1e-3)
 
 
 # ---- the per-worker hyperparameter sweep -----------------------------------------
 
 
 def a_parent(**overrides):
-    """A parent's run metadata, sitting on the centre rung of every ladder."""
+    """A parent's run metadata, sitting on the fleet's own default settings."""
     values = {
         "schema": loop_module.RUN_METADATA_VERSION,
         "lr": 3.0e-4,
@@ -616,45 +575,36 @@ def a_parent(**overrides):
     return values
 
 
-def test_a_sampled_worker_lands_on_a_rung_of_every_ladder():
-    """Every value a worker is launched with has to be one an analysis can group
-    by, or the sweep produces 25 unrepeatable points a generation."""
-    for seed in range(25):
-        drawn = sample_hyperparameters(random.Random(seed))
-        for axis, values in HP_LADDERS.items():
-            assert getattr(drawn, axis) in values
-        assert drawn.arm == HP_ARM_SAMPLED
+def a_start(**overrides):
+    """The fleet's own settings, as a loop run with no flag and no file has them."""
+    return starting_hyperparameters(
+        SimpleNamespace(**{**{axis: a_parent()[axis] for axis in HP_AXES}, **overrides})
+    )
 
 
-def test_the_axes_are_drawn_independently():
-    """The point of an independent draw is that the mean outcome over one axis
-    estimates that axis's effect with the others averaged out; drawing them
-    together would confound every reading."""
-    rng = random.Random(0)
-    pairs = {(hp.lr, hp.ppo_epochs) for hp in (sample_hyperparameters(rng) for _ in range(400))}
-    assert len(pairs) > len(HP_LADDERS["lr"])
-
-
-def test_every_ladder_is_centred_on_what_the_fleet_runs_today():
-    """A generation is a sweep *around* the known-good point, not a jump away
-    from it, so today's production value has to be on the ladder."""
-    assert HP_LADDERS["lr"][2] == 3.0e-4
-    assert HP_LADDERS["hands"][2] == 512
-    assert HP_LADDERS["opponent_probability"][2] == 0.50
-    assert HP_LADDERS["ppo_epochs"][2] == 4
-    assert HP_LADDERS["clip_epsilon"][2] == 0.20
-    assert HP_LADDERS["pool_top_share"][2] == 0.50
-    assert HP_LADDERS["pool_top_n"][3] == 100
+def test_the_default_flags_are_what_the_fleet_runs_today():
+    """A worker with no parent starts a step around these, so today's production
+    values are what the loop's own flags have to say."""
+    args = loop_module.build_parser().parse_args(["--config", ""])
+    start = starting_hyperparameters(args)
+    assert start.lr == 3.0e-4
+    assert start.hands == 512
+    assert start.opponent_probability == 0.50
+    assert start.ppo_epochs == 4
+    assert start.clip_epsilon == 0.20
+    assert start.pool_top_share == 0.50
+    assert start.pool_top_n == 100
+    assert start.arm == HP_ARM_SAMPLED
 
 
 def test_an_inheriting_worker_multiplies_every_axis_by_one_of_the_multipliers():
     """PBT's x{0.8, 1.0, 1.25} with the user's own 1.2, applied to the parent's
-    value rather than stepped along a ladder."""
+    value."""
     parent = a_parent()
     for seed in range(40):
         child = perturb_hyperparameters(parent, random.Random(seed))
         assert child is not None
-        for axis in HP_LADDERS:
+        for axis in HP_AXES:
             got, was = getattr(child, axis), parent[axis]
             allowed = [
                 round(was * m) if isinstance(got, int) else was * m
@@ -671,37 +621,20 @@ def test_an_inheriting_worker_multiplies_every_axis_by_one_of_the_multipliers():
 
 
 def test_the_multipliers_are_the_ones_that_were_asked_for():
-    """A rung step and a multiplier are not the same thing, and the inherit arm
-    is now the multiplier. Pinned because the two are easy to confuse: the
-    sampled arm's ladder happens to be spaced ~1.25 apart, so a reader could
-    take the spacing for the step."""
+    """Pinned because the step is the one number the whole search rests on."""
     assert HP_MULTIPLIERS == (0.8, 1.0, 1.2)
 
 
-def test_the_sampled_ladder_is_still_spaced_like_a_multiplier():
-    """The sampled arm did not change: its rungs stay ~1.25 apart wherever the
-    axis is a scale, so the two arms cover comparable ground."""
-    for axis in ("lr", "hands", "opponent_probability", "clip_epsilon"):
-        values = HP_LADDERS[axis]
-        for lower, upper in itertools.pairwise(values):
-            assert 1.2 <= upper / lower <= 1.3
-
-
-def test_a_lineage_can_walk_clean_past_the_ends_of_the_ladder():
-    """The opposite of what this arm used to do, and the point of the change: the
-    ends of these ladders were never measured, so they must not be the furthest
-    the fleet can go. The bound is selection -- a parent is drawn from the
-    best-rated models -- not arithmetic."""
-    top = a_parent(lr=HP_LADDERS["lr"][-1], hands=HP_LADDERS["hands"][-1])
-    children = [perturb_hyperparameters(top, random.Random(seed)) for seed in range(40)]
-    assert any(child.lr > HP_LADDERS["lr"][-1] for child in children)
-    assert any(child.hands > HP_LADDERS["hands"][-1] for child in children)
-
-    # And a parent already off the ladder is not snapped back onto it.
-    off = a_parent(lr=9.9e-4)
-    assert {
-        perturb_hyperparameters(off, random.Random(seed)).lr for seed in range(40)
-    }.isdisjoint(HP_LADDERS["lr"])
+def test_a_lineage_is_never_snapped_back_to_any_grid():
+    """Nothing but selection bounds a lineage: a parent far from the defaults
+    keeps moving from where it is, and can go on past where it already is."""
+    far = a_parent(lr=9.9e-4, hands=2000)
+    children = [perturb_hyperparameters(far, random.Random(seed)) for seed in range(40)]
+    assert any(child.lr > 9.9e-4 for child in children)
+    assert any(child.hands > 2000 for child in children)
+    assert all(
+        any(child.lr == pytest.approx(9.9e-4 * m) for m in HP_MULTIPLIERS) for child in children
+    )
 
 
 def test_a_probability_axis_is_capped_at_one():
@@ -717,7 +650,7 @@ def test_a_probability_axis_is_capped_at_one():
 
 def test_a_count_axis_that_varies_varies_by_at_least_one():
     """Plain rounding left 2 absorbing in *both* directions (round(2 x 1.2) =
-    round(2 x 0.8) = 2), and 2 is the bottom rung of the `ppo_epochs` ladder --
+    round(2 x 0.8) = 2), and 2 is an ordinary `ppo_epochs` --
     measured before the fix, 62% of lineages were stuck there after 20
     generations and 96% after 200. So when rounding would not move the value, it
     steps by exactly one instead."""
@@ -767,9 +700,8 @@ def test_a_parent_whose_settings_are_unknown_is_not_inherited_from():
 
 
 def test_every_worker_inherits_and_none_is_sampled_by_choice():
-    """The deliberate sampled arm was removed at the user's request: a worker that
-    *can* inherit always does, whatever its index."""
-    plan = hyperparameter_plan(24, [a_parent()] * 24, rng=random.Random(0))
+    """A worker that *can* inherit always does, whatever its index."""
+    plan = hyperparameter_plan(24, [a_parent()] * 24, a_start(), rng=random.Random(0))
     arms = [hp.arm for hp in plan]
     assert arms.count(HP_ARM_INHERITED) == 24
     assert arms.count(HP_ARM_SAMPLED) == 0
@@ -787,38 +719,42 @@ def test_the_supervisor_has_no_knob_left_for_a_sampled_share():
     assert "inherit_share" not in inspect.signature(hyperparameter_plan).parameters
 
 
-def test_a_worker_with_nothing_to_inherit_from_falls_back_to_sampling():
+def test_a_worker_with_nothing_to_inherit_from_starts_from_the_fleets_settings():
     """The only non-inherited case left, and it is not a choice: with no parent
-    metadata there is nothing to perturb, so the worker draws a rung and says so
-    in its arm. This is now the *whole* of the non-inherited population."""
-    plan = hyperparameter_plan(8, [None] * 8, rng=random.Random(0))
+    metadata there is nothing of a parent's to perturb, so the worker perturbs the
+    starting point the flags (and `config.toml`) give, and says so in its arm."""
+    start = a_start(lr=1.0e-3, hands=300)
+    plan = hyperparameter_plan(8, [None] * 8, start, rng=random.Random(0))
     arms = [hp.arm for hp in plan]
     assert arms.count(HP_ARM_INHERITED) == 0
     assert arms.count(HP_ARM_FALLBACK) == 8
     assert arms.count(HP_ARM_SAMPLED) == 0
     for hp in plan:
-        assert hp.lr in HP_LADDERS["lr"]
+        assert any(hp.lr == pytest.approx(1.0e-3 * m) for m in HP_MULTIPLIERS)
+        assert any(hp.hands == round(300 * m) for m in HP_MULTIPLIERS)
+    # Perturbed independently, not all moved together.
+    assert len({hp.lr for hp in plan}) > 1
 
 
 def test_hyperparameters_are_inherited_only_from_the_weights_parent():
     """Perturbing the settings of a model this worker is not resuming from would
     attribute a configuration to a run that never had it."""
-    parents = [a_parent(lr=HP_LADDERS["lr"][0]), None] * 4
-    plan = hyperparameter_plan(8, parents, rng=random.Random(3))
+    parents = [a_parent(lr=1.9e-4), None] * 4
+    plan = hyperparameter_plan(8, parents, a_start(), rng=random.Random(3))
     for worker, hp in enumerate(plan):
         if parents[worker] is None:
             assert hp.arm == HP_ARM_FALLBACK
         else:
             assert hp.arm == HP_ARM_INHERITED
             assert any(
-                hp.lr == pytest.approx(HP_LADDERS["lr"][0] * m) for m in HP_MULTIPLIERS
+                hp.lr == pytest.approx(1.9e-4 * m) for m in HP_MULTIPLIERS
             )
 
 
 def test_the_plan_is_reproducible_from_its_seed():
     parents = [a_parent(), None, a_parent(), None]
-    first = hyperparameter_plan(4, parents, rng=random.Random(7))
-    second = hyperparameter_plan(4, parents, rng=random.Random(7))
+    first = hyperparameter_plan(4, parents, a_start(), rng=random.Random(7))
+    second = hyperparameter_plan(4, parents, a_start(), rng=random.Random(7))
     assert first == second
 
 
@@ -877,22 +813,11 @@ def test_a_worker_without_a_plan_runs_the_fleets_own_settings(tmp_path, monkeypa
     assert value("--hp-arm") == HP_ARM_SAMPLED
 
 
-def test_no_worker_starts_from_a_random_network_any_more():
-    """From-scratch runs were eliminated at the user's decision: they trained
-    worse by 25-46 bb/100 in every group measured over 2,810 runs, and 8 of 95
-    collapsed below -100 bb/100."""
-    assert _argparse_default("pokerlab.rl.loop", "--inherit-fraction") == "1.0"
-    # `--fresh-lr` is dormant, not deleted: a worker still needs a rate when the
-    # store cannot supply a parent at all, and deleting a flag is what takes the
-    # fleet down.
-    assert _argparse_default("pokerlab.rl.loop", "--fresh-lr") == "0.001"
-
-
 def test_the_settings_are_read_back_out_of_a_real_checkpoint(tmp_path):
     """The one place the two halves meet: `train.py` writes the metadata into
     the archive and the supervisor reads it off the same file a generation
     later. A silent failure here does not break anything visibly -- it quietly
-    turns every worker of the generation into a fallback draw from the ladder,
+    turns every worker of the generation into a restart from the fleet's own settings,
     which is the opposite of the search the fleet is supposed to be running."""
     pytest.importorskip("torch")
     from pokerlab.rl.policy import PokerActorCritic
@@ -900,8 +825,8 @@ def test_the_settings_are_read_back_out_of_a_real_checkpoint(tmp_path):
     from pokerlab.rl.train import run_metadata
 
     args = SimpleNamespace(
-        hp_arm=HP_ARM_SAMPLED, machine="host-a", seed=7, resume=True, iterations=100,
-        hands=640, players=6, stack=200, sb=1, bb=2, lr=3.8e-4, ppo_epochs=5,
+        hp_arm=HP_ARM_SAMPLED, parent_label="", hidden=512, num_layers=3, head_hidden=256, head_layers=1, machine="host-a", seed=7, resume=True, iterations=100,
+        hands=640, table_weights=[25.0, 20.0, 15.0, 10.0, 10.0, 10.0, 5.0, 5.0], stack_min_bb=1.0, stack_max_bb=100.0, sb=50, bb=100, lr=3.8e-4, ppo_epochs=5,
         clip_epsilon=0.25, entropy_coef=0.0, opponent_probability=0.62,
         pool_models=20, pool_top_share=0.5, pool_top_n=100,
         minibatch_size=1024, gae_lambda=0.95, value_coef=0.5, max_grad_norm=0.5,
@@ -912,8 +837,8 @@ def test_the_settings_are_read_back_out_of_a_real_checkpoint(tmp_path):
     recovered = loop_module.read_run_metadata(path)
     child = perturb_hyperparameters(recovered, random.Random(0))
     assert child is not None and child.arm == HP_ARM_INHERITED
-    assert HP_LADDERS["lr"].index(child.lr) in (2, 3, 4)
-    assert HP_LADDERS["hands"].index(child.hands) in (2, 3, 4)
+    assert any(child.lr == pytest.approx(3.8e-4 * m) for m in HP_MULTIPLIERS)
+    assert any(child.hands == round(640 * m) for m in HP_MULTIPLIERS)
 
 
 def test_a_model_published_before_the_metadata_existed_reads_as_nothing(tmp_path):
@@ -956,32 +881,11 @@ def test_inherited_workers_are_visible_in_the_status(tmp_path):
     assert [row.inherited for row in rows] == [True, False]
 
 
-def test_the_history_carries_both_benchmark_series(tmp_path):
-    """The overall best can be a pre-loop model whose number never moves; the
-    per-generation series is what shows whether new training improves."""
-    path = tmp_path / "loop_state.json"
-    state = LoopState(generation=4)
-    state.history.append(
-        {
-            "generation": 4,
-            "benchmark_bb100": -10.5,
-            "benchmark_model": "seed16-iter00100",
-            "benchmark_new_bb100": -48.0,
-            "benchmark_new_model": "gen0004-w01-...",
-        }
-    )
-    state.save(path)
-
-    reloaded = LoopState.load(path)
-    assert reloaded.history[-1]["benchmark_bb100"] == -10.5
-    assert reloaded.history[-1]["benchmark_new_bb100"] == -48.0
-
-
 # ---- clearing what an interrupted run left behind --------------------------------
 
 
 def _abandoned_generation(work, generation=155, worker=7, *, archive=True, rating=1633.0):
-    """A worker directory as a killed loop leaves it: the best-so-far archive it
+    """A worker directory as a killed loop leaves it: the final archive it
     trained (with the sidecar recording its rating) and the live checkpoint beside it."""
     name = f"gen{generation:04d}-w{worker:02d}"
     worker_dir = work / name
@@ -1133,7 +1037,7 @@ def test_the_sweep_removes_only_this_machines_stale_publish_partials(tmp_path, m
     assert published.exists()
 
 
-def test_the_sweep_removes_stale_shard_scratch_from_a_killed_global_round(tmp_path, monkeypatch):
+def test_the_sweep_removes_stale_shard_scratch_from_a_killed_global_elo(tmp_path, monkeypatch):
     _no_processes(monkeypatch)
     scratch = tmp_path / "tmp"
     stale = scratch / "global-arena-shard-abc123"
@@ -1150,7 +1054,7 @@ def test_the_sweep_removes_stale_shard_scratch_from_a_killed_global_round(tmp_pa
     assert not stale.exists() and fresh.exists()
 
 
-# ---- the population round's session count ---------------------------------
+# ---- the population pass's session count ---------------------------------
 
 
 def _argparse_default(module_name: str, flag: str) -> str:
@@ -1174,21 +1078,21 @@ def _argparse_default(module_name: str, flag: str) -> str:
     raise AssertionError(f"{module_name} has no {flag}")
 
 
-def test_the_population_rounds_session_count_is_defined_in_exactly_one_place():
-    """It was not: `DEFAULT_GAMES_PER_MODEL` said 500 while both CLIs and
-    `run_population_round` carried a hard-coded 12, so the constant described
+def test_the_population_passes_session_count_is_defined_in_exactly_one_place():
+    """It was not: the constant said 500 while both CLIs and
+    `run_population_sessions` carried a hard-coded 12, so the constant described
     nothing that ever ran and the real number was invisible from it."""
     import inspect
 
-    from pokerlab.rl.global_arena import DEFAULT_GAMES_PER_MODEL, run_population_round
+    from pokerlab.rl.global_arena import DEFAULT_GLOBAL_SESSIONS, run_population_sessions
 
-    signature = inspect.signature(run_population_round)
-    assert signature.parameters["games_per_model"].default == DEFAULT_GAMES_PER_MODEL
+    signature = inspect.signature(run_population_sessions)
+    assert signature.parameters["sessions"].default == DEFAULT_GLOBAL_SESSIONS
     for module in ("pokerlab.rl.train", "pokerlab.rl.loop"):
-        assert _argparse_default(module, "--global-games-per-model") == "DEFAULT_GAMES_PER_MODEL"
+        assert _argparse_default(module, "--global-sessions") == "DEFAULT_GLOBAL_SESSIONS"
 
 
-# ---- the benchmark round in the status --------------------------------------
+# ---- the benchmark pass in the status --------------------------------------
 
 
 def benchmark_log(bb100, *, rating="1530", sessions=500, anchors=42):
@@ -1202,41 +1106,23 @@ def benchmark_log(bb100, *, rating="1530", sessions=500, anchors=42):
     ]) + "\n"
 
 
-def test_the_benchmark_round_result_is_read_off_one_line():
-    """There is one number now, not one per series: the round draws its opponents
-    from the whole frozen set, so a per-band breakdown no longer exists to read."""
+def test_the_benchmark_pass_result_is_read_off_one_line():
+    """The pass draws its opponents from the whole frozen set, so it reports one
+    number."""
     row = parse_worker_log("w00", benchmark_log("-3.7"))
     assert row.benchmark_bb100 == pytest.approx(-3.7)
     assert row.benchmark_rating == "1530"
     assert row.benchmark_sessions == 500
 
 
-def test_a_worker_that_has_not_reached_the_benchmark_round_has_none():
+def test_a_worker_that_has_not_reached_the_benchmark_pass_has_none():
     row = parse_worker_log("w00", "iter    1  reward +1.0 bb  entropy 0.9\n")
     assert row.benchmark_bb100 is None and row.benchmark_rating == "-"
     assert row.benchmark_sessions == 0
 
 
-def test_a_log_from_before_the_series_were_removed_reads_as_not_yet_rated():
-    """A worker already running when this landed keeps printing the old per-series
-    lines. They must match nothing rather than be mistaken for the new line: the
-    two cells stay empty, which is what every reader already does with a run that
-    has not reached the round."""
-    old = "\n".join([
-        "iter    1  reward +1.0 bb  entropy 0.9",
-        marker(SERIES),
-        "        serie benchmark_1: -12.4 bb/100 su 50 sessioni, rating 1468",
-        "        serie totale: -3.7 bb/100 su 11 serie, 550 sessioni, rating 1530",
-    ]) + "\n"
-
-    row = parse_worker_log("w00", old)
-
-    assert row.benchmark_bb100 is None and row.benchmark_rating == "-"
-    assert row.stage == SERIES, "the phase marker is unchanged, so the stage still reads"
-
-
-def test_the_benchmark_round_shows_running_figures_until_it_concludes():
-    """While the round plays, the two cells carry the latest running bb/100 and
+def test_the_benchmark_pass_shows_running_figures_until_it_concludes():
+    """While the pass plays, the two cells carry the latest running bb/100 and
     rating off the `avanzamento` lines, flagged provisional; the final result
     line then replaces them and clears the flag."""
     from pokerlab.rl.phases import progress_marker
@@ -1266,7 +1152,7 @@ def test_a_worker_reporting_only_the_rating_still_fills_its_column():
     assert row.benchmark_bb100 is None
 
 
-def test_the_benchmark_round_is_its_own_stage():
+def test_the_benchmark_pass_is_its_own_stage():
     assert parse_worker_log("w00", "iter 1\n" + marker(SERIES)).stage == SERIES
     assert stage_label(parse_worker_log("w00", "iter 1\n" + marker(SERIES)), 100) == "ancore"
 
@@ -1285,7 +1171,7 @@ def test_the_table_carries_the_benchmark_columns(tmp_path):
     assert "1530" in text and "1602" in text
 
 
-def test_the_benchmark_cells_are_empty_until_the_round_has_run(tmp_path):
+def test_the_benchmark_cells_are_empty_until_the_pass_has_run(tmp_path):
     write_worker_log(tmp_path, 1, 0, 40)
     text = "\n".join(format_worker_table(worker_progress(tmp_path, 1), 100))
     assert "ancore/100" in text, "the column is always there"
@@ -1293,7 +1179,7 @@ def test_the_benchmark_cells_are_empty_until_the_round_has_run(tmp_path):
 
 
 def test_the_status_no_longer_prints_the_generation_table(tmp_path, capsys):
-    """Removed at the user's request: --status is about what is happening now."""
+    """--status is about what is happening now, not the generation history."""
     LoopState(
         generation=1,
         history=[{"generation": 1, "workers": 2, "published_models": 2, "benchmark_bb100": 1.0}],
@@ -1341,6 +1227,62 @@ iter    2  reward   -0.15 bb  policy +0.0078  value    0.044  entropy 0.440  kl 
     assert history.eval_rating == [[2, 1519.0]]
 
 
+def test_parse_worker_history_reads_the_value_target_lines():
+    from pokerlab.rl.monitor import parse_worker_history
+
+    text = """iter    1  reward   +0.54 bb  policy -0.0078  value    0.039  entropy 0.427  kl 0.0242  clip 0.148
+valore per tavolo: 2 sd 0.270 ev -0.50 n 566 | 9 sd 0.674 ev -0.08 n 515  (spread 2.5x)
+valore per stack (bb): <10 sd 0.083 ev -4.12 n 281 | 30+ sd 0.669 ev n/a n 2666  (spread 8.1x)
+iter    2  reward   -0.15 bb  policy +0.0078  value    0.044  entropy 0.440  kl 0.0069  clip 0.063
+iter   10  reward   +0.10 bb  policy +0.0078  value    0.044  entropy 0.440  kl 0.0069  clip 0.063
+valore per tavolo: 2 sd 0.300 ev -0.10 n 500 | 9 sd 0.600 ev -0.05 n 400  (spread 2.0x)
+valore per stack (bb): <10 sd 0.080 ev -2.00 n 280 | 30+ sd 0.600 ev +0.02 n 2600  (spread 7.5x)"""
+    history = parse_worker_history("w01", text)
+    # Each reading is anchored to the iteration printed just before it.
+    assert history.value_sd_size == {"2": [[1, 0.27], [10, 0.3]], "9": [[1, 0.674], [10, 0.6]]}
+    assert history.value_sd_stack["<10"] == [[1, 0.083], [10, 0.08]]
+    # An n/a explained variance is left out of the series rather than plotted as 0.
+    assert history.value_ev_stack == {"<10": [[1, -4.12], [10, -2.0]], "30+": [[10, 0.02]]}
+    assert history.value_spread_size == [[1, 2.5], [10, 2.0]]
+    assert history.value_spread_stack == [[1, 8.1], [10, 7.5]]
+
+
+def test_parse_worker_history_reads_the_style_lines():
+    from pokerlab.rl.monitor import parse_worker_history
+
+    text = """iter    1  reward   +0.54 bb  policy -0.0078  value    0.039  entropy 0.427  kl 0.0242  clip 0.148
+stile (1100 mani): [vpip 440/1100 | pfr 220/1100 | three_bet 0/0]
+iter   10  reward   +0.10 bb  policy +0.0078  value    0.044  entropy 0.440  kl 0.0069  clip 0.063
+stile (9900 mani): [vpip 2970/9900 | pfr 1980/9900 | three_bet 50/500]
+stile (9900 mani): [vpip 2970/99"""
+    history = parse_worker_history("w01", text)
+    # Each reading is anchored to the iteration printed just before it; a statistic
+    # with no opportunity yet has no point, and a cut line is not read at all.
+    assert history.style_rate["vpip"] == [[1, 0.4], [10, 0.3]]
+    assert history.style_rate["pfr"] == [[1, 0.2], [10, 0.2]]
+    assert history.style_rate["three_bet"] == [[10, 0.1]]
+    assert history.style_latest["three_bet"] == [50, 500]
+    assert history.style_hands == 9900
+
+
+def test_a_log_without_style_lines_has_no_style():
+    from pokerlab.rl.monitor import parse_worker_history
+
+    history = parse_worker_history(
+        "w01", "iter    1  reward   +0.54 bb  policy -0.0078  value    0.039  entropy 0.427  kl 0.0242  clip 0.148"
+    )
+    assert history.style_rate == {} and history.style_latest == {} and history.style_hands == 0
+
+
+def test_a_log_without_value_lines_has_empty_value_series():
+    from pokerlab.rl.monitor import parse_worker_history
+
+    text = "iter    1  reward   +0.54 bb  policy -0.0078  value    0.039  entropy 0.427  kl 0.0242  clip 0.148"
+    history = parse_worker_history("w01", text)
+    assert history.value_sd_size == {} and history.value_sd_stack == {}
+    assert history.value_spread_size == [] and history.value_spread_stack == []
+
+
 def test_parse_worker_history_drops_a_half_written_final_line():
     """The log is read while the worker is still appending to it."""
     from pokerlab.rl.monitor import parse_worker_history
@@ -1362,8 +1304,10 @@ def test_every_cli_can_render_its_own_help(monkeypatch, capsys):
     `--help` dies with a TypeError -- which happened, and no test caught it
     because nothing ever asked for the help.
     """
+    import pokerlab.rl.benchmark_arena as benchmark_arena_module
     import pokerlab.rl.dashboard as dashboard_module
     import pokerlab.rl.killswitch as killswitch_module
+    import pokerlab.rl.population_arena as population_arena_module
     import pokerlab.rl.train as train_module
 
     # train.main and loop.main read sys.argv; killswitch.main and dashboard.main
@@ -1373,6 +1317,8 @@ def test_every_cli_can_render_its_own_help(monkeypatch, capsys):
         (loop_module, "poker-loop"),
         (killswitch_module, "poker-kill"),
         (dashboard_module, "poker-dashboard"),
+        (population_arena_module, "poker-elo"),
+        (benchmark_arena_module, "benchmark_arena"),
     ):
         monkeypatch.setattr("sys.argv", [script, "--help"])
         with pytest.raises(SystemExit) as exit_info:
@@ -1398,7 +1344,7 @@ def test_the_status_shows_the_rating_of_the_field_a_worker_drew():
 
 # ---- progress inside the two long, silent stages ---------------------------
 #
-# The population round and the per-series round take the better part of an hour
+# The population pass and the benchmark pass take the better part of an hour
 # each and print, between them, four lines. These tests pin the contract that
 # lets `--status` and the dashboard say how far in a worker is.
 
@@ -1481,7 +1427,7 @@ def test_the_finishing_line_reports_the_slowest_worker(tmp_path):
 
     line = format_finishing_line(rows)[0]
 
-    assert "2/2 worker nei giri finali" in line
+    assert "2/2 worker nelle passate finali" in line
     assert "avanzamento medio 35%" in line  # (50 + 20) / 2
     assert "~1h00" in line  # the slower of the two, not the mean
     assert line in "\n".join(format_worker_table(rows, 100))
@@ -1493,64 +1439,7 @@ def test_there_is_no_finishing_line_before_anyone_is_finishing(tmp_path):
     write_worker_log(tmp_path, 1, 0, 40)
     rows = worker_progress(tmp_path, 1)
     assert format_finishing_line(rows) == []
-    assert "nei giri finali" not in "\n".join(format_worker_table(rows, 100))
-
-
-# ---- flags a running supervisor still forwards --------------------------------
-
-
-def _retired_flags(module_name: str) -> set[str]:
-    """The flags `module_name` keeps parseable purely for old supervisors, read
-    out of the `for retired in (...)` loop in its source.
-
-    Read from the source, not by building the parser, so this stays in the
-    torch-free part of the suite -- `pokerlab.rl.train` imports torch.
-    """
-    import ast
-    import importlib.util
-
-    source = Path(importlib.util.find_spec(module_name).origin).read_text(encoding="utf-8")
-    for node in ast.walk(ast.parse(source)):
-        if isinstance(node, ast.For) and getattr(node.target, "id", "") == "retired":
-            return {
-                element.value
-                for element in node.iter.elts
-                if isinstance(element, ast.Constant)
-            }
-    return set()
-
-
-def test_a_flag_removed_from_train_stays_parseable_for_running_supervisors():
-    """Removing a flag from `poker-train` is not a retirement, it is an outage.
-
-    A `poker-loop` supervisor runs for weeks and forwards the flag list *its
-    own* code knew about when it started, so the moment `poker-train` stops
-    recognising one of them every worker of every running supervisor exits 2 at
-    that supervisor's next generation -- and the loop then spins through empty
-    generations in ~90 s each while `--status` still reports "training".
-
-    It happened: `--global-benchmark-refresh` was removed on 2026-09-28 at
-    20:47, five machines ran their last real generation between 23:08 and 00:29
-    and then burned ~250 empty generations each overnight. The flags below are
-    accepted and their values discarded, so the behaviour is the new behaviour
-    and only the parsing is backwards compatible. They may be deleted once no
-    supervisor predating 2026-09-29 is still running.
-    """
-    assert _retired_flags("pokerlab.rl.train") == {
-        "--pool-random-share",
-        "--pool-fresh-n",
-        "--global-benchmark-refresh",
-        # The live per-worker benchmark, removed at the user's request. A
-        # supervisor started before that change still forwards all three on
-        # every worker it launches, so `poker-train` has to keep parsing them.
-        "--benchmark-every",
-        "--benchmark-hands",
-        "--benchmark-seed",
-        # The share of opponent seats that went to this run's own frozen
-        # snapshots. The snapshots are gone, so the value is discarded, but a
-        # supervisor started before that change still forwards the flag.
-        "--self-share",
-    }
+    assert "nelle passate finali" not in "\n".join(format_worker_table(rows, 100))
 
 
 # ---- settling the anchors after one is added ---------------------------------
@@ -1559,11 +1448,11 @@ def test_a_flag_removed_from_train_stays_parseable_for_running_supervisors():
 def arena_args(tmp_path):
     return SimpleNamespace(
         machine="host-a", workers=6, global_root=tmp_path / "checkpoints",
-        log_dir=tmp_path / "logs",
+        log_dir=tmp_path / "logs", config=None,
     )
 
 
-def run_arena(tmp_path, monkeypatch, global_dir, *, exit_code=0):
+def run_arena(tmp_path, monkeypatch, global_dir, *, exit_code=0, config=None):
     """Drive `run_requested_benchmark_arena` with the arena itself stubbed."""
     commands = []
 
@@ -1572,7 +1461,9 @@ def run_arena(tmp_path, monkeypatch, global_dir, *, exit_code=0):
         return exit_code
 
     monkeypatch.setattr(loop_module.subprocess, "call", fake_call)
-    ran = loop_module.run_requested_benchmark_arena(arena_args(tmp_path), global_dir, 7)
+    args = arena_args(tmp_path)
+    args.config = config
+    ran = loop_module.run_requested_benchmark_arena(args, global_dir, 7)
     return ran, (commands[0] if commands else None)
 
 
@@ -1581,7 +1472,11 @@ def test_no_arena_runs_when_nothing_was_added(tmp_path, monkeypatch):
     assert ran is False and command is None
 
 
-def test_a_request_runs_the_arena_with_tolerance_1_and_at_most_200_rounds(tmp_path, monkeypatch):
+def test_a_request_runs_the_arena_and_leaves_its_parameters_to_the_config_file(
+    tmp_path, monkeypatch
+):
+    """Convergence (in sessions) and session length are `config.toml`'s to decide: a flag
+    here would beat the file, which is exactly what makes a file decoration."""
     global_dir = tmp_path / "global"
     request_benchmark_arena(global_dir, added=["m1"], machine="host-b")
 
@@ -1592,11 +1487,21 @@ def test_a_request_runs_the_arena_with_tolerance_1_and_at_most_200_rounds(tmp_pa
     def value(flag):
         return command[command.index(flag) + 1]
 
-    assert value("--tolerance") == "1.0"
-    assert value("--max-rounds") == "500"
     assert value("--workers") == "6"  # the supervisor's own worker count
-    assert "--k" not in command, "the arena always uses the staircase"
+    for flag in ("--arena-tolerance", "--arena-window", "--arena-min-sessions",
+                 "--arena-max-sessions", "--session-hands", "--k"):
+        assert flag not in command, flag
+    assert "--config" not in command, "no file named: the arena finds the default one"
     assert not list(global_dir.glob(f"{ARENA_REQUEST_FILENAME}*"))
+
+
+def test_the_arena_reads_the_same_file_as_the_supervisor(tmp_path, monkeypatch):
+    global_dir = tmp_path / "global"
+    request_benchmark_arena(global_dir, added=["m1"], machine="host-b")
+
+    _, command = run_arena(tmp_path, monkeypatch, global_dir, config="/etc/other.toml")
+
+    assert command[command.index("--config") + 1] == "/etc/other.toml"
 
 
 def test_two_supervisors_cannot_both_claim_one_request(tmp_path, monkeypatch):
@@ -1617,26 +1522,42 @@ def test_a_failed_arena_is_not_retried_but_leaves_its_claim_behind(tmp_path, mon
     assert again is False
 
 
-def test_the_two_worker_defaults_agree():
-    """`run.sh` and `poker-loop` must pick the same number of workers.
+def test_run_sh_leaves_the_worker_count_to_the_loop():
+    """`run.sh` no longer decides how many workers: it passes `--workers 0`
+    (or `POKER_WORKERS`), and the fleet-wide ceiling comes from `config.toml`.
+    A ceiling declared in the script again would be a second source of truth."""
+    script = (Path(__file__).resolve().parents[2] / "run.sh").read_text(encoding="utf-8")
+    assert "DEFAULT_WORKER_CEILING" not in script
+    assert 'WORKERS="${POKER_WORKERS:-0}"' in script
 
-    They are decided in two files -- `DEFAULT_WORKER_CEILING` in the shell
-    script, `DEFAULT_WORKERS` in this module -- so a loop started by hand
-    behaves like `./run.sh start` on the same box only as long as they agree.
-    Read out of the script's text rather than compared to a literal, which is
-    the same reason `--global-games-per-model` is pinned by reading the argparse
-    source: a literal here would only catch a drift while the two still matched.
 
-    Note what this does *not* say: `run.sh` lowers its own choice by the
-    machine's cores and free memory, so the number it ends up using is the
-    ceiling or less. This pins the ceiling.
-    """
-    import re
+def test_a_small_machine_is_held_by_cores_and_memory_not_the_ceiling(monkeypatch):
+    auto = loop_module.auto_workers
+    assert auto(25, cores=32, free_mb=100_000) == 25  # big box: the ceiling
+    assert auto(25, cores=8, free_mb=100_000) == 6  # cores - 2
+    assert auto(25, cores=32, free_mb=3000 + 700 * 4) == 4  # memory
+    assert auto(25, cores=1, free_mb=100_000) == 1  # never below one
+    assert auto(25, cores=32, free_mb=500) == 1
+    # `free_mb=None` means "read it", so an unreadable memory is simulated at the source.
+    monkeypatch.setattr(loop_module, "available_memory_mb", lambda: None)
+    assert auto(25, cores=32) == 25  # memory unreadable: only cores and ceiling count
 
-    script = Path(__file__).resolve().parents[2] / "run.sh"
-    found = re.search(r"^DEFAULT_WORKER_CEILING=(\d+)$", script.read_text(), re.MULTILINE)
-    assert found is not None, "run.sh no longer declares DEFAULT_WORKER_CEILING"
-    assert int(found.group(1)) == loop_module.DEFAULT_WORKERS
+
+def test_workers_zero_resolves_through_the_ceiling(monkeypatch):
+    monkeypatch.setattr(loop_module, "available_memory_mb", lambda: 100_000)
+    monkeypatch.setattr(loop_module.os, "cpu_count", lambda: 32)
+    args, _ = loop_module.load_args(["--workers", "0", "--config", ""])
+    assert loop_module.resolve_workers(args).workers == 25
+    args.worker_ceiling = 10
+    assert loop_module.resolve_workers(args).workers == 10
+    args.workers = 7  # an explicit count is left alone
+    assert loop_module.resolve_workers(args).workers == 7
+
+
+def test_the_shipped_config_sets_the_worker_ceiling_for_the_whole_fleet():
+    from pokerlab.config import read_config
+
+    assert read_config(REPO_CONFIG)["worker_ceiling"] == loop_module.DEFAULT_WORKERS
 
 
 # ---- the Elo fill-in handshake ---------------------------------------------
@@ -1671,8 +1592,8 @@ def drain(worker_dir):
 
 def test_the_supervisor_releases_workers_that_are_only_filling_time(tmp_path):
     """The deadlock this exists to break: a filling worker waits for the
-    supervisor to say the generation is over, and the supervisor used to wait
-    for that worker to exit."""
+    supervisor to say the generation is over, and the supervisor would otherwise
+    wait for that worker to exit."""
     processes = fill_processes(tmp_path, 3, exits_after=3)
     for _worker, worker_dir, _process in processes:
         drain(worker_dir)
@@ -1739,8 +1660,7 @@ def test_the_supervisor_forwards_the_stop_file_to_each_worker(tmp_path, monkeypa
 
     assert "--elo-fill-in" in command
     assert command[command.index("--fill-stop-file") + 1] == str(stop)
-    assert command[command.index("--fill-min-sessions") + 1] == "50"
-    assert command[command.index("--fill-games-per-model") + 1] == "1"
+    assert command[command.index("--fill-sessions") + 1] == "10"
 
 
 def test_a_worker_is_told_nothing_about_filling_when_it_is_off(tmp_path, monkeypatch):
@@ -1749,7 +1669,7 @@ def test_a_worker_is_told_nothing_about_filling_when_it_is_off(tmp_path, monkeyp
 
 
 def test_the_cap_is_only_ever_expressed_in_minutes():
-    """At the user's decision: a maximum number of rounds would cap the work,
+    """At the user's decision: a maximum number of passes would cap the work,
     and what has to be bounded is how long a worker holds its core."""
     assert _argparse_default("pokerlab.rl.loop", "--fill-deadline-minutes") == (
         "DEFAULT_FILL_DEADLINE_MINUTES"
@@ -1761,13 +1681,13 @@ def test_the_cap_is_only_ever_expressed_in_minutes():
         importlib.util.find_spec("pokerlab.rl.train").origin
     ).read_text(encoding="utf-8")
     assert "DEFAULT_FILL_DEADLINE_MINUTES = 150" in source
-    assert "max-rounds" not in source
+    assert "max-passes" not in source
 
 
 def test_the_two_cli_defaults_for_the_phase_agree():
     """The supervisor forwards these, so a disagreement would be invisible: the
     worker would silently run the loop's number and the help would say another."""
-    for flag in ("--fill-min-sessions", "--fill-deadline-minutes", "--fill-games-per-model"):
+    for flag in ("--fill-deadline-minutes", "--fill-sessions"):
         assert _argparse_default("pokerlab.rl.loop", flag) == _argparse_default(
             "pokerlab.rl.train", flag
         )
@@ -1788,7 +1708,7 @@ def test_a_filling_worker_is_not_what_the_generation_is_waiting_for():
         "iter    1  reward +1.0 bb  entropy 0.9\n"
         + marker(ELO_FILL)
         + "\n"
-        + progress_marker(ELO_FILL, 20, 50, detail="giro 2, 20 sessioni giocate")
+        + progress_marker(ELO_FILL, 20, 50, detail="passata 2, 20 sessioni giocate")
         + "\n",
         age=5.0,
     )
@@ -1803,7 +1723,7 @@ def test_a_filling_worker_is_not_what_the_generation_is_waiting_for():
     )
 
     line = format_finishing_line([filling, working])[0]
-    assert "1/2 worker nei giri finali" in line
+    assert "1/2 worker nelle passate finali" in line
     assert "~30m" in line
     assert "1 in riempimento elo" in line
 
@@ -1846,12 +1766,12 @@ def test_a_worker_reports_what_it_was_configured_with(tmp_path):
 
 
 def test_every_axis_of_the_sweep_is_one_the_worker_reports():
-    """The guard that matters: add an axis to `HP_LADDERS` and this fails until
+    """The guard that matters: add an axis to `HP_AXES` and this fails until
     the worker prints it, because a run whose configuration cannot be recovered
     from its own log is a run whose outcome cannot be attributed to anything."""
     from pokerlab.rl.train import REPORTED_AXES
 
-    assert set(HP_LADDERS) <= set(REPORTED_AXES)
+    assert set(HP_AXES) <= set(REPORTED_AXES)
     assert "hp_arm" in REPORTED_AXES
 
 
@@ -1912,84 +1832,9 @@ def test_the_fallback_arm_is_named_apart_in_the_summary():
     assert "genitore senza metadati" in format_sweep_line(rows)[0]
 
 
-def test_the_header_and_the_worker_cannot_report_different_rates(tmp_path, monkeypatch):
-    """Caught on a live run: with an empty store the supervisor printed
-    `lr 0.00019-0.00047` while every worker logged `lr=0.001`. The worker was
-    right -- its metadata records the rate it was actually passed -- so the
-    substitution has to happen in one place that both read."""
-    drawn = Hyperparameters(
-        lr=1.9e-4, hands=320, opponent_probability=0.5,
-        ppo_epochs=4, clip_epsilon=0.2, pool_top_share=0.5, pool_top_n=100,
-        arm=HP_ARM_SAMPLED,
-    )
-    without_parent = loop_module.effective_hyperparameters(
-        drawn, inheriting=False, fresh_lr=1e-3
-    )
-    with_parent = loop_module.effective_hyperparameters(
-        drawn, inheriting=True, fresh_lr=1e-3
-    )
-
-    assert without_parent.lr == 1e-3  # the draw does not apply to a cold start
-    assert with_parent == drawn
-    # Only the rate is substituted: every other axis is as meaningful on a
-    # random network as on an inherited one.
-    assert without_parent.hands == 320 and without_parent.ppo_epochs == 4
-
-    captured = {}
-
-    class FakePopen:
-        def __init__(self, command, **_kwargs):
-            captured["command"] = command
-
-    monkeypatch.setattr(loop_module.subprocess, "Popen", FakePopen)
-    launch_worker(
-        launch_args(tmp_path), 0, 1, tmp_path / "work" / "gen0001-w00",
-        tmp_path / "logs" / "w.log", None, drawn,
-    )
-
-    assert captured["command"][captured["command"].index("--lr") + 1] == str(1e-3)
-
-
-def test_resolving_twice_changes_nothing():
-    """The supervisor resolves before launching and `launch_worker` resolves
-    again; the two must not compound."""
-    drawn = Hyperparameters(
-        lr=1.9e-4, hands=320, opponent_probability=0.5,
-        ppo_epochs=4, clip_epsilon=0.2, pool_top_share=0.5, pool_top_n=100,
-        arm=HP_ARM_SAMPLED,
-    )
-    once = loop_module.effective_hyperparameters(drawn, inheriting=False, fresh_lr=1e-3)
-    twice = loop_module.effective_hyperparameters(once, inheriting=False, fresh_lr=1e-3)
-
-    assert once == twice
-
-
-def test_a_worker_from_an_unrestarted_supervisor_says_so(tmp_path):
-    """A supervisor is a process that lives for weeks and only picks up new
-    behaviour when restarted. Its workers run fine -- no flag was removed -- but
-    they get no arm, and naming that is how the fleet says which hosts still
-    need restarting."""
-    # Exactly what `poker-train` prints when launched without --hp-arm, which is
-    # what a supervisor loaded before the sweep existed does.
-    old_style = (
-        "iter    1  reward +1.0 bb  entropy 0.9\n"
-        "iperparametri: hp_arm= lr=0.0003 hands=512 ppo_epochs=4 clip_epsilon=0.2\n"
-    )
-    row = parse_worker_log("w00", old_style, age=1.0)
-
-    # The empty value is dropped, so the arm is simply absent...
-    assert "hp_arm" not in row.hyperparameters
-    # ... but the rest was still recorded and is still worth showing.
-    assert row.hyperparameters["lr"] == "0.0003"
-    assert "supervisor da riavviare" in format_sweep_line([row])[0]
-
-
 def test_run_sh_does_not_override_the_axes_the_sweep_decides():
-    """The one that cost a day of fleet time: `loop.py`'s `--inherit-fraction`
-    default moved to 1.0 to end from-scratch runs, but `run.sh` passed 0.5
-    explicitly and an explicit flag wins. Measured on zebele-slaves-2 generation
-    425, hours later: 12 of 25 workers inheriting and 13 still starting from a
-    random network at `--fresh-lr`, exactly the 0.5 that line asked for.
+    """An explicit flag in `run.sh` beats a default in `loop.py`: a pinned
+    `--hands 512` would silently override the value the sweep draws per worker.
 
     A default is only a default for the paths that do not override it, so the
     launcher has to leave every swept axis alone.
@@ -2000,15 +1845,13 @@ def test_run_sh_does_not_override_the_axes_the_sweep_decides():
     # the command explaining why these flags are absent.
     launch = script.index('setsid nohup "$VENV/bin/poker-loop"')
     start = script[launch:script.index("supervisor.log", launch)]
-    for axis in ("--inherit-fraction", "--hands", "--self-share",
+    for axis in ("--hands",
                  "--lr", "--opponent-probability", "--ppo-epochs", "--clip-epsilon"):
         assert axis not in start, f"run.sh pins {axis}, which the sweep decides per worker"
     # Same class of bug, different flags: the size and cadence of a validation
-    # round decide how many rated sessions are in the count the whole rating is
-    # built on, and both defaults moved (`--eval-every` 250 -> 100). This line
-    # used to carry them explicitly, which would have kept the fleet on four
-    # rounds a run while `loop.py` said ten.
-    for moved in ("--eval-every", "--eval-sessions", "--eval-hands"):
+    # pass decide how many rated sessions are in the count the whole rating is
+    # built on, so a pinned value would silently override `loop.py`'s default.
+    for moved in ("--eval-every", "--eval-sessions"):
         assert moved not in start, f"run.sh pins {moved}, whose default moved in loop.py"
 
 
@@ -2108,3 +1951,216 @@ def test_the_gae_lambda_moves_through_its_complement():
     assert got == {0.96, 0.95, 0.94}
     top = {perturb_hyperparameters(a_parent(gae_lambda=1.0), random.Random(s)).gae_lambda for s in range(60)}
     assert max(top) < 1.0
+
+
+# ---- config.toml -------------------------------------------------------------
+
+REPO_CONFIG = Path(__file__).resolve().parents[2] / "config.toml"
+
+
+def test_the_shipped_config_is_valid_for_every_cli():
+    """A key that any CLI rejects would stop it at argparse the next time it starts:
+    every supervisor and worker, but also `poker-elo`, `benchmark_arena` and the
+    dashboard, all of which read the same file."""
+    pytest.importorskip("torch")
+    from importlib import import_module
+
+    from pokerlab.config import parse_with_config
+    from pokerlab.rl.siblings import TORCH_FREE, WITH_TORCH, sibling_parsers
+
+    _args, report = loop_module.load_args(["--config", str(REPO_CONFIG)])
+    assert report.applied  # the file says something
+    for name in TORCH_FREE + WITH_TORCH:
+        module = import_module(name)
+        _args, report = parse_with_config(
+            module.build_parser(),
+            ["--config", str(REPO_CONFIG)],
+            siblings=lambda name=name: sibling_parsers(name, with_torch=name in WITH_TORCH),
+            lenient=name in TORCH_FREE,
+        )
+        assert report.path == REPO_CONFIG, name
+
+
+def test_a_key_shared_with_an_arena_or_the_dashboard_means_the_same_everywhere():
+    """One flat file, five programs: a key is checked against whichever parser
+    owns it, so the same name with another type or default in another program
+    would make one of them read a value meant for something else. This is why the
+    arenas call a session's length `--session-hands`, as `poker-train`
+    does, and not `--hands`, which there means hands per training iteration."""
+    pytest.importorskip("torch")
+    from importlib import import_module
+
+    from pokerlab.config import _actions, _is_local
+    from pokerlab.rl.siblings import TORCH_FREE, WITH_TORCH
+
+    owners: dict[str, list[tuple[str, object, object]]] = {}
+    for name in TORCH_FREE + WITH_TORCH:
+        for dest, action in _actions(import_module(name).build_parser()).items():
+            if not _is_local(dest, action):
+                owners.setdefault(dest, []).append((name, action.type, action.default))
+    for dest, entries in owners.items():
+        if not any(name in TORCH_FREE for name, _, _ in entries):
+            continue
+        assert len({(kind, repr(default)) for _, kind, default in entries}) == 1, (dest, entries)
+
+
+def test_run_sh_pins_nothing_the_config_file_sets():
+    """An explicit flag beats the file, so a flag in `run.sh` for a key that
+    `config.toml` sets would make the file a decoration."""
+    from pokerlab.config import read_config
+
+    script = (Path(__file__).resolve().parents[2] / "run.sh").read_text(encoding="utf-8")
+    launch = script.index('setsid nohup "$VENV/bin/poker-loop"')
+    start = script[launch:script.index("supervisor.log", launch)]
+    for key in read_config(REPO_CONFIG):
+        flag = "--" + key.replace("_", "-")
+        assert flag + " " not in start.replace("\\\n", " "), f"run.sh pins {flag}"
+
+
+def test_a_worker_is_told_not_to_read_the_config_again(tmp_path, monkeypatch):
+    command, _ = capture_launch(tmp_path, monkeypatch)
+    assert command[command.index("--config") + 1] == ""
+
+
+def test_the_file_sets_where_a_worker_with_no_parent_starts(tmp_path):
+    pytest.importorskip("torch")
+    path = tmp_path / "c.toml"
+    path.write_text("lr = 0.5\nhands = 9\nstack_max_bb = 80.0\n", encoding="utf-8")
+    args, _ = loop_module.load_args(["--config", str(path)])
+    assert args.stack_max_bb == 80.0
+    start = starting_hyperparameters(args)
+    assert start.lr == 0.5 and start.hands == 9
+
+
+def test_the_file_sets_the_shape_of_the_network(tmp_path):
+    pytest.importorskip("torch")
+    from pokerlab.rl.train import network_shape
+
+    path = tmp_path / "c.toml"
+    path.write_text(
+        "[network]\nhidden = 128\nnum_layers = 2\nhead_hidden = 64\nhead_layers = 3\n",
+        encoding="utf-8",
+    )
+    args, _ = loop_module.load_args(["--config", str(path)])
+    assert network_shape(args) == {
+        "hidden": 128, "num_layers": 2, "head_hidden": 64, "head_layers": 3,
+    }
+
+
+@pytest.mark.parametrize("key", ["hidden", "num_layers", "head_hidden"])
+def test_a_network_that_cannot_be_built_is_a_config_error(tmp_path, key):
+    pytest.importorskip("torch")
+    path = tmp_path / "c.toml"
+    path.write_text(f"{key} = 0\n", encoding="utf-8")
+    with pytest.raises(loop_module.ConfigError, match=key):
+        loop_module.load_args(["--config", str(path)])
+
+
+def test_zero_head_layers_is_a_network_and_a_negative_number_is_not(tmp_path):
+    pytest.importorskip("torch")
+    path = tmp_path / "c.toml"
+    path.write_text("head_layers = 0\n", encoding="utf-8")
+    assert loop_module.load_args(["--config", str(path)])[0].head_layers == 0
+    path.write_text("head_layers = -1\n", encoding="utf-8")
+    with pytest.raises(loop_module.ConfigError, match="head_layers"):
+        loop_module.load_args(["--config", str(path)])
+
+
+def test_the_file_sets_how_far_a_worker_moves(tmp_path):
+    pytest.importorskip("torch")
+    path = tmp_path / "c.toml"
+    path.write_text("hp_multipliers = [1.0]\n", encoding="utf-8")
+    args, _ = loop_module.load_args(["--config", str(path)])
+    assert args.hp_multipliers == [1.0]
+
+    start = starting_hyperparameters(args)
+    plan = hyperparameter_plan(
+        4, [a_parent(), None, a_parent(), None], start,
+        rng=random.Random(0), multipliers=args.hp_multipliers,
+    )
+    # One factor, 1.0: nobody moves, whichever arm they are in.
+    assert all(
+        {axis: getattr(hp, axis) for axis in HP_AXES}
+        == {axis: getattr(start, axis) for axis in HP_AXES}
+        for hp in plan
+    )
+
+
+def test_a_multiplier_that_would_break_an_axis_is_a_config_error(tmp_path):
+    pytest.importorskip("torch")
+    from pokerlab.config import ConfigError
+
+    for bad in ("[0.8, 0, 1.2]", "[-1.0]"):
+        path = tmp_path / "c.toml"
+        path.write_text(f"hp_multipliers = {bad}\n", encoding="utf-8")
+        with pytest.raises(ConfigError, match="hp_multipliers"):
+            loop_module.load_args(["--config", str(path)])
+
+
+def test_a_file_that_cannot_be_read_keeps_the_previous_values(tmp_path, capsys):
+    pytest.importorskip("torch")
+    path = tmp_path / "c.toml"
+    path.write_text("stack_max_bb = 50.0\n", encoding="utf-8")
+    argv = ["--config", str(path)]
+    args, _ = loop_module.load_args(argv)
+    assert args.stack_max_bb == 50.0
+
+    path.write_text("stack_max_bb = = 60\n", encoding="utf-8")  # saved halfway
+    kept = loop_module.refresh_args(args, lambda: loop_module.load_args(argv))
+    assert kept is args and "valori precedenti" in capsys.readouterr().out
+
+    path.write_text("stack_max_bb = 60.0\n", encoding="utf-8")
+    fresh = loop_module.refresh_args(args, lambda: loop_module.load_args(argv))
+    assert fresh.stack_max_bb == 60.0
+    assert "stack_max_bb: 50.0 -> 60.0" in capsys.readouterr().out
+
+
+def test_a_worker_is_handed_the_fleets_draw_tiers(tmp_path, monkeypatch):
+    command, _ = capture_launch(tmp_path, monkeypatch)
+    assert command[command.index("--draw-tiers") + 1] == "10, 100, 1000, all"
+
+
+def test_the_file_sets_the_draw_tiers_and_a_bad_one_is_an_error(tmp_path):
+    from pokerlab.config import ConfigError
+
+    path = tmp_path / "c.toml"
+    path.write_text('draw_tiers = "100, 1000, all"\n', encoding="utf-8")
+    args, _ = loop_module.load_args(["--config", str(path)])
+    assert args.draw_tiers == "100, 1000, all"
+    path.write_text('draw_tiers = "100, soon"\n', encoding="utf-8")
+    with pytest.raises(ConfigError):
+        loop_module.load_args(["--config", str(path)])
+
+
+def test_a_worker_is_handed_the_fleets_k_schedule(tmp_path, monkeypatch):
+    command, _ = capture_launch(tmp_path, monkeypatch)
+    assert command[command.index("--k-schedule") + 1] == "0:16, 100:2"
+
+
+def test_the_file_sets_the_parent_bands_and_the_k_schedule(tmp_path):
+    path = tmp_path / "c.toml"
+    path.write_text(
+        'parent_tiers = "10, 10, all"\nk_schedule = "0:20, 50:5"\n', encoding="utf-8"
+    )
+    args, _ = loop_module.load_args(["--config", str(path)])
+    assert args.parent_tiers == "10, 10, all"
+    assert args.k_schedule == "0:20, 50:5"
+    # And the same text is what poker-train reads for the same key.
+    from pokerlab.rl.train import build_parser as build_train_parser
+
+    assert "k_schedule" in {a.dest for a in build_train_parser()._actions}
+
+
+@pytest.mark.parametrize(
+    "line",
+    ['parent_tiers = "10, soon"', 'parent_tiers = "0"', 'k_schedule = "5:16"',
+     'k_schedule = "0:16, 0:11"', 'k_schedule = "0:-1"', "k_schedule = 3"],
+)
+def test_a_bad_parent_band_or_k_schedule_in_the_file_is_an_error(tmp_path, line):
+    path = tmp_path / "c.toml"
+    path.write_text(line + "\n", encoding="utf-8")
+    from pokerlab.config import ConfigError
+
+    with pytest.raises(ConfigError):
+        loop_module.load_args(["--config", str(path)])
+

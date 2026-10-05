@@ -1,9 +1,7 @@
 """One Elo scale for every model on the shared volume.
 
 Every model on the volume lives in one store, `checkpoints/models/`, and has one
-rating on one scale. (Ratings used to be private to each machine, which made them
-incomparable: Shark, identical code on every host, rated 1387 on one and 1487 on
-another.) This module keeps that scale honest by letting models drawn at random
+rating on one scale. This module keeps that scale honest by letting models drawn at random
 from the whole population play each other, so a model's rating is earned against
 everyone rather than against the few it happened to meet locally.
 
@@ -34,7 +32,6 @@ from pokerlab.rl.global_store import (
     acquire_locks,
     list_member_labels,
     load_global_registry,
-    migrate_legacy_registry,
     read_member,
     release_locks,
     remove_member,
@@ -53,6 +50,8 @@ from pokerlab.rl.pool_registry import (
     PoolRegistry,
     interpolated_percentile,
 )
+from pokerlab.rl.table_mix import DEFAULT_SESSION_HANDS, table_arguments
+from pokerlab.rl.training_pool import parent_tiers_text
 
 DEFAULT_GLOBAL_DIR = Path("checkpoints/global")
 # Pruning is disabled by lifting its trigger beyond any population this store
@@ -70,47 +69,24 @@ BENCHMARK_DIRNAME = "benchmark"
 # The shared store of every trained model (see `rl/global_store.py`).
 MODELS_DIRNAME = "models"
 
-# ~50 population + ~5 benchmark per round is the composition asked for --
-# see `run_population_round`. Both draws are plain uniform random: unlike
+# ~50 population + ~5 benchmark per pass is the composition asked for --
+# see `run_population_sessions`. Both draws are plain uniform random: unlike
 # `sample_population`'s least-played-first bias (still available, just not
-# used here), a round's whole point now includes deciding who gets deleted,
+# used here), a pass's whole point now includes deciding who gets deleted,
 # so a uniform draw is the more honest "any tracked model could come up"
 # sampling this decision deserves.
 DEFAULT_POPULATION_SAMPLE = 50
 DEFAULT_BENCHMARK_SAMPLE = 5
 # How a model becomes a frozen anchor (see `add_benchmark_candidates`): at the
-# end of a run, after the population round, every model with more rated games
+# end of a run, after the population pass, every model with more rated games
 # than the `BENCHMARK_GAMES_PERCENTILE` of the population and a rating more than
 # `BENCHMARK_MARGIN` points above the best anchor joins the frozen set. Pruning
-# no longer promotes anything: every eliminated model is deleted.
+# promotes nothing: every eliminated model is deleted.
 BENCHMARK_GAMES_PERCENTILE = 90.0
 BENCHMARK_MARGIN = 10.0
-# A thousand hands per rated session, up from a hundred. Elo reads only the
-# *sign* of each pair's chip delta, so the length of a session is what decides
-# how often that sign is right -- and at 100 hands 6-max it very nearly is not.
-# The spread of a 100-hand chip delta is of the order of +/-290 bb/100, while the
-# real gap between two adjacent models is 10-40 bb/100, so the stronger of the
-# two finishes ahead about 54% of the time. That does not merely add noise: Elo
-# settles at the rating that reproduces the *observed* win frequency, so a 54%
-# edge equilibrates ~28 points above instead of the ~150 it deserves, and the
-# whole scale comes out compressed. Ten times the hands cuts the spread by ~3.2x
-# and decompresses the gaps by the same factor, which is the only lever that
-# does -- lowering K shrinks the jitter around the equilibrium but cannot move
-# the equilibrium itself.
-#
-# `games` still counts sessions, so the K schedule is untouched: each rated
-# result simply carries ten times the evidence at the same K.
-#
-# The cost is linear and it is real. A round is ~485 sessions with the usual 55
-# models drawn, so 485,000 hands instead of 48,500 -- roughly 90 minutes of a
-# worker's time per generation instead of 9. `--global-games-per-model` is the
-# dial to turn down if that is too much; fewer, longer sessions is the better
-# trade at a fixed hand budget, which is the same argument `DEFAULT_SERIES_HANDS`
-# records.
-DEFAULT_HANDS_PER_GAME = 1000
 
-# Where a round's *played* results wait to be folded into the registry --
-# see play_population_round_sharded and apply_pending_population_rounds.
+# Where a pass's *played* results wait to be folded into the registry --
+# see play_population_sessions_sharded and apply_pending_population_sessions.
 PENDING_DIRNAME = "pending"
 DEFAULT_GLOBAL_WORKERS = 8
 # How long one session waits for the handful of member locks it needs before
@@ -122,47 +98,21 @@ DEFAULT_LOCK_WAIT_SECONDS = 20.0
 STALE_CLAIM_SECONDS = 3600
 
 
-# Rated sessions each drawn model owes per round. Every caller takes this
-# default, so the number lives in exactly one place: it used to be 500 here
-# while both CLIs and `run_population_round` carried a hard-coded 12, which
-# meant the constant described nothing that ever ran.
+# Rated sessions in a pass. Every caller takes this default, so the number lives
+# in exactly one place. A pass is that many sessions of `DEFAULT_SESSION_HANDS`
+# hands, each at a table size drawn from `TableMix` and seating that many models
+# drawn at random from the sampled set: nobody is owed a number of games, so a model
+# plays as often as the draw lands on it (~8 sessions each at ~55 drawn and the
+# default mixture's 4.35 seats on average, with the spread chance gives).
 #
-# **12, at the user's decision, to cut the end-of-run Elo round by 75%.**
-# Simulating the `due` queue above exactly, 55 drawn models give 481 sessions at
-# 50 and 128 at 12, so 481,000 hands become 128,000: **~94 -> ~25 minutes on an
-# idle core, ~160 -> ~43 minutes on a loaded fleet machine** (measured 85 and
-# ~50 hands/s respectively). That is the single biggest block of wall time a
-# worker spends after it stops training.
-#
-# **What it costs, stated plainly**: a round is the only thing that turns played
-# hands into ratings, so each run now contributes ~3.8x less rated evidence to
-# the global ranking -- and that ranking was already power-limited near the top,
-# where a 1000-hand session picks the stronger of two adjacent models only ~58%
-# of the time. A model also comes up in a round about 0.5% of the time out of
-# ~9,600, so its rating converges slowly to begin with.
-#
-# **What makes the trade defensible is where the lost evidence comes back from.**
-# The Elo fill-in phase (`train.run_elo_fill_in`) has workers that finish early
-# play extra rating rounds while they wait for the slowest worker of their
-# generation. Those rounds cost nothing -- the cores would be idle -- so this
-# change moves rating work *off* the critical path and onto time that was being
-# wasted, rather than simply deleting it. If the ratings visibly stop converging,
-# the dial to raise is `--fill-games-per-model` before this one.
-#
-# History, because the number has moved four times and one of the moves was a
-# panic. It was 500 here while both CLIs and `run_population_round` carried a
-# hard-coded 12, so the constant described nothing that ever ran; then 12, then
-# 50 for the 3.8x evidence; then briefly back to 12 when five of seven machines
-# went unresponsive hours after 50 went live, every one with at least one worker
-# in `elo_play` while the only still-running machine had none. **That revert was
-# not justified and this change is not a repeat of it.** The correlation is
-# confounded -- a machine early in its generation both has nobody in the round
-# yet *and* has had less time to hit any problem -- and the memory theory does
-# not survive measurement: the round's 55 loaded models cost 203 MB on top of a
-# worker's ~514 MB, so even every worker being in the round at once adds ~6 GB to
-# a 30-worker machine. The cause of that incident was never established, and no
-# machine could be inspected (no SSH access from the NFS server).
-DEFAULT_GAMES_PER_MODEL = 12
+# A pass is the only thing that turns played hands into ratings, so this is a
+# trade between rating evidence per run and the wall time a worker spends after
+# it stops training (the pass dominates it). The Elo fill-in phase
+# (`train.run_elo_fill_in`) has workers that finish early play extra rating
+# passes while they wait for the slowest worker of their generation; those cost
+# nothing, since the cores would be idle. If the ratings visibly stop converging,
+# the dial to raise is `--fill-sessions` before this one.
+DEFAULT_GLOBAL_SESSIONS = 100
 
 @dataclass(frozen=True)
 class Candidate:
@@ -176,9 +126,7 @@ def discover_population(root: str | Path = Path("checkpoints")) -> list[Candidat
     """Every model in the shared store, `checkpoints/models/*.pt`.
 
     A model's label is its file name without `.pt`, and there is exactly one
-    file per model: the store is write-once and machine-prefixed, so the copies
-    that per-machine pools, the exchange and retired archives used to multiply
-    -- and the deduplication they needed -- no longer exist.
+    file per model: the store is write-once and machine-prefixed.
     """
     directory = Path(root) / MODELS_DIRNAME
     return [
@@ -236,14 +184,12 @@ def prune_ghost_members(
 
     **`existing_labels` is a snapshot, and a snapshot goes stale.** The caller
     lists the disk once and then merges pending sessions, which on a busy fleet
-    takes tens of minutes -- a merge of 13,014 sessions was measured at 27 --
-    while five machines keep publishing new models and registering them. Every
-    one of those arrives in `list_member_labels` but not in the snapshot, and
-    was being deleted here as a ghost: a live model, freshly rated against the
-    frozen series, silently reset to the default rating with zero games. It
-    showed up as bursts of "ghosts removed" landing exactly on the longest
-    rounds, at a time when nothing was deleting checkpoints at all (pruning off,
-    population under the trigger), so every one of them was a false positive.
+    can take tens of minutes, while other machines keep publishing new models and
+    registering them. Every one of those arrives in `list_member_labels` but not
+    in the snapshot, and would be deleted here as a ghost: a live model, freshly
+    rated, silently reset to the default rating with zero games. With pruning off
+    and the population under the trigger, nothing deletes checkpoints at all, so
+    any ghost reported then is a false positive.
     Pass `root` and each candidate is re-checked on disk **after** its lock is
     taken, immediately before removal, which is the only moment the answer is
     authoritative; the snapshot then merely narrows the candidates.
@@ -274,9 +220,9 @@ def repair_member_refs(
 ) -> int:
     """Point every member's `ref` at where its checkpoint actually is now.
 
-    Rounds refresh the `ref` of the models they play and promotion rewrites it,
+    Passes refresh the `ref` of the models they play and promotion rewrites it,
     but a model that has not played since its file moved (a migration of the
-    store, say) keeps the old path until its next round. This sweeps them all at
+    store, say) keeps the old path until its next pass. This sweeps them all at
     once. Returns how many refs were corrected. A member with no checkpoint
     anywhere is left alone (`prune_ghost_members` handles it).
     """
@@ -285,7 +231,6 @@ def repair_member_refs(
         c.label: c.path
         for c in [*discover_population(root), *discover_benchmark_population(root)]
     }
-    migrate_legacy_registry(global_dir)
     fixed = 0
     for label in sorted(list_member_labels(global_dir)):
         target = path_by_label.get(label)
@@ -326,13 +271,13 @@ def sample_population(
     count: int,
     rng: random.Random,
 ) -> list[Candidate]:
-    """Pick who plays this round: the least-played first, then at random.
+    """Pick who plays this pass: the least-played first, then at random.
 
     Straight uniform sampling would leave a 23,000-model population with a
-    handful of games each after many rounds, and a rating from a handful of
+    handful of games each after many passes, and a rating from a handful of
     games is not a rating. Taking the least-played half deterministically and
     filling the rest at random gives even coverage without freezing the draw
-    into the same faces every round.
+    into the same faces every pass.
     """
     if count >= len(population):
         return list(population)
@@ -345,36 +290,88 @@ def sample_population(
     return chosen + remainder[: count - half]
 
 
-# The rating bands `tiered_draw` splits the ranking into, as `(first, last)`
-# ranks (0-based, `last` exclusive, `None` = to the end) with an equal quarter
-# of the seats each: the top 10, the rest of the top 100, the rest of the top
-# 1,000, and everybody else.
-DRAW_BANDS: tuple[tuple[int, int | None], ...] = ((0, 10), (10, 100), (100, 1000), (1000, None))
+# The tiers `tiered_draw` splits the ranking by, written like `--parent-tiers`:
+# the best N rated models, or `None` for the whole store. Every tier gets an equal
+# share of the seats, and a tier listed twice gets twice the share. The default is
+# the top 10, the rest of the top 100, the rest of the top 1,000 and everybody else.
+DRAW_TIERS: tuple[int | None, ...] = (10, 100, 1000, None)
+
+
+def draw_tiers_text(text: str) -> str:
+    """argparse `type=` for `--draw-tiers`: the `--parent-tiers` syntax, validated."""
+    return parent_tiers_text(text)
+
+
+def _tier_bands(
+    tiers: Sequence[int | None],
+) -> list[tuple[int, int | None, int]]:
+    """`(first, last, weight)` per disjoint band of the ranking, 0-based, `last`
+    exclusive and `None` to the end.
+
+    The tiers are nested cutoffs (the top 10, the top 100, ...), so each band runs
+    from the previous cutoff to its own; a cutoff listed `n` times is one band of
+    weight `n`, and `all` is always the last.
+    """
+    weights: dict[int | None, int] = {}
+    for tier in tiers:
+        weights[tier] = weights.get(tier, 0) + 1
+    cutoffs = sorted(c for c in weights if c is not None)
+    if None in weights:
+        cutoffs.append(None)
+    bands: list[tuple[int, int | None, int]] = []
+    first = 0
+    for cutoff in cutoffs:
+        bands.append((first, cutoff, weights[cutoff]))
+        if cutoff is not None:
+            first = cutoff
+    return bands
+
+
+def _split_seats(count: int, weights: Sequence[int], rng: random.Random) -> list[int]:
+    """`count` seats split in proportion to `weights`, to whole seats.
+
+    Each band gets the whole part of its share, and the leftover seats go to bands
+    by systematic sampling on the fractional parts, so a band's expected number of
+    seats is exactly its share even when the shares do not divide evenly.
+    """
+    total = sum(weights)
+    shares = [count * weight / total for weight in weights]
+    quotas = [int(share) for share in shares]
+    leftover = count - sum(quotas)
+    if leftover:
+        point = rng.random()
+        cumulative = 0.0
+        for index, share in enumerate(shares):
+            before = cumulative
+            cumulative += share - quotas[index]
+            quotas[index] += int(cumulative + point) - int(before + point)
+    return quotas
 
 
 def tiered_draw(
     ratings: Mapping[str, dict],
     *,
-    bands: tuple[tuple[int, int | None], ...] = DRAW_BANDS,
+    tiers: Sequence[int | None] = DRAW_TIERS,
 ) -> Callable[[list[Candidate], int, random.Random], list[Candidate]]:
-    """A draw that gives each rating band an equal share of the seats.
+    """A draw that gives each rating tier an equal share of the seats.
 
-    **Why bias at all.** A round seats ~50 of ~9,600 models, so a given model
-    comes up about 0.5% of the time and a rating can sit on the number its
-    training run published for many generations. What is read is the top:
-    `pick_parents` draws from the best 100, and the ordering there was measured
-    wrong (see "The ranking is wrong at the top"). With a quarter of the seats on
-    each of ranks 1-10, 11-100, 101-1,000 and the rest, the best ten are seated
-    in nearly every round, the next ninety about every other round, and the
-    long tail keeps a quarter of the seats rather than none.
+    **Why bias at all.** A pass seats ~50 models out of the whole store, so a
+    given model comes up rarely and a rating can sit on the number its training
+    run published for many generations. What is read is the top: `pick_parents`
+    draws from the best 100. With a quarter of the seats on each of ranks 1-10,
+    11-100, 101-1,000 and the rest, the best ten are seated in nearly every
+    pass, the next ninety about every other pass, and the long tail keeps a
+    quarter of the seats rather than none.
 
-    The bands are disjoint (a model belongs to one), seats are split by largest
-    remainder with the leftover seats given to random bands so the average share
-    is exact, and models inside a band are drawn uniformly without repetition.
-    A band too small for its seats (the top ten against 12 or 13) hands the
-    shortfall to the models not yet drawn, uniformly, so the round always comes
-    out at `count` while the disk holds that many models. A model with no rating
-    yet belongs to the last band: it is untested, not excluded.
+    The tiers are the `--draw-tiers` cutoffs. They are turned into disjoint bands
+    (a model belongs to one), seats are split between them by weight with the
+    leftover seats given at random so the average share is exact, and models
+    inside a band are drawn uniformly without repetition. A band too small for its
+    seats (the top ten against 12 or 13) hands the shortfall to the models not yet
+    drawn, uniformly, so the pass always comes out at `count` while the disk holds
+    that many models. A model with no rating yet is untested, not excluded: it
+    belongs to the open-ended band (`all`) and, without one, is reached only
+    through that spill.
 
     **Pruning and this draw do not go together.** Eligibility for deletion is a
     percentile of `games`, so seating some models far more often than others
@@ -382,6 +379,8 @@ def tiered_draw(
     `DEFAULT_PROTECT_PERCENTILE`). Pass `trigger_size=NO_PRUNE_TRIGGER` unless
     that is wanted.
     """
+    bands = _tier_bands(tiers)
+    weights = [weight for _, _, weight in bands]
 
     def draw(
         population: list[Candidate], count: int, rng: random.Random
@@ -394,17 +393,13 @@ def tiered_draw(
         )
         unrated = [c for c in population if c.label not in ratings]
         groups: list[list[Candidate]] = []
-        for index, (first, last) in enumerate(bands):
+        for first, last, _ in bands:
             group = rated[first:last]
-            if index == len(bands) - 1:
+            if last is None:
                 group = group + unrated
             groups.append(group)
 
-        base, extra = divmod(count, len(bands))
-        quotas = [base] * len(bands)
-        for index in rng.sample(range(len(bands)), extra):
-            quotas[index] += 1
-
+        quotas = _split_seats(count, weights, rng)
         chosen: list[Candidate] = []
         for group, quota in zip(groups, quotas):
             chosen.extend(rng.sample(group, min(quota, len(group))))
@@ -416,39 +411,36 @@ def tiered_draw(
     return draw
 
 
-def play_global_round(
+def play_global_sessions(
     candidates: list[Candidate],
-    game,
+    mix,
     *,
-    games_per_model: int = DEFAULT_GAMES_PER_MODEL,
-    hands_per_game: int = DEFAULT_HANDS_PER_GAME,
+    sessions: int = DEFAULT_GLOBAL_SESSIONS,
+    session_hands: int = DEFAULT_SESSION_HANDS,
     device: str = "cpu",
     seed: int = 0,
     on_skip=None,
     on_progress: Callable[[int, int, str], None] | None = None,
 ) -> list[dict[str, float]]:
-    """Play `games_per_model` sessions for each candidate, opponents at random.
+    """Play `sessions` sessions, each seating candidates drawn at random.
 
     Tables are drawn at random from the sampled candidates rather than by
     rating, so a model from one machine routinely faces models from the others
     -- which is the entire point: a rating only means something across machines
-    if the matches cross them.
+    if the matches cross them. Nobody is owed a number of games: how often a model
+    plays is whatever the draw gives it.
 
     Returns the raw per-session chip deltas; the caller folds them into the
     ratings. Same split as the local arena, and for the same reason: playing
     parallelises, rating does not.
 
     `on_progress(done, total, detail)` fires after every session, counting
-    **games owed**, not sessions: a session seats `num_players` models and
-    decrements each one's debt, so the owed total is known exactly up front
-    while the session count is not (it depends on how often the random seats
-    land on a model that owes nothing). An exact denominator is the whole point
-    -- a progress bar that can overshoot its own estimate is worse than none.
+    sessions: the total is exactly `sessions`, known up front, so the bar ends at
+    100% and never overshoots.
     """
-    from pokerlab.engine.table import Table
     from pokerlab.rl.policy import make_policy_fn
     from pokerlab.rl.ppo import build_model_from_checkpoint
-    from pokerlab.rl.rollout import SeatProxy, policy_opponent
+    from pokerlab.rl.rollout import TableBank, policy_opponent
 
     loaded = {}
     for candidate in candidates:
@@ -459,98 +451,78 @@ def play_global_round(
                 on_skip(candidate.path, str(exc))
             continue
         loaded[candidate.label] = policy_opponent(
-            candidate.label, make_policy_fn(model, device=device), game
+            candidate.label, make_policy_fn(model, device=device), mix
         )
     labels = sorted(loaded)
-    if len(labels) < game.num_players:
+    # The largest table that can be drawn decides how many models must be
+    # available: a pass that could only seat the small ones would not be the
+    # mixture the weights describe.
+    if len(labels) < mix.max_players:
         return []
 
     rng = random.Random(seed)
     bot_rng = random.Random(rng.random())
-    proxies = [SeatProxy(f"s{i}", f"S{i}") for i in range(game.num_players)]
-    table = Table(game, list(proxies), rng=rng)
+    size_rng = random.Random(rng.random())
+    bank = TableBank(mix, rng)
 
-    # Every model owes the same number of games; the queue is what guarantees
-    # it, while the other seats are filled at random around whoever is due.
-    due = {label: games_per_model for label in labels}
-    # The exact denominator for progress, fixed before the first session. Not to
-    # be confused with the `owed` list rebuilt inside the loop, which is who
-    # still has games to play.
-    owed_total = len(labels) * games_per_model
-    sessions: list[dict[str, float]] = []
+    played: list[dict[str, float]] = []
 
-    while any(count > 0 for count in due.values()):
-        owed = [label for label, count in due.items() if count > 0]
-        seat_labels = [max(owed, key=lambda label: (due[label], rng.random()))]
-        pool = [label for label in labels if label != seat_labels[0]]
-        seat_labels.extend(rng.sample(pool, game.num_players - 1))
+    for _ in range(sessions):
+        # Drawn per session and held for all of it (see `table_mix`).
+        num_players = mix.draw_size(size_rng)
+        proxies = bank.seats(num_players)
+        seat_labels = rng.sample(labels, num_players)
 
-        for seat, (proxy, label) in enumerate(zip(proxies, seat_labels)):
+        for proxy, label in zip(proxies, seat_labels):
             opponent = loaded[label]
             proxy.inner = opponent.factory(proxy.player_id, label, bot_rng)
             proxy.name = label
 
-        deltas = [0] * game.num_players
-        for _ in range(hands_per_game):
-            before = list(table.stacks)
-            table.play_hand()
-            for seat in range(game.num_players):
-                deltas[seat] += table.stacks[seat] - before[seat]
-            table.stacks = [game.starting_stack] * game.num_players
+        deltas = bank.play_session(num_players, session_hands)
 
         results: dict[str, float] = {}
         for label, delta in zip(seat_labels, deltas):
             results[label] = results.get(label, 0.0) + delta
-        sessions.append(results)
-        for label in seat_labels:
-            due[label] = max(0, due[label] - 1)
+        played.append(results)
         if on_progress is not None:
-            on_progress(
-                owed_total - sum(due.values()), owed_total, f"{len(sessions)} sessioni"
-            )
+            on_progress(len(played), sessions, f"{len(played)} sessioni")
 
-    return sessions
+    return played
 
 
 def _shard_main() -> None:
-    """Play one shard of a population round and write its sessions to JSON.
+    """Play one shard of a population pass and write its sessions to JSON.
 
-    The supervisor (`play_population_round_sharded`) runs several of these at
+    The supervisor (`play_population_sessions_sharded`) runs several of these at
     once, on one machine's cores: only *playing* parallelises, so each shard
-    just plays its slice of `--games-per-model` for the same candidate set and
+    just plays its slice of `--sessions` for the same candidate set and
     reports back: no registry, no lock, no rating math here at all.
     """
     import argparse
 
-    from pokerlab.engine.config import GameConfig
+    from pokerlab.rl.table_mix import add_table_arguments, table_mix_from_args
 
-    parser = argparse.ArgumentParser(description="Play one shard of a global population round.")
+    parser = argparse.ArgumentParser(description="Play one shard of a global population pass.")
     parser.add_argument("--candidates", type=Path, required=True, help="JSON [{label, path}, ...]")
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--games-per-model", type=int, default=DEFAULT_GAMES_PER_MODEL)
-    parser.add_argument("--hands-per-game", type=int, default=DEFAULT_HANDS_PER_GAME)
-    parser.add_argument("--players", type=int, default=6)
-    parser.add_argument("--stack", type=int, default=200)
-    parser.add_argument("--sb", type=int, default=1)
-    parser.add_argument("--bb", type=int, default=2)
+    parser.add_argument("--sessions", type=int, default=DEFAULT_GLOBAL_SESSIONS)
+    add_table_arguments(parser)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cpu")
     args = parser.parse_args()
 
-    game = GameConfig(
-        num_players=args.players, starting_stack=args.stack, small_blind=args.sb, big_blind=args.bb
-    )
+    mix = table_mix_from_args(args)
     raw = json.loads(args.candidates.read_text(encoding="utf-8"))
     candidates = [
         Candidate(label=entry["label"], path=Path(entry["path"]))
         for entry in raw
     ]
 
-    sessions = play_global_round(
+    sessions = play_global_sessions(
         candidates,
-        game,
-        games_per_model=args.games_per_model,
-        hands_per_game=args.hands_per_game,
+        mix,
+        sessions=args.sessions,
+        session_hands=args.session_hands,
         device=args.device,
         seed=args.seed,
     )
@@ -572,8 +544,8 @@ def add_benchmark_candidates(
     benchmark: `games` above the `games_percentile` of the population's games
     and a rating more than `margin` above the best anchor.
 
-    Called at the end of a training run, after the population round, so the
-    ratings it reads already include that round. Candidates are taken from the
+    Called at the end of a training run, after the population pass, so the
+    ratings it reads already include that pass. Candidates are taken from the
     lowest rating upwards and each must clear the previously added one by more
     than `margin` too, so the anchors stay at least `margin` apart rather than a
     whole cluster of near-identical models joining at once. Returns the models
@@ -667,7 +639,7 @@ def delete_checkpoints(
     too, for good -- there is no "retired" holding area.
 
     `paths_by_label` should come from `discover_all_copies()`. A file already
-    gone (a previous interrupted round) is skipped via `on_skip` rather than
+    gone (a previous interrupted pass) is skipped via `on_skip` rather than
     treated as an error.
 
     Returns the number of *files* removed, which can exceed `len(members)`.
@@ -690,15 +662,14 @@ def delete_checkpoints(
 
 
 @dataclass(frozen=True)
-class PlayedRound:
-    """What the playing half of a round produced, before anything is merged.
+class PlayedSessions:
+    """What the playing half of a pass produced, before anything is merged.
 
     Two different counts, and conflating them is easy: `candidates` is how many
     models were drawn and seated, `sessions` how many rated games they played
     between them. A caller that has to stop after so many *games* -- the Elo
-    fill-in phase does -- needs the second, and there is no way to derive it
-    from the first (a session seats `num_players` models and decrements each
-    one's debt, so how many it takes depends on where the random seats land).
+    fill-in phase does -- needs the second, which is not derivable from the first
+    (a session seats `num_players` of the `candidates` drawn).
     """
 
     candidates: int = 0
@@ -706,8 +677,8 @@ class PlayedRound:
 
 
 @dataclass(frozen=True)
-class PopulationRoundReport:
-    """What one call to `run_population_round` did, for the caller to log.
+class PopulationSessionsReport:
+    """What one call to `run_population_sessions` did, for the caller to log.
 
     `played` is how many candidates this call drew and played and
     `sessions_played` how many games it played with them; everything else
@@ -730,60 +701,60 @@ class PopulationRoundReport:
     deleted_files: int = 0
 
 
-def play_population_round_sharded(
+def play_population_sessions_sharded(
     *,
     global_dir: str | Path = DEFAULT_GLOBAL_DIR,
     root: str | Path = Path("checkpoints"),
-    game,
+    mix,
     machine: str,
     population_sample: int = DEFAULT_POPULATION_SAMPLE,
     benchmark_sample: int = DEFAULT_BENCHMARK_SAMPLE,
-    games_per_model: int = DEFAULT_GAMES_PER_MODEL,
-    hands_per_game: int = DEFAULT_HANDS_PER_GAME,
+    sessions: int = DEFAULT_GLOBAL_SESSIONS,
+    session_hands: int = DEFAULT_SESSION_HANDS,
     device: str = "cpu",
     seed: int | None = None,
     workers: int = 1,
     draw: Callable[[list[Candidate], int, random.Random], list[Candidate]] | None = None,
     on_skip: Callable[[Path, str], None] | None = None,
     on_progress: Callable[[int, int, str], None] | None = None,
-) -> PlayedRound:
+) -> PlayedSessions:
     """Draw a random sample and play it -- no lock held at all.
 
-    This is the expensive half of a round, and it parallelises perfectly
+    This is the expensive half of a pass, and it parallelises perfectly
     (each session is independent), unlike applying ratings, which must be
-    folded in model by model -- see `apply_pending_population_rounds`.
+    folded in model by model -- see `apply_pending_population_sessions`.
     Splitting them is what lets every machine, and every core on it, evaluate
     at the same time; only the cheap bookkeeping step takes any locks, and
     only on the few models each session involves.
 
     `workers <= 1` (the default, and what every existing test uses) plays
-    in-process via `play_global_round` directly -- no subprocess, so tests
+    in-process via `play_global_sessions` directly -- no subprocess, so tests
     stay fast and simple. `workers > 1` shards across that many local
     subprocesses (`python -m pokerlab.rl.global_arena`, one per shard): the
     games are split exactly between them (see `play_sharded`), each plays its
     slice for the same candidates and reports its sessions back; a shard that
     crashes or writes unreadable JSON is skipped via `on_skip`, never fatal to
-    the round.
+    the pass.
 
     Results are written to one pending-result file under
     `<global_dir>/pending/`, named uniquely (machine, timestamp, a short
-    random suffix) so concurrent writers -- other machines, or another round
+    random suffix) so concurrent writers -- other machines, or another pass
     from this one -- never collide. Returns how many candidates were drawn and
     played (0 if the draw could not even seat one table -- not an error,
     just nothing to report).
 
     `on_progress` is reported only on the in-process path (`workers <= 1`),
     which is the one production uses: `train.py` leaves `workers` at its
-    default, so every worker of every generation plays its round here. A
-    sharded round (`rl/benchmark_arena.py`, run by hand) spreads its playing
+    default, so every worker of every generation plays its pass here. A
+    sharded pass (`rl/benchmark_arena.py`, run by hand) spreads its playing
     across subprocesses that write to their own scratch logs, and stitching
     those back together is not worth it for a command someone is watching
     directly.
 
     `seed` defaults to `None` (OS entropy), not the training run's own seed:
-    reusing that would make every round of a repeated identical sweep replay
+    reusing that would make every pass of a repeated identical sweep replay
     the identical cross-machine pairings -- the opposite of what a shared
-    population round is for, unlike `benchmark.py`, where determinism is the
+    population pass is for, unlike `benchmark.py`, where determinism is the
     entire point.
     """
     global_dir = Path(global_dir)
@@ -792,11 +763,11 @@ def play_population_round_sharded(
 
     population = discover_population(root)
     benchmark_population = discover_benchmark_population(root)
-    # Uniform by default, and deliberately: a round decides who might be *deleted*,
+    # Uniform by default, and deliberately: a pass decides who might be *deleted*,
     # so an honest draw is the right fit (see the module header). `draw` is the hook
     # for a caller that wants coverage instead -- `rl/population_arena.py` passes a
     # least-played-first draw, because a hand-run rating sweep deletes nothing and
-    # its whole job is to reach models the sampled rounds have never seated.
+    # its whole job is to reach models the sampled passes have never seated.
     if draw is None:
         population_draw = rng.sample(population, min(population_sample, len(population)))
     else:
@@ -805,42 +776,42 @@ def play_population_round_sharded(
         benchmark_population, min(benchmark_sample, len(benchmark_population))
     )
     combined = population_draw + benchmark_draw
-    if len(combined) < game.num_players:
-        return PlayedRound()
+    if len(combined) < mix.max_players:
+        return PlayedSessions()
 
     if workers <= 1:
-        sessions = play_global_round(
+        played = play_global_sessions(
             combined,
-            game,
-            games_per_model=games_per_model,
-            hands_per_game=hands_per_game,
+            mix,
+            sessions=sessions,
+            session_hands=session_hands,
             device=device,
             seed=rng.randrange(2**31),
             on_skip=on_skip,
             on_progress=on_progress,
         )
     else:
-        sessions = play_sharded(
+        played = play_sharded(
             combined,
-            game,
-            games_per_model=games_per_model,
-            hands_per_game=hands_per_game,
+            mix,
+            sessions=sessions,
+            session_hands=session_hands,
             device=device,
             rng=rng,
             workers=workers,
             on_skip=on_skip,
         )
-    if not sessions:
-        return PlayedRound()
+    if not played:
+        return PlayedSessions()
 
     write_pending_sessions(
         global_dir,
-        sessions,
+        played,
         machine=machine,
         population={c.label: str(c.path) for c in population_draw},
         benchmark={c.label: str(c.path) for c in benchmark_draw},
     )
-    return PlayedRound(candidates=len(combined), sessions=len(sessions))
+    return PlayedSessions(candidates=len(combined), sessions=len(played))
 
 
 def write_pending_sessions(
@@ -855,9 +826,9 @@ def write_pending_sessions(
 
     The only way results reach the ratings: playing takes no lock and leaves its
     work here, merging claims the file and applies it (see
-    `apply_pending_population_rounds`). The name carries the machine, the time
+    `apply_pending_population_sessions`). The name carries the machine, the time
     and a random suffix, so concurrent writers -- other machines, or another
-    round from this one -- never collide, and the file is written as a dotted
+    pass from this one -- never collide, and the file is written as a dotted
     `.partial` and renamed into place so a merger never claims a half-written
     one.
 
@@ -882,26 +853,26 @@ def write_pending_sessions(
     return target
 
 
-def shard_games(games_per_model: int, workers: int) -> list[int]:
-    """How many games each shard owes, summing to exactly `games_per_model`.
+def shard_sessions(sessions: int, workers: int) -> list[int]:
+    """How many sessions each shard plays, summing to exactly `sessions`.
 
-    Shard `i` takes the floor plus one while the remainder lasts. It used to be
-    `ceil(games_per_model / workers)` for every shard, which silently overshot on
-    an uneven division -- 20 games across 15 shards played 30, half again the
-    hands that were asked for. A shard owed 0 is not launched.
+    Shard `i` takes the floor plus one while the remainder lasts. (A flat
+    `ceil(sessions / workers)` per shard would silently overshoot on an uneven
+    division: 20 sessions across 15 shards would play 30.) A shard given 0 is
+    not launched.
     """
     if workers < 1:
-        return [games_per_model] if games_per_model else []
-    base, remainder = divmod(games_per_model, workers)
+        return [sessions] if sessions else []
+    base, remainder = divmod(sessions, workers)
     return [base + (1 if index < remainder else 0) for index in range(workers)]
 
 
 def play_sharded(
     combined: list[Candidate],
-    game,
+    mix,
     *,
-    games_per_model: int,
-    hands_per_game: int,
+    sessions: int,
+    session_hands: int,
     device: str,
     rng: random.Random,
     workers: int,
@@ -910,16 +881,13 @@ def play_sharded(
     """Fan `combined` out to `workers` local subprocesses via `_shard_main` and
     collect their sessions.
 
-    Public because it has two callers: the population round below, and
+    Public because it has two callers: the population pass below, and
     `rl/benchmark_arena.py`, which is otherwise sequential and needs the same
-    fan-out (its rounds are 200,000 hands each, over an hour on one core).
+    fan-out (its passes are 200,000 hands each, over an hour on one core).
 
-    **The games are split exactly**, shard `i` taking
-    `games_per_model // workers` plus one while the remainder lasts, so the
-    total played per model is `games_per_model` and not more. It used to be
-    `ceil(games_per_model / workers)` for every shard, which silently overshot
-    whenever the division was uneven -- 20 games across 15 shards played 30.
-    A shard owed nothing is not launched.
+    **The sessions are split exactly**, shard `i` taking `sessions // workers`
+    plus one while the remainder lasts, so the total played is `sessions` and not
+    more. A shard given nothing is not launched.
 
     Scratch files live under a local temp dir (never the shared NFS volume --
     shard output is pure IPC between parent and child on one machine), removed
@@ -928,13 +896,9 @@ def play_sharded(
     **Children are given `OMP_NUM_THREADS=1`, and that is what makes sharding
     worth anything.** Left unset, torch sizes its intra-op pool from the cores it
     can see, so every shard would try to use the whole machine and N shards would
-    oversubscribe it N-fold. Measured on an idle 32-core box, 6-max hands per
-    second: one process at 15 threads reaches **80.1** and one process at 1 thread
-    **72.1** -- so fifteen cores' worth of threads buys 1.11x -- while **fifteen
-    processes at one thread each total 1,102.9**, i.e. 15.3x for the same fifteen
-    cores. Threads are a 14x worse use of the machine, because the work is a
-    batch-of-one forward pass (~334 us) inside a pure-Python engine that accounts
-    for two thirds of a hand's 12.4 ms."""
+    oversubscribe it N-fold. The work is a batch-of-one forward pass inside a
+    pure-Python engine, so threads inside one process buy almost nothing, while
+    one process per core scales with the core count."""
     work_dir = Path(tempfile.mkdtemp(prefix="global-arena-shard-"))
     try:
         candidates_path = work_dir / "candidates.json"
@@ -942,27 +906,24 @@ def play_sharded(
             json.dumps([{"label": c.label, "path": str(c.path)} for c in combined]),
             encoding="utf-8",
         )
-        per_shard = shard_games(games_per_model, workers)
+        per_shard = shard_sessions(sessions, workers)
         environment = dict(os.environ)
         environment["OMP_NUM_THREADS"] = "1"
         environment["MKL_NUM_THREADS"] = "1"
 
         processes = []
         for shard in range(workers):
-            games_per_shard = per_shard[shard]
-            if games_per_shard == 0:
+            sessions_per_shard = per_shard[shard]
+            if sessions_per_shard == 0:
                 continue
             out = work_dir / f"shard{shard:02d}.json"
             command = [
                 sys.executable, "-u", "-m", "pokerlab.rl.global_arena",
                 "--candidates", str(candidates_path),
                 "--out", str(out),
-                "--games-per-model", str(games_per_shard),
-                "--hands-per-game", str(hands_per_game),
-                "--players", str(game.num_players),
-                "--stack", str(game.starting_stack),
-                "--sb", str(game.small_blind),
-                "--bb", str(game.big_blind),
+                "--sessions", str(sessions_per_shard),
+                "--session-hands", str(session_hands),
+                *table_arguments(mix),
                 "--seed", str(rng.randrange(2**31)),
                 "--device", device,
             ]
@@ -1026,6 +987,7 @@ def _apply_session(
     machine: str,
     lock_ttl: float,
     lock_wait: float,
+    k_schedule: Sequence[tuple[int, float]] = DEFAULT_K_SCHEDULE,
 ) -> bool:
     """Fold one session into the ratings under the locks of its participants.
 
@@ -1061,7 +1023,7 @@ def _apply_session(
                 directory=global_dir,
                 max_models=10**9,
                 members=members,
-                k_schedule=DEFAULT_K_SCHEDULE,
+                k_schedule=tuple(k_schedule),
             ).record_session(known)
             for member in members.values():
                 write_member(global_dir, member)
@@ -1149,7 +1111,7 @@ def _eliminate(
         release_locks(global_dir, [PRUNE_LOCK])
 
 
-def apply_pending_population_rounds(
+def apply_pending_population_sessions(
     *,
     global_dir: str | Path = DEFAULT_GLOBAL_DIR,
     root: str | Path = Path("checkpoints"),
@@ -1159,10 +1121,11 @@ def apply_pending_population_rounds(
     trigger_size: int = DEFAULT_POPULATION_TRIGGER,
     eliminate_fraction: float = DEFAULT_ELIMINATION_FRACTION,
     protect_percentile: float = DEFAULT_PROTECT_PERCENTILE,
+    k_schedule: Sequence[tuple[int, float]] = DEFAULT_K_SCHEDULE,
     on_skip: Callable[[Path, str], None] | None = None,
     on_phase: Callable[[str], None] | None = None,
-) -> PopulationRoundReport:
-    """Fold every pending round -- this machine's and everyone else's -- into
+) -> PopulationSessionsReport:
+    """Fold every pending pass -- this machine's and everyone else's -- into
     the ratings, then prune if the population has reached the trigger.
 
     There is no registry-wide lock. Each pending file is *claimed* by an atomic
@@ -1204,7 +1167,6 @@ def apply_pending_population_rounds(
     pending_dir = global_dir / PENDING_DIRNAME
     if on_phase is not None:
         on_phase(ELO_MERGE)
-    migrate_legacy_registry(global_dir)
 
     population = discover_population(root)
     benchmark_population = discover_benchmark_population(root)
@@ -1236,6 +1198,7 @@ def apply_pending_population_rounds(
                 machine=machine,
                 lock_ttl=lock_ttl,
                 lock_wait=lock_wait,
+                k_schedule=k_schedule,
             ):
                 sessions_applied += 1
                 participants.update(results)
@@ -1284,7 +1247,7 @@ def apply_pending_population_rounds(
 
     write_snapshot(global_dir, machine=machine)
 
-    return PopulationRoundReport(
+    return PopulationSessionsReport(
         pending_merged=merged_files,
         sessions=sessions_applied,
         deferred_sessions=deferred,
@@ -1296,16 +1259,16 @@ def apply_pending_population_rounds(
     )
 
 
-def run_population_round(
+def run_population_sessions(
     *,
     global_dir: str | Path = DEFAULT_GLOBAL_DIR,
     root: str | Path = Path("checkpoints"),
-    game,
+    mix,
     machine: str,
     population_sample: int = DEFAULT_POPULATION_SAMPLE,
     benchmark_sample: int = DEFAULT_BENCHMARK_SAMPLE,
-    games_per_model: int = DEFAULT_GAMES_PER_MODEL,
-    hands_per_game: int = DEFAULT_HANDS_PER_GAME,
+    sessions: int = DEFAULT_GLOBAL_SESSIONS,
+    session_hands: int = DEFAULT_SESSION_HANDS,
     device: str = "cpu",
     seed: int | None = None,
     workers: int = 1,
@@ -1314,37 +1277,38 @@ def run_population_round(
     trigger_size: int = DEFAULT_POPULATION_TRIGGER,
     eliminate_fraction: float = DEFAULT_ELIMINATION_FRACTION,
     protect_percentile: float = DEFAULT_PROTECT_PERCENTILE,
+    k_schedule: Sequence[tuple[int, float]] = DEFAULT_K_SCHEDULE,
     on_skip: Callable[[Path, str], None] | None = None,
     on_phase: Callable[[str], None] | None = None,
     on_progress: Callable[[int, int, str], None] | None = None,
-) -> PopulationRoundReport:
-    """One end-of-training-run cross-machine Elo round, and (rarely) a prune
+) -> PopulationSessionsReport:
+    """One end-of-training-run cross-machine Elo pass, and (rarely) a prune
     that deletes real files. Called from `train.py::main()` at the end of
     every `poker-train` run.
 
-    Two independent phases, deliberately: `play_population_round_sharded`
+    Two independent phases, deliberately: `play_population_sessions_sharded`
     (play -- no lock, sharded across `workers` local processes) always runs,
-    then `apply_pending_population_rounds` (bookkeeping -- per-model locks only)
+    then `apply_pending_population_sessions` (bookkeeping -- per-model locks only)
     always follows. Whatever this call played is durably in
     `<global_dir>/pending/` before the merge starts, so no played game is ever
     lost, whichever machine ends up folding it in.
 
-    `on_phase` receives the stage names of `rl/phases.py` as the round moves
+    `on_phase` receives the stage names of `rl/phases.py` as the pass moves
     through them (play, merge, pruning), which is what lets a watcher say which
     of the three a worker is in; `on_progress` reports how far into the playing
     half it is, which is what lets the watcher say how much of it is left.
     """
     if on_phase is not None:
         on_phase(ELO_PLAY)
-    played = play_population_round_sharded(
+    played = play_population_sessions_sharded(
         global_dir=global_dir,
         root=root,
-        game=game,
+        mix=mix,
         machine=machine,
         population_sample=population_sample,
         benchmark_sample=benchmark_sample,
-        games_per_model=games_per_model,
-        hands_per_game=hands_per_game,
+        sessions=sessions,
+        session_hands=session_hands,
         device=device,
         seed=seed,
         workers=workers,
@@ -1352,7 +1316,7 @@ def run_population_round(
         on_skip=on_skip,
         on_progress=on_progress,
     )
-    merged = apply_pending_population_rounds(
+    merged = apply_pending_population_sessions(
         global_dir=global_dir,
         root=root,
         machine=machine,
@@ -1360,6 +1324,7 @@ def run_population_round(
         trigger_size=trigger_size,
         eliminate_fraction=eliminate_fraction,
         protect_percentile=protect_percentile,
+        k_schedule=k_schedule,
         on_skip=on_skip,
         on_phase=on_phase,
     )
@@ -1371,9 +1336,9 @@ if __name__ == "__main__":
     # silent bug: `play_sharded` launches `python -m pokerlab.rl.global_arena`,
     # which without a `__main__` guard merely imported the module, did nothing,
     # and wrote no output file -- so every shard was reported through `on_skip`
-    # as a missing file and a sharded round returned *zero* sessions. It stayed
+    # as a missing file and a sharded pass returned *zero* sessions. It stayed
     # dormant because nothing in production passes `workers > 1`
-    # (`train.py`'s `run_population_round` call leaves it at the default 1), so
+    # (`train.py`'s `run_population_sessions` call leaves it at the default 1), so
     # the only path that exercised it was one nobody had run. Pinned by a test
     # that invokes the module as a subprocess and checks it plays.
     _shard_main()

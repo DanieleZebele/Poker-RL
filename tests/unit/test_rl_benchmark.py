@@ -1,9 +1,4 @@
-"""The frozen benchmark: the only cross-generation measurement in the project.
-
-Its whole value rests on being reproducible -- a number that wobbles between two
-runs of the same model cannot tell a real improvement from noise -- so that is
-what most of these assert.
-"""
+"""The frozen anchors and the pass that rates a model against them."""
 
 from __future__ import annotations
 
@@ -11,125 +6,16 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from pokerlab.engine.config import GameConfig
+from support import fixed_mix
+
 from pokerlab.rl.benchmark import (
-    BenchmarkResult,
     anchor_paths,
-    load_benchmark_opponents,
     rate_against_benchmark,
-    run_benchmark,
 )
 from pokerlab.rl.policy import PokerActorCritic
 from pokerlab.rl.ppo import save_checkpoint
 
-GAME = GameConfig(num_players=3, starting_stack=100, small_blind=1, big_blind=2)
-
-
-@pytest.fixture
-def benchmark_dir(tmp_path):
-    for index in range(4):
-        torch.manual_seed(index)
-        save_checkpoint(tmp_path / f"bench-{index}.pt", PokerActorCritic(hidden=32, num_layers=1))
-    return tmp_path
-
-
-def small_model(seed: int) -> PokerActorCritic:
-    torch.manual_seed(seed)
-    return PokerActorCritic(hidden=32, num_layers=1)
-
-
-def test_the_set_loads_in_a_fixed_order(benchmark_dir):
-    """Sorted by name, not by mtime: copying the directory must not change the
-    measurement."""
-    labels = [o.label for o in load_benchmark_opponents(benchmark_dir, GAME)]
-    assert labels == sorted(labels) == ["bench-0", "bench-1", "bench-2", "bench-3"]
-
-
-def test_a_missing_directory_is_empty_not_an_error(tmp_path):
-    assert load_benchmark_opponents(tmp_path / "nope", GAME) == []
-
-
-def test_nested_series_directories_are_included_by_default(benchmark_dir):
-    """The root benchmark directory is now just a container: all numbered
-    benchmark_<N>/ subdirectories are part of the same fixed benchmark set."""
-    nested = benchmark_dir / "benchmark_1"
-    nested.mkdir()
-    save_checkpoint(nested / "promoted.pt", PokerActorCritic(hidden=32, num_layers=1))
-    labels = [o.label for o in load_benchmark_opponents(benchmark_dir, GAME)]
-    assert "promoted" in labels
-    assert len(labels) == 5
-
-
-def test_recursive_can_still_be_disabled_explicitly(benchmark_dir):
-    """The recursive default is the intended behaviour, but callers can still
-    opt into root-only selection when they need a stable, non-growing set."""
-    nested = benchmark_dir / "benchmark_1"
-    nested.mkdir()
-    save_checkpoint(nested / "promoted.pt", PokerActorCritic(hidden=32, num_layers=1))
-    labels = [o.label for o in load_benchmark_opponents(benchmark_dir, GAME, recursive=False)]
-    assert "promoted" not in labels
-    assert len(labels) == 4
-
-
-def test_an_unreadable_checkpoint_is_skipped_with_a_reason(benchmark_dir):
-    (benchmark_dir / "broken.pt").write_text("not a checkpoint")
-    skipped: list[str] = []
-    opponents = load_benchmark_opponents(
-        benchmark_dir, GAME, on_skip=lambda path, why: skipped.append(path.name)
-    )
-    assert skipped == ["broken.pt"]
-    assert len(opponents) == 4
-
-
-def test_the_same_model_scores_identically_twice(benchmark_dir):
-    """The property the whole benchmark rests on."""
-    opponents = load_benchmark_opponents(benchmark_dir, GAME)
-    model = small_model(7)
-    first = run_benchmark(model, opponents, GAME, hands=60, seed=99)
-    second = run_benchmark(model, opponents, GAME, hands=60, seed=99)
-    assert first.bb_per_100 == second.bb_per_100
-    assert first.won_chips == second.won_chips
-
-
-def test_different_models_score_differently(benchmark_dir):
-    """A perfectly stable number that never moves would measure nothing."""
-    opponents = load_benchmark_opponents(benchmark_dir, GAME)
-    first = run_benchmark(small_model(7), opponents, GAME, hands=120, seed=99)
-    second = run_benchmark(small_model(123), opponents, GAME, hands=120, seed=99)
-    assert first.bb_per_100 != second.bb_per_100
-
-
-def test_a_different_seed_deals_different_hands(benchmark_dir):
-    opponents = load_benchmark_opponents(benchmark_dir, GAME)
-    model = small_model(7)
-    assert (
-        run_benchmark(model, opponents, GAME, hands=60, seed=1).bb_per_100
-        != run_benchmark(model, opponents, GAME, hands=60, seed=2).bb_per_100
-    )
-
-
-def test_too_few_opponents_is_a_clear_error(tmp_path):
-    torch.manual_seed(0)
-    save_checkpoint(tmp_path / "only.pt", PokerActorCritic(hidden=32, num_layers=1))
-    opponents = load_benchmark_opponents(tmp_path, GAME)
-    with pytest.raises(ValueError, match="benchmark has 1 opponents"):
-        run_benchmark(small_model(1), opponents, GAME, hands=10)
-
-
-def test_the_result_reports_what_was_played(benchmark_dir):
-    opponents = load_benchmark_opponents(benchmark_dir, GAME)
-    result = run_benchmark(small_model(7), opponents, GAME, hands=100, seed=5)
-    assert isinstance(result, BenchmarkResult)
-    assert result.hands == 100
-    assert result.opponents == 4
-    assert result.per_opponent, "no per-opponent breakdown was produced"
-
-
-def test_every_benchmark_opponent_is_actually_faced(benchmark_dir):
-    """A deterministic walk must still cover the set, not circle two of them."""
-    opponents = load_benchmark_opponents(benchmark_dir, GAME)
-    result = run_benchmark(small_model(7), opponents, GAME, hands=400, seed=5, rotate_every=10)
-    assert set(result.per_opponent) == {o.label for o in opponents}
+GAME = fixed_mix(3)
 
 
 # ---- rating a fresh model against each frozen series ------------------------
@@ -138,12 +24,11 @@ def test_every_benchmark_opponent_is_actually_faced(benchmark_dir):
 def make_series(root, series, per_series=3):
     """The frozen set as it is stored on disk: `benchmark_<N>/` directories.
 
-    The round no longer cares which directory a checkpoint sits in -- it draws
+    The pass no longer cares which directory a checkpoint sits in -- it draws
     opponents from the whole set -- but the layout is still what pruning creates,
     so the fixture keeps it.
     """
     from pokerlab.rl.policy import PokerActorCritic
-    from pokerlab.rl.ppo import save_checkpoint
 
     for index in range(series):
         directory = root / f"benchmark_{index + 1}"
@@ -157,7 +42,7 @@ def make_series(root, series, per_series=3):
 
 
 def test_every_frozen_checkpoint_is_a_candidate_whatever_directory_it_is_in(tmp_path):
-    """The round draws from the whole set, so discovery is flat and recursive.
+    """The pass draws from the whole set, so discovery is flat and recursive.
     Sorted, because `rglob` order is filesystem order and a seeded draw has to
     repeat across the machines sharing the volume."""
     make_series(tmp_path / "benchmark", series=3, per_series=2)
@@ -174,8 +59,8 @@ def test_a_missing_benchmark_directory_is_empty_not_an_error(tmp_path):
     assert anchor_paths(tmp_path / "nope") == []
 
 
-def test_the_round_rates_the_model_over_every_session(tmp_path):
-    game = GameConfig(num_players=3, starting_stack=100, small_blind=1, big_blind=2)
+def test_the_pass_rates_the_model_over_every_session(tmp_path):
+    game = fixed_mix(3)
     make_series(tmp_path / "benchmark", series=3, per_series=2)
 
     rated = rate_against_benchmark(
@@ -193,9 +78,9 @@ def test_the_round_rates_the_model_over_every_session(tmp_path):
 
 def test_the_session_count_continues_from_training(tmp_path):
     """The K a session is rated at comes from how many rated sessions the learner
-    has played *in total*, validation rounds included -- that continuity is the
-    whole reason the round takes `games` rather than starting at zero."""
-    game = GameConfig(num_players=3, starting_stack=100, small_blind=1, big_blind=2)
+    has played *in total*, validation passes included -- that continuity is the
+    whole reason the pass takes `games` rather than starting at zero."""
+    game = fixed_mix(3)
     make_series(tmp_path / "benchmark", series=2, per_series=2)
 
     rated = rate_against_benchmark(
@@ -216,7 +101,7 @@ def test_a_later_session_moves_the_rating_less_than_an_early_one(tmp_path):
 
 
 def test_a_frozen_set_too_small_to_seat_a_table_is_not_fatal(tmp_path):
-    game = GameConfig(num_players=6, starting_stack=100, small_blind=1, big_blind=2)
+    game = fixed_mix(6)
     make_series(tmp_path / "benchmark", series=1, per_series=2)  # need 5, have 2
     skipped = []
 
@@ -231,17 +116,17 @@ def test_a_frozen_set_too_small_to_seat_a_table_is_not_fatal(tmp_path):
 
 
 def test_an_empty_benchmark_directory_yields_nothing(tmp_path):
-    game = GameConfig(num_players=3, starting_stack=100, small_blind=1, big_blind=2)
+    game = fixed_mix(3)
     assert rate_against_benchmark(
         PokerActorCritic(hidden=16, num_layers=1), tmp_path / "nope", game,
         label="fresh", rating=1500.0, sessions=1, hands=2,
     ) is None
 
 
-def test_the_round_reports_its_progress_session_by_session(tmp_path):
-    """The round plays 500,000 hands and prints almost nothing, so without this
+def test_the_pass_reports_its_progress_session_by_session(tmp_path):
+    """The pass plays 500,000 hands and prints almost nothing, so without this
     the 10-minute stale-log warning fires on a perfectly healthy worker."""
-    game = GameConfig(num_players=3, starting_stack=100, small_blind=1, big_blind=2)
+    game = fixed_mix(3)
     make_series(tmp_path / "benchmark", series=2, per_series=2)
     seen = []
 
@@ -258,7 +143,7 @@ def test_a_broken_checkpoint_is_struck_off_rather_than_reported_every_slice(tmp_
     """A bad file must be tried once, not once per slice: ten slices would
     otherwise report the same failure ten times, and a slice that happened to be
     entirely bad could spin."""
-    game = GameConfig(num_players=3, starting_stack=100, small_blind=1, big_blind=2)
+    game = fixed_mix(3)
     make_series(tmp_path / "benchmark", series=2, per_series=3)
     (tmp_path / "benchmark" / "benchmark_1" / "broken.pt").write_bytes(b"not a checkpoint")
     skipped = []
@@ -274,13 +159,13 @@ def test_a_broken_checkpoint_is_struck_off_rather_than_reported_every_slice(tmp_
     assert skipped.count("broken.pt") == 1
 
 
-def test_the_round_is_deliberately_not_queued_for_the_global_merge(tmp_path):
+def test_the_pass_is_deliberately_not_queued_for_the_global_merge(tmp_path):
     """`raw_sessions` is offered but `train.main()` does not queue it, because the
     evidence is already in the rating the model publishes with: re-applying it at
     the merge measured 10-20% worse. This pins the property that makes that safe
-    -- the round hands back the session count so `publish_model` can register the
+    -- the pass hands back the session count so `publish_model` can register the
     games it really earned."""
-    game = GameConfig(num_players=3, starting_stack=100, small_blind=1, big_blind=2)
+    game = fixed_mix(3)
     make_series(tmp_path / "benchmark", series=2, per_series=2)
 
     rated = rate_against_benchmark(
@@ -293,7 +178,7 @@ def test_the_round_is_deliberately_not_queued_for_the_global_merge(tmp_path):
     assert len(rated.raw_sessions) == rated.sessions
 
 
-def test_the_round_rests_on_enough_hands_to_mean_something():
+def test_the_pass_rests_on_enough_hands_to_mean_something():
     """500 sessions of 1,000 hands is 500,000, a 95% interval of about +/-8
     bb/100 -- which is what lets `benchmark_bb100` be the sweep's response
     variable. The old arrangement's 1,000-hand readings carried +/-180."""
@@ -302,20 +187,33 @@ def test_the_round_rests_on_enough_hands_to_mean_something():
     assert DEFAULT_BENCHMARK_SESSIONS * DEFAULT_SESSION_HANDS >= 400_000
 
 
-def test_a_session_is_a_thousand_hands_everywhere():
+def test_one_parameter_sets_the_session_length_everywhere():
     """The Elo scale is defined by how often a session of this length picks the
-    stronger model, so a round of a different length would be a different scale
-    silently sharing the same numbers."""
-    from pokerlab.rl.benchmark import DEFAULT_SESSION_HANDS
-    from pokerlab.rl.global_arena import DEFAULT_HANDS_PER_GAME
-    from pokerlab.rl.train import SESSION_HANDS
+    stronger model, so a pass of a different length would be a different scale
+    silently sharing the same numbers. There is one length -- `--session-hands`,
+    1,000 by default -- and every program that plays rated sessions reads it from
+    the same flag, with the same default."""
+    from importlib import import_module
 
-    assert DEFAULT_SESSION_HANDS == SESSION_HANDS == DEFAULT_HANDS_PER_GAME == 1000
+    from pokerlab.config import _actions
+    from pokerlab.rl.benchmark import rate_against_benchmark
+    from pokerlab.rl.siblings import TORCH_FREE, WITH_TORCH
+    from pokerlab.rl.table_mix import DEFAULT_SESSION_HANDS
+
+    assert DEFAULT_SESSION_HANDS == 1000
+    for name in TORCH_FREE + WITH_TORCH:
+        if name.endswith("dashboard"):
+            continue  # plays nothing
+        action = _actions(import_module(name).build_parser())["session_hands"]
+        assert action.default == DEFAULT_SESSION_HANDS, name
+    import inspect
+
+    assert inspect.signature(rate_against_benchmark).parameters["hands"].default == DEFAULT_SESSION_HANDS
 
 
 def test_the_published_session_count_keeps_a_new_model_out_of_the_top_tier():
     """A model published with the ~600 rated sessions it really played is refined
-    gently by later population rounds. Published at zero it would be shoved
+    gently by later population passes. Published at zero it would be shoved
     around at the schedule's first tier on evidence it already has."""
     from pokerlab.rl.benchmark import DEFAULT_BENCHMARK_SESSIONS
     from pokerlab.rl.pool_registry import DEFAULT_K_SCHEDULE, k_for_games
@@ -323,3 +221,61 @@ def test_the_published_session_count_keeps_a_new_model_out_of_the_top_tier():
     earned = 100 + DEFAULT_BENCHMARK_SESSIONS
     assert k_for_games(earned) < k_for_games(0)
     assert k_for_games(earned) > DEFAULT_K_SCHEDULE[-1][1], "and not in the bottom tier either"
+
+
+# ---- a mixture of table sizes ------------------------------------------------
+
+
+def test_the_pass_draws_a_table_size_per_session_from_the_mixture(tmp_path):
+    from pokerlab.rl.table_mix import TableMix
+
+    mix = TableMix(weights=(1, 1, 1, 0, 0, 0, 0, 0), stack_min_bb=5.0, stack_max_bb=50.0,
+                   small_blind=1, big_blind=2)
+    make_series(tmp_path / "benchmark", series=2, per_series=2)  # four anchors: enough for 4-handed
+
+    rated = rate_against_benchmark(
+        PokerActorCritic(hidden=16, num_layers=1), tmp_path / "benchmark", mix,
+        label="fresh", rating=1500.0, sessions=30, hands=2, seed=3,
+    )
+
+    assert rated is not None and rated.sessions == 30
+    # Every session is one table: its size is the number of participants, and it
+    # is one the mixture allows.
+    assert {len(session) for session in rated.raw_sessions} == {2, 3, 4}
+    assert set(rated.bb_per_100_by_size) == {2, 3, 4}
+
+
+def test_the_sizes_a_pass_plays_are_reproducible_from_the_seed(tmp_path):
+    from pokerlab.rl.table_mix import TableMix
+
+    mix = TableMix(weights=(1, 1, 1, 0, 0, 0, 0, 0), stack_min_bb=5.0, stack_max_bb=50.0,
+                   small_blind=1, big_blind=2)
+    make_series(tmp_path / "benchmark", series=2, per_series=2)
+
+    def sizes(seed):
+        rated = rate_against_benchmark(
+            PokerActorCritic(hidden=16, num_layers=1), tmp_path / "benchmark", mix,
+            label="fresh", rating=1500.0, sessions=12, hands=1, seed=seed,
+        )
+        return [len(session) for session in rated.raw_sessions]
+
+    assert sizes(5) == sizes(5)
+
+
+def test_a_frozen_set_that_cannot_seat_the_largest_table_is_not_rated(tmp_path):
+    """A pass that quietly dropped the big tables would measure a different
+    mixture than the weights say, so it does not run at all."""
+    from pokerlab.rl.table_mix import TableMix
+
+    mix = TableMix(weights=(1, 0, 0, 0, 0, 0, 0, 1), stack_min_bb=5.0, stack_max_bb=50.0,
+                   small_blind=1, big_blind=2)
+    make_series(tmp_path / "benchmark", series=1, per_series=5)  # a 9-handed table needs 8
+    skipped = []
+
+    rated = rate_against_benchmark(
+        PokerActorCritic(hidden=16, num_layers=1), tmp_path / "benchmark", mix,
+        label="fresh", rating=1500.0, sessions=2, hands=1, seed=1,
+        on_skip=lambda path, why: skipped.append(why),
+    )
+
+    assert rated is None and skipped

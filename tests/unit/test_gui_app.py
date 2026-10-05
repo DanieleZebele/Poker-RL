@@ -50,8 +50,7 @@ def table_frame(app):
 
 
 def test_bot_spec_to_key_string_for_a_model():
-    """There is no bot catalog any more (see CLAUDE.md, "Heuristic bots,
-    removed") -- every spec is a trained model given by path."""
+    """Every bot spec is a trained model given by path."""
     assert _bot_spec_to_key_string({"key": "model", "path": "checkpoints/pool/agent.pt"}) == (
         "model:checkpoints/pool/agent.pt"
     )

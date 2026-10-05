@@ -35,7 +35,7 @@ def machine_dir(tmp_path, name, generation, workers=2, iterations=10):
 
 def test_a_machine_reports_when_its_slowest_worker_should_be_done(tmp_path):
     """The end of a generation is the part that looks stuck: every bar reads
-    100% and the workers then spend an hour in the final rounds. A generation
+    100% and the workers then spend an hour in the final passes. A generation
     ends when its slowest worker does, so the machine reports the longest ETA.
     """
     d = machine_dir(tmp_path, "host-a", 3, workers=2)
@@ -314,18 +314,9 @@ def test_the_page_renders_the_settings_and_does_not_fetch_them_again(tmp_path):
 
     assert "hpByKey.set(key, w.hyperparameters || null)" in PAGE
     assert "function hpHtml(key)" in PAGE
-    # Built in one place: three call sites used to repeat the panel's markup.
+    # Built in one place, so the panel's markup is not repeated at each call site.
     assert PAGE.count("function panelHtml(key)") == 1
     assert PAGE.count("panel.innerHTML = panelHtml(key);") == 2
-
-
-def test_the_page_counts_an_unassigned_arm_instead_of_hiding_it():
-    """It is how a machine still running a supervisor from before the sweep
-    identifies itself, so it has to be counted in the pill, not skipped."""
-    from pokerlab.rl.dashboard import PAGE
-
-    assert "'': 'senza sweep: supervisor da riavviare'" in PAGE
-    assert "const arm = hp.hp_arm || '';" in PAGE
 
 
 def test_the_snapshot_says_how_many_hands_the_training_rate_covers(tmp_path):
@@ -350,3 +341,21 @@ def test_the_page_marks_a_window_that_is_still_filling():
 
     assert "w.train_hands.toLocaleString('it') + ' mani'" in PAGE
     assert "w.train_hands < 100000" in PAGE
+
+
+def test_the_dashboard_scales_its_bars_by_the_iterations_of_the_config_file(tmp_path):
+    """`--iterations` has to match the running loop's or every bar is drawn at the
+    wrong fraction; the key `iterations` is the loop's own, so the shared file
+    sets both and they cannot disagree."""
+    import pokerlab.rl.dashboard as module
+
+    path = tmp_path / "config.toml"
+    path.write_text("iterations = 321\ndashboard_port = 9001\nlr = 0.01\n", encoding="utf-8")
+
+    args = module.resolve_cli(module.build_parser(), ["--config", str(path)], lenient=True)
+
+    assert (args.iterations, args.dashboard_port) == (321, 9001)
+    flagged = module.resolve_cli(
+        module.build_parser(), ["--config", str(path), "--iterations", "50"], lenient=True
+    )
+    assert flagged.iterations == 50

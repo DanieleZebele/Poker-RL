@@ -18,10 +18,9 @@ from pokerlab.rl.global_arena import (
 )
 from pokerlab.rl.global_store import load_ranking
 
-# A trained checkpoint as an opponent, given by path. There is no catalog of
-# hand-coded bots any more -- every non-human seat is a `model:<path>` spec --
-# so a bad path only ever fails for whoever asked for that seat, never for
-# anyone else running `poker-play`.
+# A trained checkpoint as an opponent, given by path. Every non-human seat is a
+# `model:<path>` spec, so a bad path only ever fails for whoever asked for that
+# seat, never for anyone else running `poker-play`.
 MODEL_PREFIX = "model:"
 
 DEFAULT_CHECKPOINT_ROOT = Path("checkpoints")
@@ -88,9 +87,7 @@ def discover_global_top_models(
 
     Unlike `discover_trained_models`, which approximates "best" from each
     machine's own local pool rating (a scale that is not comparable across
-    machines -- see CLAUDE.md's "Population-wide Elo and pruning", where the
-    same code, Shark, rated 1387 on one machine and 1487 on another), this
-    reads the one shared Elo scale that `rl/global_arena.py` maintains, so
+    machines), this reads the one shared Elo scale that `rl/global_arena.py` maintains, so
     "the 6 best" actually means something across the whole fleet.
 
     Read from the `registry.json` snapshot (a few minutes behind at worst), or
@@ -171,8 +168,7 @@ def build_players(
 
     With no `bot_keys`, the non-human seats cycle through the best-rated
     trained models found across every machine's pool (see
-    `discover_trained_models`) -- there is no hand-coded bot catalog to fall
-    back to any more. Raises a clear `ValueError` if there are seats to fill
+    `discover_trained_models`) -- there is nothing else to fall back to. Raises a clear `ValueError` if there are seats to fill
     and no trained model can be found for them, rather than silently seating
     nothing.
     """
@@ -210,9 +206,9 @@ def build_players(
 def print_available_bots() -> None:
     models = discover_trained_models()
     if not models:
-        print("No trained models found under checkpoints/. There is no hand-coded bot "
-              "catalog any more -- train a model first (see poker-train), or pass "
-              "--bots model:<path> to seat a specific checkpoint.")
+        print("No trained models found under checkpoints/. Train a model first "
+              "(see poker-train), or pass --bots model:<path> to seat a specific "
+              "checkpoint.")
         return
     print("Available bots -- trained models, best rating first:")
     for label, path, rating in models:
@@ -225,8 +221,7 @@ def validate_bot_key(key: str) -> None:
     the CLI's argparse validation and the GUI's form validation."""
     if not key.startswith(MODEL_PREFIX):
         raise ValueError(
-            f"unknown bot spec {key!r}; only 'model:<path>' is supported "
-            "(there is no hand-coded bot catalog any more)"
+            f"unknown bot spec {key!r}; only 'model:<path>' is supported"
         )
     path = Path(key[len(MODEL_PREFIX) :])
     if not path.is_file():

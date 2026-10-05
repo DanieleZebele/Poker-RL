@@ -28,6 +28,14 @@ packages = ["src/pokerlab"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "engine: engine, cards, evaluator, players, hand history (the default area)",
+    "rl: training, ratings, loop, dashboard",
+    "gui: Tkinter app, spot screen, screen reader",
+    "vision: screen capture and recognisers",
+    "config: config.toml loading",
+    "slow: launches real poker-loop / poker-train subprocesses",
+]
 
 [tool.ruff]
 line-length = 100

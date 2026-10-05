@@ -1,0 +1,99 @@
+
+[fleet]
+worker_ceiling = 25
+
+[elo]
+k_schedule = "0:16, 20:11, 45:7.4, 80:5, 140:3.4, 225:2.3, 325:1.6, 500:1.05, 750:0.72, 1200:0.49, 1700:0.33, 2500:0.22, 3750:0.15, 5500:0.1, 8500:0.07, 12000:0.047, 18000:0.032, 27500:0.022, 40000:0.015, 60000:0.01"
+session_hands = 1000  # Hands in one rated session, it defines the Elo scale.
+
+[game]
+table_weights = [25, 20, 15, 10, 10, 10, 5, 5]  # Table size 2..9 probability
+stack_min_bb = 1.0
+stack_max_bb = 100.0
+sb = 50
+bb = 100
+
+[training]
+iterations = 1000
+
+[network]
+hidden = 1024        # width of the shared trunk's layers
+num_layers = 5       # layers in the shared trunk
+head_hidden = 256    # width of the hidden layers of each head (policy and value)
+head_layers = 3      # hidden layers in each head before its output layer (0 = the output layer alone)
+
+[opponent-pool]
+pool_models = 50
+
+[inheritance]
+parent_tiers = "10, 100, 1000, all"   # Where a worker's parent comes from.
+
+[starting-point]
+lr = 0.0003
+hands = 512                # per iteration 
+opponent_probability = 0.5
+ppo_epochs = 4
+clip_epsilon = 0.2
+minibatch_size = 1024
+gae_lambda = 0.95
+value_coef = 0.5
+max_grad_norm = 0.5
+entropy_coef = 0.1
+pool_top_share = 0.5
+pool_top_n = 100
+
+[sweep]
+inherit_hyperparameters = false    # true: a worker perturbs its parent's settings (the sweep). false: every worker uses exactly [starting-point], no perturbation, no optimizer
+hp_multipliers = [0.5, 0.8, 1.0, 1.3, 2]
+sweep_optimizer = false    # true: steer the multipliers by Elo gained per unit of CPU (uniform until warmed up). false: uniform draw, the estimate is still logged
+sweep_explore = 0.35       # chance an axis is drawn uniformly anyway (keeps every effect measurable)
+sweep_warmup = 150         # children observed before the optimizer steers
+sweep_window = 1500        # most recent children it reads
+sweep_min_gain = 1.0       # Elo a unit of relative cost is worth, at least
+
+[validation]
+eval_every = 100           # iterations between passes (0 disables)
+eval_sessions = 10         # rated sessions per pass, each session_hands long
+
+[benchmark]
+benchmark_sessions = 500   # sessions against the frozen anchors before publishing
+benchmark_resident = 10    # anchors held in memory at once (a random slice of the frozen set)
+benchmark_rotate_every = 50  # sessions played against one slice before drawing the next
+
+[population-elo]
+global_elo = true
+global_sample = 50
+global_benchmark_sample = 5
+draw_tiers = "10, 100, 1000, all"   # Who the passes seat: equal share per tier.
+global_sessions = 100
+
+[fill-in]
+elo_fill_in = true         
+fill_deadline_minutes = 180
+fill_sessions = 10
+
+[pruning]
+global_trigger_size = 1000
+global_eliminate_fraction = 0.05
+global_protect_percentile = 25.0
+
+[anchors]
+benchmark_games_percentile = 90.0
+benchmark_margin = 20.0
+
+[benchmark-arena]
+arena_min_sessions = 10000      # never declare convergence before this many rated sessions
+arena_max_sessions = 100000     # safety cap, not a failure
+arena_tolerance = 1.0           # rating points of net drift over the window
+arena_window = 4000             # sessions the drift is measured across
+arena_checkpoint_sessions = 200  # sessions between two writes of the ratings (and convergence tests)
+
+
+
+[poker-elo]
+elo_sessions = 2000         # rated sessions poker-elo plays in total
+elo_coverage = "played"     # played: least played first; random: uniform like the automatic draw
+
+[dashboard]
+dashboard_port = 8770
+dashboard_refresh = 15     # seconds between polls

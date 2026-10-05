@@ -24,6 +24,8 @@ from pokerlab.rl.training_pool import (
     available_labels,
     build_training_registry,
     draw_training_pool,
+    format_parent_tiers,
+    parse_parent_tiers,
     pick_parents,
 )
 
@@ -64,8 +66,7 @@ def test_half_the_seats_come_from_the_top_and_the_rest_from_anywhere():
 
 
 def test_the_top_share_is_the_only_thing_that_favours_anyone():
-    """Nothing biases the remaining seats -- not the least-played models, which
-    used to have a share of their own. Over many draws from a store whose
+    """Nothing biases the remaining seats -- not the least-played models. Over many draws from a store whose
     never-rated models are a fifth of it, they take about a fifth of those
     seats."""
     ranking = ranking_of(top=(100, 2000.0, 200), mid=(300, 1500.0, 50))
@@ -277,3 +278,16 @@ def test_parents_come_from_every_band_of_the_ranking():
     ranks = [position[pick_parents(ranking, list(ranking), 1, rng=rng)[0]] for _ in range(2000)]
     assert 0.22 < sum(r < 10 for r in ranks) / 2000 < 0.36
     assert 0.10 < sum(r >= 1000 for r in ranks) / 2000 < 0.24
+
+
+def test_the_parent_bands_round_trip_through_their_text_form():
+    from pokerlab.rl.training_pool import PARENT_TIERS
+
+    assert parse_parent_tiers(format_parent_tiers(PARENT_TIERS)) == PARENT_TIERS
+    assert parse_parent_tiers("10, 10 ,ALL") == (10, 10, None)
+
+
+@pytest.mark.parametrize("text", ["", " , ", "ten", "0", "-3", "10, x"])
+def test_a_parent_band_that_is_not_a_size_or_all_is_refused(text):
+    with pytest.raises(ValueError):
+        parse_parent_tiers(text)

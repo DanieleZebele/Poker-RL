@@ -12,9 +12,8 @@ from pokerlab.rl.ppo import save_checkpoint
 
 
 def make_checkpoint(path: Path) -> Path:
-    """A minimal, fast-to-load checkpoint -- there is no bot catalog any
-    more (see CLAUDE.md, "Heuristic bots, removed"), so every non-human seat
-    in these CLI tests needs a real `model:<path>` to seat."""
+    """A minimal, fast-to-load checkpoint: every non-human seat in these CLI
+    tests needs a real `model:<path>` to seat."""
     save_checkpoint(path, PokerActorCritic(hidden=16, num_layers=1))
     return path
 
@@ -91,8 +90,8 @@ def test_session_ends_early_message_when_players_bust(tmp_path, capsys):
 
 
 def test_list_bots_does_not_play_a_session(capsys):
-    """`--list-bots` now lists discovered trained models rather than a fixed
-    catalog, so its exact output depends on whatever is under checkpoints/ on
+    """`--list-bots` lists discovered trained models, so its exact output
+    depends on whatever is under checkpoints/ on
     the machine running the tests -- the one thing every environment shares
     is that it must not play a session."""
     main(["--list-bots"])

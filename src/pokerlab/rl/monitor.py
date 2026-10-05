@@ -3,8 +3,7 @@
 Everything here is what a *watcher* needs: the supervisor's `loop_state.json`, the
 workers' own logs, and the formatting of both. It lives apart from `rl/loop.py`
 because `loop.py` imports `rl/ppo.py` for the benchmark, which imports torch --
-and on the NFS server under load, importing torch was measured at **over five
-minutes**. A monitoring tool that takes five minutes to start is not a monitoring
+and on the NFS server under load, importing torch can take **minutes**. A monitoring tool that takes five minutes to start is not a monitoring
 tool, so `rl/dashboard.py` imports this and never touches `loop.py`.
 
 `loop.py` re-exports these names, so `--status` and the tests keep importing them
@@ -36,6 +35,8 @@ from pokerlab.rl.phases import (
     parse_marker,
     parse_progress,
 )
+from pokerlab.rl.style_log import parse_style_line
+from pokerlab.rl.value_diagnostics import SIZE_KIND, STACK_KIND, parse_value_line
 
 STATE_FILENAME = "loop_state.json"
 STOP_FILENAME = "STOP"
@@ -90,47 +91,34 @@ STAGE_LABELS = {
 STAGE_ORDER = tuple(STAGE_LABELS)
 
 # The training column averages the latest **100,000 hands**, not a fixed number
-# of iterations. It was the last 10 iterations, which stopped being defensible
-# the moment `--hands` became a swept axis: a window of 10 iterations covers
-# 3,200 hands for a worker that drew 320 and 8,000 for one that drew 800, so two
-# rows of the same table carried noise differing by 1.58x -- and nothing said
-# which was which.
+# of iterations: with `--hands` a swept axis, a window of 10 iterations would
+# cover 3,200 hands for a worker that drew 320 and 8,000 for one that drew 800,
+# so two rows of the same table would carry different noise and nothing would
+# say which was which.
 #
-# **Measured on 1,488 real runs** at 512 hands/iteration: the reward of one
-# iteration has a standard deviation of **0.417 bb/hand**, which is 9.4 bb on a
-# single hand. Measured from the first differences between consecutive
+# Windows of a fixed number of hands put every worker's noise on the same footing
+# whatever it drew. Measure that noise from first differences between consecutive
 # iterations, not from the raw spread: a run improves over its life, and a raw
-# standard deviation charges that trend as noise (doing it the naive way on a
-# narrower sample gave 0.718, 1.7x too high, and the figures below were wrong
-# by the same factor until this was redone). That puts the old 10-iteration
-# window at **+/-13.2 bb/100**, against a column that reads between -3 and +3 --
-# mostly noise at the level anyone reads it. 100,000 hands take it to
-# **+/-3.0 bb/100**, the same for every worker whatever it drew, which is the
-# 4.4x the hand counts predict.
+# standard deviation charges that trend as noise.
 #
-# The cost is that the window is *partial* early in a run: at 512 hands an
-# iteration it fills at iteration 196, about a fifth into a 1000-iteration run
-# (a twelfth at 800 hands, a third at 320). Partial is still shown rather than
+# The cost is that the window is *partial* early in a run (at 512 hands an
+# iteration it fills at iteration 196). Partial is still shown rather than
 # blanked, because "is this worker alive and not collapsed" is what the column
 # is read for minute to minute, and `train_hands` says how much is behind it.
 REWARD_WINDOW_HANDS = 100_000
 # A log untouched this long, in a stage that should still be writing, means the
-# process is gone or wedged. Generous on purpose: the population round plays
+# process is gone or wedged. Generous on purpose: the population pass plays
 # tens of thousands of hands between two lines.
 STALE_LOG_SECONDS = 600
 
 # `train.py` prints the reward in bb *per hand*; every column that reports a
 # win rate in this project is bb/100, so the conversion happens here, at the
-# parse boundary, and `train_bb100` is bb/100 from then on. The log line's unit
-# is deliberately left alone: a worker launched before this change keeps writing
-# the old lines, and changing what the number means on disk would make the two
-# indistinguishable and wrong by a factor of 100.
+# parse boundary, and `train_bb100` is bb/100 from then on.
 _ITER_REWARD = re.compile(r"^iter\s+\d+\s+reward\s+([+-]?\d+(?:\.\d+)?)\s+bb")
 HANDS_PER_RATE = 100
 # How many hands one iteration collected, off the header line every worker
-# prints as it starts (`device cpu | 6 seats | 512 hands/iteration`). Read from
-# there rather than from the `iperparametri:` line because every log ever
-# written has it, including the years of logs that predate the sweep.
+# prints as it starts (`device cpu | tables 2:25% 3:20% ... | 512 hands/iteration`). Read from
+# there rather than from the `iperparametri:` line because every log has it.
 _HANDS_PER_ITERATION = re.compile(r"\|\s*(\d+)\s+hands/iteration")
 _ITER_ENTROPY = re.compile(r"entropy\s+(\S+)")
 _EVAL = re.compile(
@@ -142,21 +130,19 @@ _EVAL = re.compile(
 # so the same rating means different things in two rows of the same table.
 _PARENT_RATING = re.compile(r"rating ereditato (-?\d+)")
 _POOL_RATING = re.compile(r"^pool rating: media (-?\d+) min (-?\d+) max (-?\d+)\s*$")
-# The one line `train.py` prints when the round against the frozen anchors ends.
+# The one line `train.py` prints when the pass against the frozen anchors ends.
 # It carries the bb/100, the rating the model is published with and the session
-# count behind it -- which is the whole of what that round concluded, now that
-# there is no per-series breakdown to report. A log written before the series
-# were removed matches nothing here and leaves the two cells at "-", which is
-# what every reader already does with a run that has not reached the round.
+# count behind it -- which is the whole of what that pass concluded. A run
+# that has not reached the pass leaves the two cells at "-".
 _BENCHMARK_RATING = re.compile(
     r"benchmark: ([+-]?\d+(?:\.\d+)?) bb/100 su (\d+) sessioni contro (\d+) ancore, "
     r"rating (-?\d+(?:\.\d+)?)"
 )
 # The running figures `benchmark.rate_against_benchmark` puts in the detail of
 # its `avanzamento series` lines. They fill the same two cells as the final
-# result while the round is still playing, flagged as provisional.
-# The bb/100 is optional: workers launched before it was added report the rating
-# alone, and for them that is still worth putting in its column.
+# result while the pass is still playing, flagged as provisional.
+# The bb/100 is optional: a line may report the rating alone, and that is still
+# worth putting in its column.
 _SERIES_DETAIL = re.compile(
     r"rating (-?\d+(?:\.\d+)?)(?:, ([+-]?\d+(?:\.\d+)?) bb/100)?"
 )
@@ -178,7 +164,7 @@ class WorkerProgress:
     iterations: int = 0
     inherited: bool = False
     # The parent's published rating, from the `resumed from` line; None when the
-    # worker did not inherit or the log predates the figure.
+    # worker did not inherit or the log does not carry the figure.
     parent_rating: int | None = None
     stage: str = STAGE_STARTING
     train_bb100: float | None = None
@@ -192,27 +178,24 @@ class WorkerProgress:
     # Mean rating of the models this worker drew for its training field, "-" until
     # the draw is logged (or for a run with an empty store).
     pool_rating: str = "-"
-    # What this worker was configured with, as its own log reports it. Empty for
-    # a log written before the sweep existed, which every log on the volume was
-    # when it landed -- so every reader has to treat "not recorded" as normal
-    # rather than as an error.
+    # What this worker was configured with, as its own log reports it. Empty when
+    # the log has no `iperparametri:` line yet, so every reader has to treat "not
+    # recorded" as normal rather than as an error.
     hyperparameters: dict[str, str] = field(default_factory=dict)
     age: float | None = None
-    # What the round against the frozen anchors concluded: bb/100, the rating the
+    # What the pass against the frozen anchors concluded: bb/100, the rating the
     # model is published with, and how many rated sessions were behind it. All
-    # three stay empty until the run reaches that round, which is the last thing
-    # it does. There used to be a per-series breakdown here (`series`, a dict
-    # keyed by series name, and a matrix under the table); it went with the
-    # series themselves -- the round now draws opponents from the whole frozen
-    # set, so there is one number, not one per band.
+    # three stay empty until the run reaches that pass, which is the last thing
+    # it does. The pass draws opponents from the whole frozen set, so there is
+    # one number, not one per band.
     benchmark_bb100: float | None = None
     benchmark_rating: str = "-"
     benchmark_sessions: int = 0
-    # True while the two figures above are the running values of a round still
+    # True while the two figures above are the running values of a pass still
     # in progress, read off its `avanzamento` lines, not its conclusion.
     benchmark_live: bool = False
     # How far into the current stage the worker is, for the two stages that
-    # report it (the per-series round and the population round). None outside
+    # report it (the benchmark pass and the population pass). None outside
     # them, and cleared the moment a new stage is announced, so a percentage
     # shown next to a stage always belongs to that stage.
     progress: Progress | None = None
@@ -300,10 +283,6 @@ def parse_worker_log(name: str, text: str, *, age: float | None = None) -> Worke
                         benchmark_bb100 = float(running.group(2))
                     benchmark_sessions = reported.done
                     benchmark_live = True
-        elif line.startswith("global round"):
-            # The summary a run prints when its population round is over; new
-            # logs follow it with a `done` marker, old ones simply end here.
-            stage = DONE
         elif line.startswith("Traceback (most recent call last)"):
             stage = STAGE_ERROR
         else:
@@ -373,7 +352,7 @@ def worker_progress(
 def stage_label(row: WorkerProgress, target_iterations: int) -> str:
     """The stage as shown, sharpened by how far through training the worker is."""
     # Past the last iteration the ordinary "training" is really the wrap-up:
-    # saving, publishing, and the per-series round that rates the model.
+    # saving, publishing, and the benchmark pass that rates the model.
     if target_iterations and row.iterations >= target_iterations and row.stage == STAGE_TRAINING:
         return "fine training"
     return STAGE_LABELS.get(row.stage, row.stage)
@@ -479,8 +458,8 @@ def format_worker_table(rows: list[WorkerProgress], target_iterations: int) -> l
         "di training, contro pool e copie di se stesso (~+/-3 bb/100 a finestra piena; "
         "si riempie dopo ~1/5 della run); "
         "eval = ultima valutazione contro il pool; "
-        "ancore = giro finale contro le ancore congelate (con ~ = valore provvisorio, "
-        "il giro e' ancora in corso), elo ancore = rating con "
+        "ancore = passata finale contro le ancore congelate (con ~ = valore provvisorio, "
+        "la passata e' ancora in corso), elo ancore = rating con "
         "cui "
         "il modello entra nella classifica globale; pool = rating medio del campo "
         "che quel worker ha pescato, cioe' contro chi valgono eval e rating "
@@ -497,14 +476,6 @@ ARM_LABELS = {
     "sampled": "campionati",
     "inherited": "ereditati",
     "sampled-fallback": "campionati (genitore senza metadati)",
-    # A worker launched by a supervisor that predates the sweep: it runs
-    # perfectly well (no flag was removed, so nothing breaks) but it was given
-    # no arm, because its supervisor does not know about arms. `poker-train`
-    # records `hp_arm=""` in that case. Naming it is what turns an otherwise
-    # puzzling row into the one operational fact worth knowing -- a supervisor
-    # is a process that lives for weeks and only picks up new behaviour when it
-    # is restarted, so this is how the fleet says which hosts still need it.
-    "": "senza sweep: supervisor da riavviare",
 }
 
 
@@ -526,7 +497,7 @@ def format_sweep_line(rows: list[WorkerProgress]) -> list[str]:
     dashboard's expanded panel, and in each worker's own log.
 
     Absent entirely when no worker recorded any, which is every log written
-    before the sweep existed -- not an error, just nothing to say.
+    yet -- not an error, just nothing to say.
     """
     recorded = [row for row in rows if row.hyperparameters]
     if not recorded:
@@ -563,14 +534,14 @@ def format_finishing_line(rows: list[WorkerProgress]) -> list[str]:
 
     The end of a generation is the part that looks stuck: the workers have
     finished training, their bars all read 100%, and they then spend an hour or
-    more in the per-series and population rounds. The per-worker cells say how
+    more in the benchmark and population passes. The per-worker cells say how
     far each one is; this says when the machine as a whole should be free, which
     is the number a supervisor is waiting on -- a generation ends when its
     *slowest* worker does, so the line reports the longest ETA, not the mean.
 
     **The workers filling in are counted apart, and must be.** A worker in
     `ELO_FILL` has finished everything of its own and is playing extra rating
-    rounds precisely *because* it is waiting for the others; folding it in here
+    passes precisely *because* it is waiting for the others; folding it in here
     would have it report an ETA of its own safety cap -- hours -- and, being the
     longest, that cap would become the generation's answer to "how much longer",
     which is exactly backwards. It is the one worker the generation is certainly
@@ -596,7 +567,7 @@ def format_finishing_line(rows: list[WorkerProgress]) -> list[str]:
         row.progress.eta_seconds for row in reporting if row.progress.eta_seconds is not None
     ]
     line = (
-        f"fine  : {len(reporting)}/{len(rows)} worker nei giri finali "
+        f"fine  : {len(reporting)}/{len(rows)} worker nelle passate finali "
         f"(elo e ancore), avanzamento medio {mean_percent:.0f}%"
     )
     if etas:
@@ -697,6 +668,23 @@ class WorkerHistory:
     clip: list[float] = field(default_factory=list)
     eval_bb100: list[list[float]] = field(default_factory=list)
     eval_rating: list[list[float]] = field(default_factory=list)
+    # The critic's target by table size and by effective stack (`rl/value_diagnostics`),
+    # one `[iteration, value]` pair per reading -- the first iteration and every
+    # tenth -- like the two readings above, and for the same reason. The sd and
+    # explained variance are keyed by group (`"2"`..`"9"`, `"<10"`...), the spread
+    # is the widest sd over the narrowest. Empty for a log that predates the lines.
+    value_sd_size: dict[str, list[list[float]]] = field(default_factory=dict)
+    value_sd_stack: dict[str, list[list[float]]] = field(default_factory=dict)
+    value_ev_stack: dict[str, list[list[float]]] = field(default_factory=dict)
+    value_spread_size: list[list[float]] = field(default_factory=list)
+    value_spread_stack: list[list[float]] = field(default_factory=list)
+    # How the model plays (`rl/style_log.py`): each statistic's rate over its recent
+    # training hands, one `[iteration, rate]` pair per reading (the first iteration
+    # and every tenth), and the last reading's raw `[events, opportunities]` with the
+    # seat-hands behind it. A statistic with no opportunity yet has no point.
+    style_rate: dict[str, list[list[float]]] = field(default_factory=dict)
+    style_latest: dict[str, list[int]] = field(default_factory=dict)
+    style_hands: int = 0
     total_iterations: int = 0
 
 
@@ -747,6 +735,12 @@ def parse_worker_history(
     rows: list[tuple[float, ...]] = []
     eval_bb: list[list[float]] = []
     eval_rating: list[list[float]] = []
+    value_sd: dict[str, dict[str, list[list[float]]]] = {SIZE_KIND: {}, STACK_KIND: {}}
+    value_ev: dict[str, list[list[float]]] = {}
+    value_spread: dict[str, list[list[float]]] = {SIZE_KIND: [], STACK_KIND: []}
+    style_rate: dict[str, list[list[float]]] = {}
+    style_latest: dict[str, list[int]] = {}
+    style_hands = 0
     hands_per_iteration = 0
     for line in text.splitlines():
         if line.startswith("device "):
@@ -758,6 +752,32 @@ def parse_worker_history(
             if matched:
                 steps.append(int(matched.group(1)))
                 rows.append(tuple(float(matched.group(i)) for i in range(2, 8)))
+        elif line.startswith("stile "):
+            parsed_style = parse_style_line(line)
+            if parsed_style is not None and steps:
+                style_hands = parsed_style.hands
+                style_latest = {
+                    stat: [events, chances]
+                    for stat, (events, chances) in parsed_style.rates.items()
+                }
+                for stat, (events, chances) in parsed_style.rates.items():
+                    if chances > 0:
+                        style_rate.setdefault(stat, []).append([steps[-1], events / chances])
+        elif line.startswith("valore "):
+            # Printed right after the `iter` line it describes, so it belongs to
+            # the last iteration read.
+            parsed = parse_value_line(line)
+            if parsed is not None and steps:
+                for group, stats in parsed.groups.items():
+                    value_sd[parsed.kind].setdefault(group, []).append(
+                        [steps[-1], stats.target_sd]
+                    )
+                    if parsed.kind == STACK_KIND and stats.explained_variance is not None:
+                        value_ev.setdefault(group, []).append(
+                            [steps[-1], stats.explained_variance]
+                        )
+                if parsed.spread is not None:
+                    value_spread[parsed.kind].append([steps[-1], parsed.spread])
         elif "eval vs pool:" in line:
             matched = _EVAL.search(line)
             if matched and steps:
@@ -780,6 +800,14 @@ def parse_worker_history(
         clip=column(5),
         eval_bb100=eval_bb,
         eval_rating=eval_rating,
+        value_sd_size=value_sd[SIZE_KIND],
+        value_sd_stack=value_sd[STACK_KIND],
+        value_ev_stack=value_ev,
+        value_spread_size=value_spread[SIZE_KIND],
+        value_spread_stack=value_spread[STACK_KIND],
+        style_rate=style_rate,
+        style_latest=style_latest,
+        style_hands=style_hands,
         total_iterations=len(rows),
     )
 

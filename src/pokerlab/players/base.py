@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 
 from pokerlab.cards.card import Card
 from pokerlab.engine.actions import Action, LegalAction
@@ -39,9 +40,17 @@ class Observation:
     seats: tuple[SeatPublicInfo, ...]
     button_seat: int
     action_history: tuple[ActionRecord, ...]  # this hand only, so far
+    # Optional opponent statistics (`engine/stats.py`): per seat, up to `STAT_SLOTS`
+    # numbers in [0, 1]. A seat with no entry -- no tracker, a player never seen --
+    # is simply unknown; nothing downstream treats "not given" as an error.
+    seat_stats: Mapping[int, tuple[float, ...]] = field(default_factory=dict)
 
 
-def build_observation(hand_state: HandState, seat: int) -> Observation:
+def build_observation(
+    hand_state: HandState,
+    seat: int,
+    seat_stats: Mapping[int, tuple[float, ...]] | None = None,
+) -> Observation:
     ps = hand_state.seat_state(seat)
     assert ps.hole_cards is not None, "observation requested for a seat with no hole cards dealt"
     seats = tuple(
@@ -68,6 +77,7 @@ def build_observation(hand_state: HandState, seat: int) -> Observation:
         seats=seats,
         button_seat=hand_state.button_seat,
         action_history=tuple(hand_state.action_log),
+        seat_stats=dict(seat_stats) if seat_stats else {},
     )
 
 

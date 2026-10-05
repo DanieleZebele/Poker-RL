@@ -74,7 +74,7 @@ DEFAULT_GLOBAL_DIR = Path("checkpoints/global")
 DEFAULT_ROOT = Path("checkpoints")
 DEFAULT_FIELD_DIR = Path("checkpoints/benchmark")
 
-# The grid deliberately runs well past what anyone plays: the population round's
+# The grid deliberately runs well past what anyone plays: the population pass's
 # session is 1,000 hands and so is a rated session everywhere else, so the lengths
 # have to be readable straight off the table, and the lengths beyond them are
 # what say how far short they fall.
@@ -898,7 +898,7 @@ def load_measurement(path: Path) -> DuelMeasurement:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    from pokerlab.rl.global_arena import DEFAULT_HANDS_PER_GAME
+    from pokerlab.rl.table_mix import DEFAULT_SESSION_HANDS
 
     parser = argparse.ArgumentParser(
         description="Quante mani deve durare una partita perche' vinca il modello "
@@ -914,7 +914,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--mode", choices=("teams", "field"), default="teams",
                         help="teams: meta' tavolo per modello, e' il confronto piu' pulito. "
                         "field: un solo seggio a testa e gli altri riempiti da modelli "
-                        "terzi, cioe' esattamente cio' che misura un round di popolazione")
+                        "terzi, cioe' esattamente cio' che misura una passata di popolazione")
     parser.add_argument("--field-dir", type=Path, default=DEFAULT_FIELD_DIR,
                         help="da dove pescare i riempitivi in --mode field (default: le "
                         "ancore congelate, che non sono mai sedute in training)")
@@ -941,7 +941,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--sessions", type=int, default=DEFAULT_SESSIONS_SHOWN,
                         help="quante partite per lunghezza mostrare nella distribuzione "
                         f"(default: {DEFAULT_SESSIONS_SHOWN})")
-    parser.add_argument("--session-hands", type=int, default=DEFAULT_HANDS_PER_GAME,
+    parser.add_argument("--session-hands", type=int, default=DEFAULT_SESSION_HANDS,
                         help="la lunghezza di partita usata davvero dal progetto, "
                         "commentata in fondo al rapporto")
     parser.add_argument("--jobs", type=int, default=1,

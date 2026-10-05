@@ -5,7 +5,7 @@ blocked in `process.wait()` and learns nothing until the process exits. The log
 is the only channel, so a worker writes a `phase: <name>` line as it enters each
 stage and the watcher reads the last one. This module is the whole vocabulary,
 shared by the three places that must agree on it (the worker that prints, the
-population round that announces its own stages, and the watcher that parses),
+population pass that announces its own stages, and the watcher that parses),
 so a name cannot drift between them.
 
 Pure Python, no torch: the watcher and the tests import it freely.
@@ -20,13 +20,10 @@ MARKER_PREFIX = "phase: "
 
 EVALUATION = "evaluation"  # the learner plays the drawn pool to earn a rating
 SERIES = "series"  # the published model is rated against the frozen anchors
-# The marker string stays `series` although there are no series any more: it is
-# the word a worker writes and the watcher reads, so changing it would only make
-# logs from before and after the change indistinguishable.
-ELO_PLAY = "elo_play"  # end-of-run population round: playing the games
+ELO_PLAY = "elo_play"  # end-of-run population pass: playing the games
 ELO_MERGE = "elo_merge"  # ... folding the results into the shared ratings
 PRUNING = "pruning"  # ... and deleting the weakest models, when it is due
-# Extra population rounds a worker that finished early plays while the rest of
+# Extra population passes a worker that finished early plays while the rest of
 # its generation is still training. A separate name from ELO_PLAY on purpose:
 # both are the same machinery, but one is a worker doing its own run's last
 # stage and the other is a worker *waiting*, and `--status` has to be able to
@@ -97,7 +94,7 @@ def parse_hyperparameters(line: str) -> dict[str, str] | None:
 # "I am only filling time now" by creating `FILL_DRAINING_FILENAME` in its own
 # scratch directory, the supervisor polls for one per worker, and when every
 # worker is either gone or draining it creates `FILL_STOP_FILENAME` in its state
-# directory, which every worker polls between rounds. Both are created and
+# directory, which every worker polls between passes. Both are created and
 # deleted, never written to, so there is no partial-read problem and nothing to
 # parse; both live on the machine's *own* disk, never on the shared volume, so
 # two machines cannot stop each other's workers.
@@ -123,8 +120,8 @@ def parse_marker(line: str) -> str | None:
 #
 # A stage marker says *what* a worker is doing; these lines say *how far in* it
 # is. They exist for the two stages that take the best part of an hour each and
-# print, between them, four lines: the population round (`ELO_PLAY`) and the
-# benchmark round (`SERIES`). Without them `--status` can only show
+# print, between them, four lines: the population pass (`ELO_PLAY`) and the
+# benchmark pass (`SERIES`). Without them `--status` can only show
 # "elo: gioco" for ninety minutes -- long enough that the 10-minute stale-log
 # warning fires routinely on a worker that is perfectly healthy -- and cannot
 # answer the one question actually being asked, which is how much is left.
@@ -145,8 +142,8 @@ _PROGRESS_ETA = re.compile(r"~(\d+)m rimasti")
 class Progress:
     """How far into `stage` a worker is, as its log reports it.
 
-    `done`/`total` are whatever unit the stage counts (sessions for the series
-    round, owed games for the population round); `detail` is free text for the
+    `done`/`total` are whatever unit the stage counts (sessions for the benchmark
+    pass, and for the population pass); `detail` is free text for the
     reader and nothing decides anything from it.
     """
 

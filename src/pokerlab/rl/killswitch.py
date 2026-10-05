@@ -3,7 +3,7 @@
 `./run.sh stop` is the polite way out: it lets the generation in flight finish.
 This is the other one, for when that is too slow or the loop is wedged. It does
 not ask any process to wind down and it does not care what stage one is in --
-training, benchmark, the Elo round, a pruning pass, or hung on a read: it freezes
+training, benchmark, the Elo pass, a pruning pass, or hung on a read: it freezes
 the whole tree and then kills it.
 
 Two properties matter, and both are why this is not just `pkill -f poker-`:
@@ -15,7 +15,7 @@ Two properties matter, and both are why this is not just `pkill -f poker-`:
     rescanned until no new member turns up; and only then does SIGKILL go out to
     all of them. A frozen supervisor cannot spawn the worker that would survive.
   * **Only this machine's loop.** Processes are matched by what they run (the
-    supervisor, `poker-train`, the global-round shards) *and* by naming this
+    supervisor, `poker-train`, the global-elo shards) *and* by naming this
     machine's state or work directory on their command line, plus everything
     that descends from them. Another loop, a hand-started `poker-train` in a
     different directory, or an editor with one of these words in its arguments is

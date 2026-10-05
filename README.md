@@ -3,18 +3,18 @@
 A No-Limit Texas Hold'em engine, built as the foundation for a future
 reinforcement-learning poker project.
 
-The long-term plan has four parts:
+The project has five parts:
 
 1. **Game engine** — configurable players, stacks and blinds, with a full
    hand-history log of every action. *(done)*
-2. **Players** — a manual (human, terminal-driven) player and scripted bots
-   with a few preset strategies. *(done)*
-3. **Reinforcement learning** — training scripts where an agent learns to
-   play against the bots or against itself (self-play). *(not started —
-   see `src/pokerlab/rl/env.py` for the planned interface)*
-4. **Live table recognition** — identifying cards and players from a
-   screen capture of a poker application. *(not started — see
-   `src/pokerlab/vision/reader.py` for the planned interface)*
+2. **Players** — a manual (human, terminal-driven) player and trained
+   models as opponents (`model:<path>`). *(done)*
+3. **Reinforcement learning** — self-play PPO against a pool of previously
+   trained models, with a population-wide Elo ranking. *(done — see
+   `src/pokerlab/rl/`)*
+4. **Live table recognition** — identifying cards, the dealer button, seat
+   states, bets, the pot and stacks from a screen capture of a poker
+   application. *(done — see `src/pokerlab/vision/`)*
 
 A simple Tkinter GUI for playing/testing live (instead of the terminal) is
 also available — see "Playing with the GUI" below.
@@ -52,23 +52,20 @@ poker-gui
 ```
 
 Opens a setup screen (players, stack, blinds, hands, bot selection --
-accepts the same catalog keys and `custom:...` spec as `--bots` below) and
+accepts the same `model:<path>` specs as `--bots` below) and
 then a live table screen with clickable action buttons for your seat.
 
 ## Playing a session (terminal)
 
 ```powershell
-# see the available bot personalities and their difficulty (1 = weakest, 5 = strongest)
+# see the best trained models found
 poker-play --list-bots
 
 # 6 players, one of them you (seat 0), the rest bots
 poker-play --players 6 --stack 200 --sb 1 --bb 2 --hands 10 --human-seats 1
 
-# pick which bots fill the non-human seats (cycled if there are more seats than keys)
-poker-play --players 4 --human-seats 1 --bots rock,shark,maniac
-
-# or tune a one-off bot's own probabilities instead of using a preset
-poker-play --players 2 --bots "custom:tightness=0.1;aggression=0.9;bluff_frequency=0.4;size_variance=0.7"
+# pick which models fill the non-human seats (cycled if there are more seats than specs)
+poker-play --players 4 --human-seats 1 --bots model:checkpoints/models/<a-model>.pt
 
 # fully unattended bot-only run, reproducible via --seed
 poker-play --players 9 --hands 500 --human-seats 0 --seed 42
@@ -93,11 +90,11 @@ src/pokerlab/
   evaluator/   hand-strength evaluation (5-7 cards -> best 5-card hand)
   engine/      GameConfig, betting rules, side pots, Table orchestration,
                hand-history read/write
-  players/     Player interface, ManualPlayer, ScriptedBot strategies, GuiPlayer
+  players/     Player interface, ManualPlayer, RLAgentPlayer, GuiPlayer
   cli/         `poker-play` command-line entrypoint
   gui/         `poker-gui` Tkinter desktop app
-  rl/          (stub) future self-play training environment
-  vision/      (stub) future live screen-capture card/player recognition
+  rl/          self-play PPO, opponent pool, Elo ranking, continuous training loop
+  vision/      live screen-capture recognition (cards, dealer, seats, amounts)
 tests/
   unit/        engine, evaluator, players, hand history
   integration/ full multi-hand sessions with a chip-conservation fuzz test

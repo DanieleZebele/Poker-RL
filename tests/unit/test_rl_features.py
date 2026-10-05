@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import math
 import random
 
@@ -12,6 +13,7 @@ from pokerlab.engine.actions import Action, LegalAction
 from pokerlab.engine.betting import compute_legal_actions, post_blinds
 from pokerlab.engine.config import GameConfig
 from pokerlab.engine.state import HandState, PlayerState, Street
+from pokerlab.engine.stats import STAT_SLOTS
 from pokerlab.engine.table import Table
 from pokerlab.players.base import Observation, Player, build_observation
 from pokerlab.rl.action_space import ACTION_DIM, legal_action_mask
@@ -23,6 +25,7 @@ from pokerlab.rl.features import (
     MAX_SEATS,
     OBS_DIM,
     POT_SCALARS_DIM,
+    SEAT_BASE_FEATURES,
     SEAT_FEATURES,
     SEATS_DIM,
     STREET_DIM,
@@ -224,3 +227,76 @@ def test_encoding_is_deterministic():
     observation = build_observation(hs, 0)
     legal = compute_legal_actions(hs, 0)
     assert encode(observation, legal) == encode(observation, legal)
+
+
+# ---- opponent statistics: optional slots on every seat -----------------------
+
+
+def three_handed():
+    hole = {
+        0: (Card.parse("Ah"), Card.parse("Kd")),
+        1: (Card.parse("7c"), Card.parse("2s")),
+        2: (Card.parse("Tc"), Card.parse("Th")),
+    }
+    hs = make_hand({0: 200, 1: 150, 2: 100}, hole, button_seat=0)
+    post_blinds(hs, sb_seat=1, bb_seat=2)
+    return hs
+
+
+def seat_block(vector: list[float], slot: int) -> list[float]:
+    start = SEATS_OFFSET + slot * SEAT_FEATURES
+    return vector[start : start + SEAT_FEATURES]
+
+
+def test_every_seat_has_room_for_a_hundred_statistics_after_its_nine_features():
+    assert STAT_SLOTS == 100
+    assert SEAT_FEATURES == SEAT_BASE_FEATURES + STAT_SLOTS == 109
+    assert OBS_DIM == 1380
+
+
+def test_without_statistics_every_stat_slot_is_zero():
+    hs = three_handed()
+    vector = encode(build_observation(hs, 0), compute_legal_actions(hs, 0))
+    for slot in range(MAX_SEATS):
+        assert seat_block(vector, slot)[SEAT_BASE_FEATURES:] == [0.0] * STAT_SLOTS
+
+
+def test_supplied_statistics_land_in_that_seats_slots_relative_to_the_observer():
+    hs = three_handed()
+    stats = {1: (1.0, 0.5, 0.25), 2: (1.0, 0.9)}
+    legal = compute_legal_actions(hs, 0)
+    as_seat_0 = encode(dataclasses.replace(build_observation(hs, 0), seat_stats=stats), legal)
+    # Seat 1 is one to my left, seat 2 two: slots follow the seating relative to me.
+    assert seat_block(as_seat_0, 1)[SEAT_BASE_FEATURES : SEAT_BASE_FEATURES + 4] == [1.0, 0.5, 0.25, 0.0]
+    assert seat_block(as_seat_0, 2)[SEAT_BASE_FEATURES : SEAT_BASE_FEATURES + 3] == [1.0, 0.9, 0.0]
+    assert seat_block(as_seat_0, 0)[SEAT_BASE_FEATURES:] == [0.0] * STAT_SLOTS  # I was not given mine
+
+    legal_1 = compute_legal_actions(hs, 1)
+    as_seat_1 = encode(dataclasses.replace(build_observation(hs, 1), seat_stats=stats), legal_1)
+    assert seat_block(as_seat_1, 0)[SEAT_BASE_FEATURES : SEAT_BASE_FEATURES + 3] == [1.0, 0.5, 0.25]
+
+
+def test_giving_statistics_changes_nothing_but_the_stat_slots():
+    hs = three_handed()
+    legal = compute_legal_actions(hs, 0)
+    plain = encode(build_observation(hs, 0), legal)
+    given = encode(dataclasses.replace(build_observation(hs, 0), seat_stats={1: (1.0, 0.7)}), legal)
+    changed = [i for i, (a, b) in enumerate(zip(plain, given)) if a != b]
+    stat_start = SEATS_OFFSET + 1 * SEAT_FEATURES + SEAT_BASE_FEATURES
+    assert changed == [stat_start, stat_start + 1]
+    assert given[stat_start : stat_start + 2] == [1.0, 0.7]
+
+
+def test_statistics_are_clipped_into_the_unit_interval():
+    hs = three_handed()
+    legal = compute_legal_actions(hs, 0)
+    vector = encode(dataclasses.replace(build_observation(hs, 0), seat_stats={1: (1.0, 7.0, -3.0)}), legal)
+    assert seat_block(vector, 1)[SEAT_BASE_FEATURES : SEAT_BASE_FEATURES + 3] == [1.0, 1.0, 0.0]
+
+
+def test_more_statistics_than_the_encoding_has_room_for_is_an_error_not_a_truncation():
+    hs = three_handed()
+    legal = compute_legal_actions(hs, 0)
+    too_many = tuple([0.5] * (STAT_SLOTS + 1))
+    with pytest.raises(ValueError, match="room for"):
+        encode(dataclasses.replace(build_observation(hs, 0), seat_stats={1: too_many}), legal)

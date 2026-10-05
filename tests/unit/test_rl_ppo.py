@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import math
 import random
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 torch = pytest.importorskip("torch")
+
+from support import fixed_mix
 
 from pokerlab.engine.config import GameConfig
 from pokerlab.engine.table import Table
@@ -16,7 +19,6 @@ from pokerlab.rl.features import FEATURE_VERSION, OBS_DIM
 from pokerlab.rl.global_store import read_sidecar
 from pokerlab.rl.policy import PokerActorCritic
 from pokerlab.rl.pool_registry import (
-    DEFAULT_K_FACTOR,
     DEFAULT_K_SCHEDULE,
     DEFAULT_RATING,
     PoolMember,
@@ -110,12 +112,16 @@ def test_update_returns_finite_diagnostics(model):
     stats = ppo_update(model, optimizer, batch, PPOConfig(epochs=2, minibatch_size=16))
 
     assert set(stats) == {
-        "policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction", "grad_norm"
+        "policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction", "grad_norm",
+        "adv_mean", "adv_std",
     }
     for name, value in stats.items():
         assert math.isfinite(value), f"{name} was not finite"
     assert stats["approx_kl"] >= 0.0
     assert 0.0 <= stats["clip_fraction"] <= 1.0
+    # Raw (pre-normalisation) advantage statistics: a constant batch of 1.0.
+    assert stats["adv_mean"] == pytest.approx(1.0)
+    assert stats["adv_std"] == pytest.approx(0.0, abs=1e-6)
 
 
 def test_a_positive_advantage_makes_the_taken_action_more_likely(model):
@@ -222,7 +228,7 @@ def test_a_model_is_rebuilt_at_the_shape_it_was_trained_with(tmp_path):
 
 def test_a_stale_or_unreadable_checkpoint_is_skipped_not_fatal(tmp_path):
     """The store is shared and long-lived; one bad file must not stop training."""
-    game = GameConfig(num_players=3, starting_stack=100, small_blind=1, big_blind=2)
+    game = fixed_mix(3)
     save_checkpoint(tmp_path / "good.pt", PokerActorCritic(hidden=32, num_layers=1))
     (tmp_path / "garbage.pt").write_text("not a checkpoint at all")
 
@@ -246,7 +252,7 @@ def test_a_stale_or_unreadable_checkpoint_is_skipped_not_fatal(tmp_path):
 
 
 def test_drawn_opponents_join_the_trainer_pool(tmp_path):
-    game = GameConfig(num_players=3, starting_stack=100, small_blind=1, big_blind=2)
+    game = fixed_mix(3)
     save_checkpoint(tmp_path / "veteran.pt", PokerActorCritic(hidden=32, num_layers=1))
     registry = PoolRegistry(directory=tmp_path)
     registry.members["veteran"] = PoolMember(label="veteran", kind="model", ref="veteran.pt")
@@ -263,7 +269,7 @@ def test_drawn_opponents_join_the_trainer_pool(tmp_path):
 
 
 def test_a_training_iteration_runs_end_to_end_and_updates_the_weights():
-    game = GameConfig(num_players=3, starting_stack=100, small_blind=1, big_blind=2)
+    game = fixed_mix(3)
     trainer = SelfPlayTrainer(
         game,
         TrainConfig(hands_per_iteration=20),
@@ -285,8 +291,8 @@ def test_a_training_iteration_runs_end_to_end_and_updates_the_weights():
 # ---- the ranked pool -----------------------------------------------------
 
 
-def small_game() -> GameConfig:
-    return GameConfig(num_players=3, starting_stack=100, small_blind=1, big_blind=2)
+def small_game():
+    return fixed_mix(3)
 
 
 def registry_with_models(tmp_path, count: int, *, max_models: int = 20) -> PoolRegistry:
@@ -329,8 +335,7 @@ def test_registry_opponents_reuse_one_load_for_a_duplicated_member(tmp_path):
 
 
 def test_registry_opponents_is_empty_with_no_models(tmp_path):
-    """There is no catalog to fall back to any more (see CLAUDE.md,
-    "Heuristic bots, removed"): an empty registry seats nothing."""
+    """There is nothing to fall back to: an empty registry seats nothing."""
     registry = PoolRegistry(directory=tmp_path)
     assert registry_opponents(registry, small_game(), count=6) == []
 
@@ -459,12 +464,13 @@ def test_the_learner_can_actually_reach_the_rating_of_the_pool_it_beats(tmp_path
         rating += deltas["learner"]
 
     assert rating > pool_rating
-    # Same ten sessions at the flat K: nowhere near.
+    # Same ten sessions at the flat K of 8 the rating used to be run with: nowhere near.
+    flat_k = 8.0
     flat = DEFAULT_RATING
     for _ in range(10):
         results = {"learner": 100.0} | {f"m{i}": -20.0 for i in range(5)}
         ratings = {"learner": flat} | {f"m{i}": pool_rating for i in range(5)}
-        flat += pairwise_elo_delta(results, ratings, k_factor=DEFAULT_K_FACTOR)["learner"]
+        flat += pairwise_elo_delta(results, ratings, k_factors=dict.fromkeys(results, flat_k))["learner"]
     assert flat < pool_rating
 
 
@@ -492,8 +498,7 @@ def test_archiving_saves_the_weights_with_the_learners_rating_beside_them(tmp_pa
 
 
 def test_archiving_touches_no_registry_and_moves_nothing(tmp_path):
-    """The model is published once, at the end of the run: archiving mid-run
-    must not edit any ranking or file, so a label never changes weights."""
+    """The model is published once, at the end of the run: archiving must not edit any ranking or file, so a label never changes weights."""
     registry = registry_with_models(tmp_path, 2)
     before = {label: (m.rating, m.games) for label, m in registry.members.items()}
     trainer = SelfPlayTrainer(
@@ -511,9 +516,10 @@ def test_archiving_touches_no_registry_and_moves_nothing(tmp_path):
     assert (tmp_path / "agent-0.pt").exists() and (tmp_path / "agent-1.pt").exists()
 
 
-def test_re_archiving_the_same_path_overwrites_the_best_so_far_in_place(tmp_path):
-    """`main()` reuses one path across a whole run to keep only its best model
-    on disk: the second call must replace both the weights and the recorded rating."""
+def test_re_archiving_the_same_path_overwrites_in_place(tmp_path):
+    """`main()` writes the final archive, then rewrites it with the run's outcomes
+    before publishing: the second call must replace both the weights and the
+    recorded rating."""
     trainer = SelfPlayTrainer(
         small_game(),
         TrainConfig(hands_per_iteration=10),
@@ -561,7 +567,7 @@ def test_a_checkpoint_can_be_seated_by_path(tmp_path):
 
     path = tmp_path / "agent.pt"
     save_checkpoint(path, PokerActorCritic(hidden=32, num_layers=1))
-    game = small_game()
+    game = GameConfig(num_players=3, starting_stack=100, small_blind=1, big_blind=2)
     spec = f"model:{path}"
     validate_bot_key(spec)
 
@@ -592,7 +598,7 @@ def test_a_table_of_trained_models_plays_without_errors(tmp_path):
 
     for index in range(3):
         save_checkpoint(tmp_path / f"a{index}.pt", PokerActorCritic(hidden=32, num_layers=1))
-    game = small_game()
+    game = GameConfig(num_players=3, starting_stack=100, small_blind=1, big_blind=2)
     keys = [f"model:{tmp_path / f'a{i}.pt'}" for i in range(3)]
 
     table = Table(game, build_players(3, 0, random.Random(1), keys, game=game), rng=random.Random(1))
@@ -764,8 +770,9 @@ def _train_args(**overrides):
     from types import SimpleNamespace
 
     values = {
-        "hp_arm": "sampled", "machine": "host-a", "seed": 7, "resume": False,
-        "iterations": 1000, "hands": 512, "players": 6, "stack": 200, "sb": 1, "bb": 2,
+        "hp_arm": "sampled", "parent_label": "", "hidden": 512, "num_layers": 3, "head_hidden": 256, "head_layers": 1, "machine": "host-a", "seed": 7, "resume": False,
+        "iterations": 1000, "hands": 512, "table_weights": [25.0, 20.0, 15.0, 10.0, 10.0, 10.0, 5.0, 5.0],
+        "stack_min_bb": 1.0, "stack_max_bb": 100.0, "sb": 50, "bb": 100,
         "lr": 3e-4, "ppo_epochs": 4, "clip_epsilon": 0.2, "entropy_coef": 0.0,
         "opponent_probability": 0.5,
         "minibatch_size": 1024, "gae_lambda": 0.95, "value_coef": 0.5, "max_grad_norm": 0.5,
@@ -827,20 +834,22 @@ def test_a_schema_version_travels_with_it():
 
 # ---- the Elo fill-in phase --------------------------------------------------
 
+GAME6 = fixed_mix(6, stack_bb=100)
+
 
 def _fill_args(tmp_path, **overrides):
     values = {
         "scratch_dir": tmp_path / "scratch",
         "fill_stop_file": str(tmp_path / "FILL_STOP"),
-        "fill_min_sessions": 10,
         "fill_deadline_minutes": 60.0,
-        "fill_games_per_model": 1,
+        "fill_sessions": 10, "draw_tiers": "10, 100, 1000, all",
         "global_dir": tmp_path / "global",
         "global_root": tmp_path,
         "global_sample": 50,
         "global_benchmark_sample": 5,
-        "global_hands_per_game": 1000,
+        "session_hands": 1000,
         "global_lock_seconds": 120,
+        "k_schedule": "0:16, 100:2",
         "machine": "host-a",
         "device": "cpu",
     }
@@ -848,19 +857,24 @@ def _fill_args(tmp_path, **overrides):
     return SimpleNamespace(**values)
 
 
-class FakeRound:
-    """Stands in for `run_population_round`, recording how it was called."""
+class FakeSessions:
+    """Stands in for `run_population_sessions`, recording how it was called."""
 
-    def __init__(self, *, sessions_played=4, played=55):
+    def __init__(self, *, sessions_played=4, played=55, stop_after=None, stop_file=None):
         self.calls = []
         self._sessions = sessions_played
         self._played = played
+        # The supervisor's stop flag going up after this many passes.
+        self._stop_after = stop_after
+        self._stop_file = stop_file
 
     def __call__(self, **kwargs):
-        from pokerlab.rl.global_arena import PopulationRoundReport
+        from pokerlab.rl.global_arena import PopulationSessionsReport
 
         self.calls.append(kwargs)
-        return PopulationRoundReport(
+        if self._stop_after is not None and len(self.calls) >= self._stop_after:
+            self._stop_file.touch()
+        return PopulationSessionsReport(
             played=self._played,
             sessions_played=self._sessions,
             # Far larger, as on a real fleet: this merge folded in every other
@@ -869,11 +883,11 @@ class FakeRound:
         )
 
 
-def _patch_round(monkeypatch, fake):
+def _patch_sessions(monkeypatch, fake):
     import pokerlab.rl.global_arena as arena
     import pokerlab.rl.train as train_module
 
-    monkeypatch.setattr(arena, "run_population_round", fake)
+    monkeypatch.setattr(arena, "run_population_sessions", fake)
     # Only `.members` is read, to build the rating map the top bias needs.
     monkeypatch.setattr(
         train_module, "load_ranking", lambda _dir: SimpleNamespace(members={})
@@ -883,87 +897,71 @@ def _patch_round(monkeypatch, fake):
 def test_the_fill_in_stops_once_the_supervisor_says_so(tmp_path, monkeypatch):
     from pokerlab.rl.train import run_elo_fill_in
 
-    fake = FakeRound(sessions_played=4)
-    _patch_round(monkeypatch, fake)
+    fake = FakeSessions(sessions_played=4, stop_after=2, stop_file=tmp_path / "FILL_STOP")
+    _patch_sessions(monkeypatch, fake)
+
+    passes, sessions = run_elo_fill_in(_fill_args(tmp_path), GAME6)
+
+    # The flag is checked between passes: the pass it went up in still finishes.
+    assert (passes, sessions) == (2, 8)
+
+
+def test_a_stop_flag_that_is_already_up_ends_the_phase_before_any_round(tmp_path, monkeypatch):
+    from pokerlab.rl.train import run_elo_fill_in
+
+    fake = FakeSessions()
+    _patch_sessions(monkeypatch, fake)
     (tmp_path / "FILL_STOP").touch()  # the generation is already over
 
-    rounds, sessions = run_elo_fill_in(_fill_args(tmp_path), GameConfig(num_players=6, starting_stack=200, small_blind=1, big_blind=2))
-
-    # The minimum is honoured first, and only then the flag: 3 rounds of 4.
-    assert (rounds, sessions) == (3, 12)
+    assert run_elo_fill_in(_fill_args(tmp_path), GAME6) == (0, 0)
+    assert fake.calls == []
 
 
-def test_the_minimum_holds_even_when_every_worker_finishes_together(tmp_path, monkeypatch):
-    """The case the user asked to protect: without a floor, a generation whose
-    workers all drew the same `--hands` would do no rating at all."""
+def test_the_deadline_is_the_only_cap_when_nothing_says_stop(tmp_path, monkeypatch):
+    """A worker whose supervisor died must stop on its own."""
     from pokerlab.rl.train import run_elo_fill_in
 
-    fake = FakeRound(sessions_played=1)
-    _patch_round(monkeypatch, fake)
-    (tmp_path / "FILL_STOP").touch()
+    fake = FakeSessions(sessions_played=1)
+    _patch_sessions(monkeypatch, fake)
 
-    _rounds, sessions = run_elo_fill_in(
-        _fill_args(tmp_path, fill_min_sessions=7), GameConfig(num_players=6, starting_stack=200, small_blind=1, big_blind=2)
-    )
-
-    assert sessions >= 7
-
-
-def test_the_deadline_is_the_only_cap_and_it_beats_the_minimum(tmp_path, monkeypatch):
-    """A worker whose supervisor died must stop on its own, and it must not
-    keep going forever chasing a minimum it cannot reach."""
-    from pokerlab.rl.train import run_elo_fill_in
-
-    fake = FakeRound(sessions_played=1)
-    _patch_round(monkeypatch, fake)
-
-    rounds, sessions = run_elo_fill_in(
+    passes, sessions = run_elo_fill_in(
         # No stop file will ever appear, and no time to play in.
-        _fill_args(
-            tmp_path, fill_stop_file="", fill_min_sessions=10_000,
-            fill_deadline_minutes=0.0,
-        ),
-        GameConfig(num_players=6, starting_stack=200, small_blind=1, big_blind=2),
+        _fill_args(tmp_path, fill_stop_file="", fill_deadline_minutes=0.0), GAME6
     )
 
-    assert (rounds, sessions) == (0, 0)
+    assert (passes, sessions) == (0, 0)
 
 
-def test_a_fill_in_round_can_never_prune(tmp_path, monkeypatch):
+def test_a_fill_in_pass_can_never_prune(tmp_path, monkeypatch):
     """It draws with a top bias, and eligibility for deletion is a percentile of
     games -- so a pruning pass under this draw would eat the middle of the
     population instead of its bottom."""
     from pokerlab.rl.global_arena import NO_PRUNE_TRIGGER
     from pokerlab.rl.train import run_elo_fill_in
 
-    fake = FakeRound()
-    _patch_round(monkeypatch, fake)
-    (tmp_path / "FILL_STOP").touch()
+    fake = FakeSessions(stop_after=1, stop_file=tmp_path / "FILL_STOP")
+    _patch_sessions(monkeypatch, fake)
 
-    run_elo_fill_in(_fill_args(tmp_path, fill_min_sessions=1), GameConfig(num_players=6, starting_stack=200, small_blind=1, big_blind=2))
+    run_elo_fill_in(_fill_args(tmp_path), GAME6)
 
     assert fake.calls[0]["trigger_size"] == NO_PRUNE_TRIGGER
     assert fake.calls[0]["draw"] is not None
-    assert fake.calls[0]["games_per_model"] == 1
+    assert fake.calls[0]["sessions"] == 10
 
 
 def test_the_worker_counts_the_sessions_it_played_not_the_ones_it_merged(
     tmp_path, monkeypatch
 ):
     """`sessions` counts what the merge folded in from every machine, which on a
-    busy fleet is thousands -- reading it would satisfy the minimum on the first
-    round without this worker having played anything."""
+    busy fleet is thousands -- reading it would report that as this worker's."""
     from pokerlab.rl.train import run_elo_fill_in
 
-    fake = FakeRound(sessions_played=2)
-    _patch_round(monkeypatch, fake)
-    (tmp_path / "FILL_STOP").touch()
+    fake = FakeSessions(sessions_played=2, stop_after=3, stop_file=tmp_path / "FILL_STOP")
+    _patch_sessions(monkeypatch, fake)
 
-    rounds, sessions = run_elo_fill_in(
-        _fill_args(tmp_path, fill_min_sessions=6), GameConfig(num_players=6, starting_stack=200, small_blind=1, big_blind=2)
-    )
+    passes, sessions = run_elo_fill_in(_fill_args(tmp_path), GAME6)
 
-    assert (rounds, sessions) == (3, 6)
+    assert (passes, sessions) == (3, 6)
 
 
 def test_the_supervisor_is_told_this_worker_is_only_waiting(tmp_path, monkeypatch):
@@ -975,21 +973,20 @@ def test_the_supervisor_is_told_this_worker_is_only_waiting(tmp_path, monkeypatc
     seen = []
     marker_path = tmp_path / "scratch" / FILL_DRAINING_FILENAME
 
-    class WatchingRound(FakeRound):
+    class WatchingSessions(FakeSessions):
         def __call__(self, **kwargs):
             seen.append(marker_path.exists())
             return super().__call__(**kwargs)
 
-    _patch_round(monkeypatch, WatchingRound())
-    (tmp_path / "FILL_STOP").touch()
+    _patch_sessions(monkeypatch, WatchingSessions(stop_after=1, stop_file=tmp_path / "FILL_STOP"))
 
-    run_elo_fill_in(_fill_args(tmp_path, fill_min_sessions=1), GameConfig(num_players=6, starting_stack=200, small_blind=1, big_blind=2))
+    run_elo_fill_in(_fill_args(tmp_path), GAME6)
 
-    assert seen == [True]  # up before the very first round
+    assert seen == [True]  # up before the very first pass
     assert not marker_path.exists()  # and gone afterwards
 
 
-def test_a_broken_round_costs_the_extra_rounds_and_nothing_else(tmp_path, monkeypatch):
+def test_a_broken_pass_costs_the_extra_passes_and_nothing_else(tmp_path, monkeypatch):
     """By this point the run has trained, published and been rated; a failure in
     a bonus phase must not turn that into a failed process."""
     from pokerlab.rl.phases import FILL_DRAINING_FILENAME
@@ -998,11 +995,11 @@ def test_a_broken_round_costs_the_extra_rounds_and_nothing_else(tmp_path, monkey
     def explode(**_kwargs):
         raise RuntimeError("il volume e' sparito")
 
-    _patch_round(monkeypatch, explode)
+    _patch_sessions(monkeypatch, explode)
 
-    rounds, sessions = run_elo_fill_in(_fill_args(tmp_path), GameConfig(num_players=6, starting_stack=200, small_blind=1, big_blind=2))
+    passes, sessions = run_elo_fill_in(_fill_args(tmp_path), GAME6)
 
-    assert (rounds, sessions) == (0, 0)
+    assert (passes, sessions) == (0, 0)
     # The marker is cleared on the error path too, or the next generation's
     # supervisor reads a stale directory as a worker already draining.
     assert not (tmp_path / "scratch" / FILL_DRAINING_FILENAME).exists()
@@ -1011,28 +1008,58 @@ def test_a_broken_round_costs_the_extra_rounds_and_nothing_else(tmp_path, monkey
 def test_an_empty_store_ends_the_phase_instead_of_spinning(tmp_path, monkeypatch):
     from pokerlab.rl.train import run_elo_fill_in
 
-    _patch_round(monkeypatch, FakeRound(played=0, sessions_played=0))
+    _patch_sessions(monkeypatch, FakeSessions(played=0, sessions_played=0))
 
-    rounds, sessions = run_elo_fill_in(_fill_args(tmp_path), GameConfig(num_players=6, starting_stack=200, small_blind=1, big_blind=2))
+    passes, sessions = run_elo_fill_in(_fill_args(tmp_path), GAME6)
 
-    assert (rounds, sessions) == (0, 0)
+    assert (passes, sessions) == (0, 0)
 
 
 def test_the_ranking_is_re_read_for_every_round(tmp_path, monkeypatch):
-    """The previous round just moved the ratings the top bias is computed from,
+    """The previous pass just moved the ratings the top bias is computed from,
     and so did every other machine."""
     import pokerlab.rl.train as train_module
     from pokerlab.rl.train import run_elo_fill_in
 
     reads = []
-    _patch_round(monkeypatch, FakeRound(sessions_played=1))
+    _patch_sessions(
+        monkeypatch, FakeSessions(sessions_played=1, stop_after=3, stop_file=tmp_path / "FILL_STOP")
+    )
     monkeypatch.setattr(
         train_module,
         "load_ranking",
         lambda _dir: reads.append(1) or SimpleNamespace(members={}),
     )
-    (tmp_path / "FILL_STOP").touch()
 
-    run_elo_fill_in(_fill_args(tmp_path, fill_min_sessions=3), GameConfig(num_players=6, starting_stack=200, small_blind=1, big_blind=2))
+    run_elo_fill_in(_fill_args(tmp_path), GAME6)
 
     assert len(reads) == 3
+
+
+def test_run_metadata_records_everything_the_run_resolved_to():
+    """With a config file a run's settings are not recoverable from its command
+    line, so the model carries them -- the evaluation and population knobs too,
+    not only the swept axes. Per-machine values and paths stay out."""
+    pytest.importorskip("torch")
+    from pokerlab.rl.train import run_metadata
+
+    recorded = run_metadata(_train_args(eval_sessions=10, global_sample=50, models_dir=Path("m")))
+    assert recorded["settings"]["eval_sessions"] == 10
+    assert recorded["settings"]["global_sample"] == 50
+    assert "models_dir" not in recorded["settings"] and "machine" not in recorded["settings"]
+
+
+def test_a_validation_pass_plays_the_sizes_of_the_mixture(tmp_path):
+    from pokerlab.rl.table_mix import TableMix
+
+    mix = TableMix(weights=(1, 1, 0, 0, 0, 0, 0, 0), stack_min_bb=5.0, stack_max_bb=50.0,
+                   small_blind=1, big_blind=2)
+    registry = registry_with_models(tmp_path, 2)
+    trainer = SelfPlayTrainer(
+        mix,
+        TrainConfig(hands_per_iteration=10),
+        model=PokerActorCritic(hidden=32, num_layers=1),
+        registry=registry,
+    )
+    assert math.isfinite(trainer.evaluate_against_pool(10, hands=5, seed=4))
+    assert trainer.learner_games == 10

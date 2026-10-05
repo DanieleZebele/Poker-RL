@@ -19,6 +19,7 @@ from pokerlab.engine.config import GameConfig
 from pokerlab.engine.history import SCHEMA_VERSION, HandHistory, HandHistoryWriter
 from pokerlab.engine.pots import compute_pots, distribute_pots
 from pokerlab.engine.state import HandState, PlayerState, PlayerStatus, Street
+from pokerlab.engine.stats import StatsTracker
 
 if TYPE_CHECKING:
     from pokerlab.players.base import Player
@@ -46,6 +47,7 @@ class Table:
         on_hand_started: Callable[[dict[str, Any]], None] | None = None,
         on_street_dealt: Callable[[dict[str, Any]], None] | None = None,
         on_action_applied: Callable[[dict[str, Any]], None] | None = None,
+        stats_tracker: StatsTracker | None = None,
     ) -> None:
         """`on_hand_started`, if given, is called once per hand right after
         blinds are posted (before any betting), with a dict of
@@ -76,6 +78,12 @@ class Table:
 
         Building the Observation costs something, so it only happens when a
         hook is installed -- training never pays for it.
+
+        `stats_tracker`, if given, watches every finished hand
+        (`engine/stats.py`) and puts each seat's opponent statistics into the
+        `Observation`s of the hands that follow, for the seats whose player it has
+        seen. Optional by design: with none, or for a player it has not seen, the
+        statistics are simply absent.
         """
         if len(players) != config.num_players:
             raise ValueError(
@@ -88,6 +96,8 @@ class Table:
         self._on_hand_started = on_hand_started
         self._on_street_dealt = on_street_dealt
         self._on_action_applied = on_action_applied
+        self._stats_tracker = stats_tracker
+        self._hand_stats: dict[int, tuple[float, ...]] = {}
         self.stacks: list[int] = [config.starting_stack] * config.num_players
         self._button_seat: int | None = None
         self._hand_counter = 0
@@ -135,6 +145,11 @@ class Table:
         )
         starting_stacks = {ps.seat: ps.stack for ps in seats}
         hole_cards = {ps.seat: ps.hole_cards for ps in seats}
+        player_ids = {ps.seat: ps.player_id for ps in seats}
+        # Read once per hand: nothing it describes changes until the hand ends.
+        self._hand_stats = (
+            self._stats_tracker.vectors(player_ids) if self._stats_tracker is not None else {}
+        )
 
         order = seats_clockwise_from(hand_state, button_seat)
         if len(eligible) == 2:
@@ -206,6 +221,14 @@ class Table:
         )
         if self._history_writer is not None:
             self._history_writer.append(hand_history)
+        if self._stats_tracker is not None:
+            self._stats_tracker.record_hand(
+                hand_history.actions,
+                dealt=[ps.seat for ps in seats],
+                button_seat=button_seat,
+                board_cards=len(hand_history.community_cards),
+                player_ids=player_ids,
+            )
 
         return HandResult(
             hand_id=hand_id,
@@ -242,7 +265,7 @@ class Table:
                     hand_state.to_act.discard(seat)
                     continue
                 legal = compute_legal_actions(hand_state, seat)
-                observation = build_observation(hand_state, seat)
+                observation = build_observation(hand_state, seat, self._hand_stats)
                 action = self.players[seat].act(observation, legal)
                 apply_action(hand_state, seat, action)
                 if self._on_action_applied is not None:
@@ -254,7 +277,7 @@ class Table:
                             "name": ps.name,
                             "action": action,
                             "record": hand_state.action_log[-1],
-                            "observation": build_observation(hand_state, seat),
+                            "observation": build_observation(hand_state, seat, self._hand_stats),
                         }
                     )
                 progressed = True

@@ -93,69 +93,23 @@ machine_seed() {
     printf '%d' "$(( 0x$(printf '%s' "$MACHINE" | sha256sum | cut -c1-6) ))"
 }
 
-# Twenty workers by default, not as many as the machine can technically hold.
-# Filling every core (nproc - 2, which is 30 on the 32-core boxes) is what the
-# fleet ran before, and five of seven machines went unresponsive under it; the
-# cause was never established, but a machine running at its own ceiling has no
-# headroom for the end-of-run phases, where every worker of a generation
-# arrives at the same moment and each one loads models it did not hold while
-# training. Twenty still leaves a third of a 32-core box free for that, while
-# ten was leaving two thirds of it idle.
-#
-# Watch this one. Every worker of a generation reaches the population round at
-# about the same time and each loads ~55 models there, measured at 203 MB on top
-# of its ~514 MB of training footprint, so twenty-five workers in that phase
-# together want ~18 GB. Two things have made that window wider since the ceiling
-# was first set: the round is ten times longer than it used to be
-# (`global_arena.DEFAULT_HANDS_PER_GAME` is 1000 now), and
-# `rate_against_benchmark` plays 500 rated sessions of 1000 hands against the
-# frozen anchors, so 500,000 hands per published model. If machines start going
-# unresponsive again, this and `--global-games-per-model` are the two dials --
-# and POKER_WORKERS overrides this one without touching the file.
-#
-# The history is worth knowing before raising it further: the fleet ran at 30,
-# five of seven machines went unresponsive, no cause was ever established, and
-# the ceiling went to 10 and then to 20 as a compromise. 25 is a deliberate step
-# back up, not a measured safe value.
-#
-# Cores and memory still cap it, for the small VMs: each worker is its own
-# Python+torch process at roughly 700 MB once its pool is loaded, so a small VM
-# runs out of RAM long before it runs out of cores.
-DEFAULT_WORKER_CEILING=25
-default_workers() {
-    local cores free_mb by_cores by_memory chosen
-    cores=$(nproc)
-    free_mb=$(awk '/^MemAvailable:/ {print int($2/1024)}' /proc/meminfo)
-    by_cores=$(( cores - 2 ))
-    by_memory=$(( (free_mb - 3000) / 700 ))
-    chosen=$DEFAULT_WORKER_CEILING
-    [ "$by_cores" -lt "$chosen" ] && chosen=$by_cores
-    [ "$by_memory" -lt "$chosen" ] && chosen=$by_memory
-    echo "$chosen"
-}
+# How many workers: `poker-loop --workers 0` means "as many as this machine
+# holds", i.e. the fleet-wide `worker_ceiling` in `config.toml`, lowered on a small
+# VM by its cores (all but two) and its free memory (`loop.auto_workers`).
+# POKER_WORKERS pins a number for this machine only, for a one-off run.
+WORKERS="${POKER_WORKERS:-0}"
 
-WORKERS="${POKER_WORKERS:-$(default_workers)}"
-[ "$WORKERS" -lt 1 ] && WORKERS=1
-
-# Passed to `start` and to `status`/`watch` alike: the status scales every
-# progress bar against it, so a value that does not match the running loop's
-# would draw every worker at the wrong fraction.
-#
-# 1000, up from 100. Training measurably had not finished at 100: the learner's
-# win rate against its own pool was still climbing (-94.5 -> -30.9 -> -19.3 ->
-# -13.5 bb/100 at iterations 25/50/75/100), `clip` was still 0.072 and `kl`
-# 0.009, and a duplicate-deck duel put the iteration-100 model +57 bb/100 ahead
-# of the iteration-50 one from the same seed (t = 7.5). A run now takes ~2.8
-# hours instead of ~25 minutes, so a machine produces roughly six times fewer
-# models per day -- deliberately trading breadth for depth.
-ITERATIONS="${POKER_ITERATIONS:-1000}"
-
-# 50 opponents drawn per run, up from 20. A run ten times longer against the
-# same fixed twenty would learn to beat those twenty rather than to play better
-# -- and since the in-run evaluation uses that same pool, the number would keep
-# rising while the model narrowed. A wider draw dilutes that. Each extra model
-# costs ~3.7 MB resident in the worker.
-POOL_MODELS="${POKER_POOL_MODELS:-50}"
+# The training length and the pool size live in `config.toml`, with the reasoning
+# for each value, not here: an explicit flag beats the file, so a value pinned in
+# this script would silently override what the file says. POKER_ITERATIONS and
+# POKER_POOL_MODELS still override it for a one-off run, and are passed to
+# `status`/`watch` too -- the status scales every progress bar against the
+# iterations, so a value that does not match the running loop's would draw every
+# worker at the wrong fraction.
+ITERATION_FLAGS=()
+[ -n "${POKER_ITERATIONS:-}" ] && ITERATION_FLAGS=(--iterations "$POKER_ITERATIONS")
+POOL_FLAGS=()
+[ -n "${POKER_POOL_MODELS:-}" ] && POOL_FLAGS=(--pool-models "$POKER_POOL_MODELS")
 
 start() {
     setup
@@ -167,50 +121,41 @@ start() {
     rm -f "$ROOT/STOP"
     mkdir -p "$ROOT/logs/loop" "$MODELS"
     local seed; seed="$(machine_seed)"
-    log "macchina $MACHINE | $WORKERS worker | seed-base $seed"
+    log "macchina $MACHINE | worker: $([ "$WORKERS" -gt 0 ] && echo "$WORKERS" || echo "auto, tetto da config.toml") | seed-base $seed"
     log "store condiviso dei modelli $MODELS, stato di questa macchina $ROOT"
-    # **Flags deliberately absent: --inherit-fraction, --hands, --eval-every and
-    # --eval-sessions.** The first two are decided per worker by
-    # `loop.hyperparameter_plan`, and passing them here pinned nothing while
-    # looking like it did. The two --eval ones are absent for the sibling reason:
-    # a validation round is 10 rated sessions every 100 iterations, that interval
-    # is `poker-loop`'s own default, and this line used to carry
-    # `--eval-every 250 --eval-hands 10000` -- which would have quietly kept the
-    # fleet on 4 rounds a run instead of 10 after the defaults moved, exactly the
-    # failure the paragraph below is about. (Two more, --self-share and
-    # --eval-hands, no longer exist on `poker-loop` at all.)
-    # `--inherit-fraction 0.5` was worse than misleading:
-    # an explicit flag beats the default, so it kept half the fleet starting
-    # from random networks for a whole day after from-scratch runs were
-    # supposed to be gone -- measured on zebele-slaves-2 generation 425, 12 of
-    # 25 workers inheriting and 13 at --fresh-lr, exactly the 0.5 this line
-    # asked for. The rule it cost: when a default moves in `loop.py`, check
-    # whether this command line is overriding it.
+    # **Flags deliberately absent: --hands, --eval-every and
+    # --eval-sessions, and everything `config.toml` sets (game, iterations, pool
+    # size, benchmark hands).** `--hands` is decided per
+    # worker by `loop.hyperparameter_plan`, and passing it here would pin
+    # nothing while looking like it did. The two --eval ones are absent so
+    # `loop.py`'s own defaults govern the size and cadence of a validation pass.
+    # The rule: an explicit flag beats the file, and the file beats a default, so
+    # a flag added here silently overrides both -- only machine-local values
+    # (workers, directories, machine, seed) belong on this line.
     OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONUNBUFFERED=1 \
     setsid nohup "$VENV/bin/poker-loop" \
-        --workers "$WORKERS" --generations 0 --iterations "$ITERATIONS" \
-        --players 6 --stack 200 --sb 1 --bb 2 \
+        --workers "$WORKERS" --generations 0 \
+        ${ITERATION_FLAGS[@]+"${ITERATION_FLAGS[@]}"} \
         --state-dir "$ROOT" --work-dir "$ROOT/work" --models-dir "$MODELS" \
         --log-dir "$ROOT/logs/loop" --machine "$MACHINE" \
-        --pool-models "$POOL_MODELS" \
-        --archive-every 500 \
-        --benchmark-dir "$BENCHMARK" --benchmark-hands 3000 \
+        ${POOL_FLAGS[@]+"${POOL_FLAGS[@]}"} \
+        --benchmark-dir "$BENCHMARK" \
         --seed-base "$seed" --top 15 \
         >> "$ROOT/logs/supervisor.log" 2>&1 < /dev/null &
     sleep 5
     log "avviato. segui con: ./run.sh watch"
 }
 
-# No default subcommand: `./run.sh` on its own used to mean `start`, which put a
-# 30-worker production loop on the machine from a bare, harmless-looking command
-# (it happened). Nothing starts unless `start` is spelled out.
+# No default subcommand: a bare `./run.sh` must not put a production loop on the
+# machine from a harmless-looking command. Nothing starts unless `start` is
+# spelled out.
 case "${1:-help}" in
     setup)  setup ;;
     start)  start ;;
-    status) "$VENV/bin/poker-loop" --status --iterations "$ITERATIONS" \
+    status) "$VENV/bin/poker-loop" --status ${ITERATION_FLAGS[@]+"${ITERATION_FLAGS[@]}"} \
                 --state-dir "$ROOT" --models-dir "$MODELS" \
                 --log-dir "$ROOT/logs/loop" --benchmark-dir "$BENCHMARK" ;;
-    watch)  "$VENV/bin/poker-loop" --status --watch 30 --iterations "$ITERATIONS" \
+    watch)  "$VENV/bin/poker-loop" --status --watch 30 ${ITERATION_FLAGS[@]+"${ITERATION_FLAGS[@]}"} \
                 --state-dir "$ROOT" --models-dir "$MODELS" \
                 --log-dir "$ROOT/logs/loop" --benchmark-dir "$BENCHMARK" ;;
     stop)   mkdir -p "$ROOT" && touch "$ROOT/STOP"

@@ -1,11 +1,8 @@
 """Minimal test-only players: cheap, deterministic opponents for fuzzing
 engine correctness (chip conservation, action legality).
 
-These replace what `players/scripted.py` used to provide before the
-hand-coded bot catalog was removed from the product (see CLAUDE.md,
-"Heuristic bots, removed"). Nothing here is product-facing -- it exists
-purely so engine-level tests keep a cheap opponent to play against, the same
-way they always have.
+Nothing here is product-facing -- it exists purely so engine-level tests have
+a cheap opponent to play against.
 """
 
 from __future__ import annotations
@@ -15,6 +12,7 @@ from collections.abc import Callable
 
 from pokerlab.engine.actions import Action, ActionType, LegalAction
 from pokerlab.players.base import Observation, Player
+from pokerlab.rl.table_mix import SIZES, TableMix
 
 Strategy = Callable[[Observation, list[LegalAction]], Action]
 
@@ -61,3 +59,21 @@ def make_random_legal_bot(
         return Action(choice.action_type)
 
     return _StrategyPlayer(player_id, name, strategy)
+
+
+def fixed_mix(
+    num_players: int, *, stack_bb: float = 50.0, small_blind: int = 1, big_blind: int = 2
+) -> TableMix:
+    """A `TableMix` that always draws the same table: one size, one stack.
+
+    The defaults are the old fixed test table (100 chips at 1/2), so a test that
+    wants the mixture's variety builds a `TableMix` itself.
+    """
+    weights = tuple(1.0 if size == num_players else 0.0 for size in SIZES)
+    return TableMix(
+        weights=weights,
+        stack_min_bb=stack_bb,
+        stack_max_bb=stack_bb,
+        small_blind=small_blind,
+        big_blind=big_blind,
+    )

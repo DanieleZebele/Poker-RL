@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 from pokerlab.cards.card import Card, Suit
 from pokerlab.engine.actions import ActionType
 from pokerlab.engine.state import PlayerStatus, Street
+from pokerlab.engine.stats import STAT_SLOTS
 from pokerlab.rl.action_space import ACTION_DIM
 
 if TYPE_CHECKING:
@@ -34,14 +35,18 @@ MAX_SEATS = 9
 # Checkpoints record it, so a model trained to read slot 340 as one thing is not
 # silently reused once that slot means another. Comparing dimensions alone would
 # not catch it: the position fix that reordered seats kept OBS_DIM identical.
-FEATURE_VERSION = 1
+FEATURE_VERSION = 2
 
 CARD_PLANES = 6
 CARDS_DIM = CARD_PLANES * 52
 STREET_DIM = 4
 POT_SCALARS_DIM = 24
 FIELD_SCALARS_DIM = 8
-SEAT_FEATURES = 9
+SEAT_BASE_FEATURES = 9
+# Room for opponent statistics per seat (`engine/stats.py`), after the nine
+# features every seat has. Optional: a seat with no statistics supplied is encoded
+# as all zeros in these slots, and most slots are reserved for later.
+SEAT_FEATURES = SEAT_BASE_FEATURES + STAT_SLOTS
 SEATS_DIM = MAX_SEATS * SEAT_FEATURES
 HISTORY_STREETS = 4
 HISTORY_FEATURES = 10
@@ -213,7 +218,7 @@ def _seat_slots(observation: Observation, rotated_seats: list, starting_stack: i
     committed = committed_by_seat(observation)
     for slot, seat in enumerate(rotated_seats):
         offset = slot * SEAT_FEATURES
-        slots[offset : offset + SEAT_FEATURES] = [
+        slots[offset : offset + SEAT_BASE_FEATURES] = [
             1.0,
             1.0 if seat.seat == observation.my_seat else 0.0,
             1.0 if seat.status is PlayerStatus.ACTIVE else 0.0,
@@ -224,6 +229,16 @@ def _seat_slots(observation: Observation, rotated_seats: list, starting_stack: i
             _ratio(committed.get(seat.seat, 0), pot),
             1.0 if seat.is_button else 0.0,
         ]
+        # Optional: a seat with no statistics supplied keeps its stat slots at zero.
+        supplied = observation.seat_stats.get(seat.seat)
+        if supplied:
+            if len(supplied) > STAT_SLOTS:
+                raise ValueError(
+                    f"seat {seat.seat} has {len(supplied)} statistics, the encoding has "
+                    f"room for {STAT_SLOTS}: truncating would silently drop some"
+                )
+            start = offset + SEAT_BASE_FEATURES
+            slots[start : start + len(supplied)] = [_clip01(value) for value in supplied]
     return slots
 
 

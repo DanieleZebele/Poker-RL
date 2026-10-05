@@ -129,7 +129,7 @@ def test_it_kills_every_worker_of_this_machine_and_nothing_else(tmp_path):
 
 @pytest.mark.skipif(not Path("/proc").is_dir(), reason="needs /proc")
 def test_children_of_a_worker_die_with_it(tmp_path):
-    """A worker's global round shards it out to subprocesses; killing only the
+    """A worker's global pass shards it out to subprocesses; killing only the
     parent would orphan them and leave them running on the cores."""
     script = (
         "import subprocess, sys, time;"

@@ -263,15 +263,14 @@ def _pot_fraction_raise_to(observation: Observation, fraction: float) -> int:
 class ActionReporter:
     """Table's `on_action_applied` hook: publish the action, then pace.
 
-    Both halves used to live in a wrapper around `Player.act()`, and that
-    put them in the wrong order. A wrapper only ever sees the state from
-    *before* its own action -- the engine applies it once `act()` has
-    returned -- so the table showed the move as not yet made and then held
-    that stale picture for the whole pause. Worse, the correction only
-    arrived with the *next* action, so the last action of a street was
-    never drawn at all: the next thing to happen is the new community
-    card. Running from the engine hook instead means what the pause holds
-    on screen is the finished action, chips in and pot updated.
+    Both halves run from the engine hook rather than from a wrapper around
+    `Player.act()`, because a wrapper only ever sees the state from *before*
+    its own action -- the engine applies it once `act()` has returned -- so
+    the table would show the move as not yet made, hold that stale picture
+    for the whole pause, and never draw the last action of a street at all
+    (the next thing to happen is the new community card). From the engine
+    hook, what the pause holds on screen is the finished action, chips in and
+    pot updated.
 
     Called on the session thread, which is what makes blocking legal here
     (the same place `on_street_dealt` waits out an all-in runout).
@@ -341,8 +340,8 @@ def _bot_spec_label(spec: dict) -> str:
 class AddBotDialog(tk.Toplevel):
     """Modal dialog opened by the "+" button: pick a trained model to seat.
 
-    There is no hand-coded bot catalog any more -- every bot seat is a
-    trained checkpoint, offered by path rather than a hardcoded key: a key
+    Every bot seat is a trained checkpoint, offered by path rather than a
+    hardcoded key: a key
     pointing at a file that may later go missing would break the setup
     screen for everyone, while a path only ever fails for whoever picks it.
     """
@@ -769,7 +768,7 @@ class TableFrame(ttk.Frame):
     def _hide_seat(self, seat: int) -> None:
         """A player with 0 chips is out for the rest of the session --
         remove their box from the table entirely rather than just greying
-        it out, per the user's request."""
+        it out."""
         if seat in self._busted_seats:
             return
         self._busted_seats.add(seat)
@@ -828,9 +827,9 @@ class TableFrame(ttk.Frame):
         self._set_dealer_seat(observation.button_seat)
 
         # Same rule as the "(tu)" marker above: with nobody sitting in,
-        # this panel has nothing to show. It used to fall back to
-        # `observation.hole_cards`, which in spectator mode is whichever
-        # bot just acted -- so "Le tue carte" flipped between opponents'
+        # this panel has nothing to show. Falling back to
+        # `observation.hole_cards` would show whichever bot just acted in
+        # spectator mode, so "Le tue carte" would flip between opponents'
         # hands every action.
         if self._human_seat is not None:
             own_hole_cards = self._all_hole_cards.get(self._human_seat, observation.hole_cards)

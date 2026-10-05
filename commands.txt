@@ -40,25 +40,27 @@ cd C:\Users\zeppo\Desktop\POKER
 
 cd /mnt/shared_volume/POKER/Poker-RL
 OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1 .venv/bin/python -m pokerlab.rl.benchmark_arena \
-    --games-per-model 20 --workers 10 \
-    --tolerance 1 --window 20 --min-rounds 50 --max-rounds 200 \
+    --workers 10 \
     2>&1 | tee checkpoints/logs/arena-$(date +%Y%m%d-%H%M%S).log
 
 # solo snapshot, senza rigiocare:
-OMP_NUM_THREADS=1 .venv/bin/python -m pokerlab.rl.benchmark_arena --max-rounds 0
+OMP_NUM_THREADS=1 .venv/bin/python -m pokerlab.rl.benchmark_arena --arena-max-sessions 0
 
 # annulla i rating (i file restano dove sono):
 .venv/bin/python -m pokerlab.rl.benchmark_arena --restore \
     checkpoints/global/benchmark_arena_backups/ratings-<timestamp>.json
 
 
-# ── AGGIORNARE L'ELO DI TUTTI I MODELLI (giro di fine training, a mano) ──────────────────────────
+# ── AGGIORNARE L'ELO DI TUTTI I MODELLI (passata di fine training, a mano) ──────────────────────────
 
 cd /mnt/shared_volume/POKER/Poker-RL
-OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1 .venv/bin/python -m pokerlab.rl.benchmark_arena \
-    --games-per-model 20 --workers 20 \
-    --tolerance 1 --window 20 --min-rounds 50 --max-rounds 200 \
-    2>&1 | tee checkpoints/logs/arena-$(date +%Y%m%d-%H%M%S).log
+OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1 .venv/bin/poker-elo \
+    --elo-sessions 2000 --workers 20 \
+    2>&1 | tee checkpoints/logs/elo-$(date +%Y%m%d-%H%M%S).log
+
+# i parametri comuni (tavolo, campione, sessioni, mani per sessione...) si leggono da
+# config.toml; un flag li batte. Vale per poker-train, poker-loop, poker-elo,
+# benchmark_arena e poker-dashboard: poker-<cli> --print-config mostra cosa risolve
 
 
 # ── QUANTE MANI SERVONO PER SAPERE CHI E' PIU' FORTE ──────────────────────────
@@ -68,7 +70,7 @@ OMP_NUM_THREADS=1 .venv/bin/python -m pokerlab.rl.duel_power \
     --save /tmp/duel.json
 # rianalizza senza rigiocare, ad altre lunghezze di partita:
 .venv/bin/python -m pokerlab.rl.duel_power --load /tmp/duel.json --lengths 100,1000,50000
-#   --mode field   un seggio a testa e 4 riempitivi, come un giro di popolazione
+#   --mode field   un seggio a testa e 4 riempitivi, come una passata di popolazione
 
 
 # ── TEST E LINT ───────────────────────────────────────────────────────────────

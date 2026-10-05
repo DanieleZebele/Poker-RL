@@ -7,6 +7,28 @@ import gc
 
 import pytest
 
+# Every test file belongs to one area, named by its file name, so a change can be
+# checked by running only its area (`pytest -m rl`, or `tests/affected.py`).
+# Applied here rather than decorated by hand so a new file is covered by default:
+# anything that is not gui/vision/rl/config is the engine.
+AREA_PREFIXES = (
+    ("test_gui_", "gui"),
+    ("test_vision_", "vision"),
+    ("test_rl_", "rl"),
+    ("test_config", "config"),
+)
+# The one test that launches real `poker-loop` and `poker-train` subprocesses.
+SLOW_FILES = {"test_rl_loop_e2e.py"}
+
+
+def pytest_collection_modifyitems(items):
+    for item in items:
+        name = item.path.name
+        area = next((area for prefix, area in AREA_PREFIXES if name.startswith(prefix)), "engine")
+        item.add_marker(getattr(pytest.mark, area))
+        if name in SLOW_FILES:
+            item.add_marker(pytest.mark.slow)
+
 
 @pytest.fixture(scope="session")
 def app():

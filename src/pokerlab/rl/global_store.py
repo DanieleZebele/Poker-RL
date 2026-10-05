@@ -1,10 +1,9 @@
 """Storage and locking for the global registry: one file and one lock per model.
 
-The global registry used to be a single `registry.json`, rewritten whole on
-every save. That forces one lock for the entire ranking, because two writers
-touching *different* models would still overwrite each other's file -- and a
-single lock is exactly what made merging slow enough that only a handful of
-games ever reached the ratings.
+A single registry file rewritten whole on every save would force one lock for
+the entire ranking, because two writers touching *different* models would still
+overwrite each other's file -- and a single lock makes merging slow enough that
+only a handful of games ever reach the ratings.
 
 Here every model owns its own file (`members/<label>.json`) and its own lock
 (`locks/<label>.lock`). A writer locks only the models it is about to change,
@@ -183,34 +182,9 @@ def read_all_members(global_dir: str | Path, *, workers: int = 16) -> dict[str, 
     return {member.label: member for member in loaded if member is not None}
 
 
-def migrate_legacy_registry(global_dir: str | Path) -> int:
-    """Split an old single-file `registry.json` into per-member files, once.
-
-    Runs only while `members/` does not exist yet. The files are written into a
-    staging directory that is then renamed into place, so of several processes
-    migrating at once exactly one wins and nobody ever sees a half-migrated store.
-    """
-    directory = Path(global_dir)
-    members_dir = directory / MEMBERS_DIRNAME
-    if members_dir.exists() or not (directory / REGISTRY_FILENAME).is_file():
-        return 0
-    legacy = PoolRegistry.load(directory, max_models=10**9)
-    staging = directory / f".{MEMBERS_DIRNAME}-{uuid.uuid4().hex[:8]}.tmp"
-    staging.mkdir(parents=True)
-    for member in legacy.members.values():
-        (staging / f"{member.label}.json").write_text(json.dumps(asdict(member)), encoding="utf-8")
-    try:
-        staging.rename(members_dir)
-    except OSError:
-        shutil.rmtree(staging, ignore_errors=True)
-        return 0
-    return len(legacy.members)
-
-
 def load_global_registry(global_dir: str | Path) -> PoolRegistry:
     """The whole registry, assembled from the member files."""
     directory = Path(global_dir)
-    migrate_legacy_registry(directory)
     registry = PoolRegistry(directory=directory, max_models=10**9)
     registry.members = read_all_members(directory)
     return registry
@@ -308,9 +282,9 @@ def publish_model(
     run itself, against its pool and then against the frozen anchors. **`games`
     matters as much as the rating**: it is what `k_for_games` reads, so a model
     published with the ~600 rated sessions it really played is refined gently by
-    later population rounds, while one published at zero would be treated as a
+    later population passes, while one published at zero would be treated as a
     newcomer and shoved around at the schedule's top tier on evidence it already
-    has. It was hard-coded to 0 while the round's sessions were queued for the
+    has. It was hard-coded to 0 while the pass's sessions were queued for the
     global merge instead, which applied the same evidence a second time.
     """
     models = Path(models_dir)
@@ -345,11 +319,11 @@ def publish_model(
 # ---- asking for a benchmark-arena run --------------------------------------
 #
 # A model added to the benchmark arrives carrying the rating it earned in the
-# ordinary rounds, never measured against the anchors themselves. So adding one
+# ordinary passes, never measured against the anchors themselves. So adding one
 # leaves a request here and a `poker-loop` supervisor runs `benchmark_arena`
 # *between two generations*, when its workers have exited and the machine is
 # free. It is deliberately not run by the training worker that added the model:
-# the job is up to 200 rounds, and a worker that blocked on it would stall its
+# the job is up to 200 passes, and a worker that blocked on it would stall its
 # whole generation.
 #
 # One request file, not a queue: the arena rates *every* anchor, so a second

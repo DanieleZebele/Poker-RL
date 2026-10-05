@@ -20,7 +20,7 @@ from torch import Tensor, nn
 
 from pokerlab.rl.action_space import ACTION_DIM
 from pokerlab.rl.features import FEATURE_VERSION, OBS_DIM
-from pokerlab.rl.policy import PokerActorCritic
+from pokerlab.rl.policy import SHAPE_KEYS, PokerActorCritic
 from pokerlab.rl.rollout import HandTrajectory
 
 
@@ -93,6 +93,10 @@ def ppo_update(
 ) -> dict[str, float]:
     """One PPO update over a batch. Returns diagnostics, averaged per minibatch."""
     advantages = batch.advantages
+    # Raw statistics, read before normalising: after it they are 0 and 1 by
+    # construction, which says nothing about the scale the GAE produced.
+    raw_mean = float(advantages.mean())
+    raw_std = float(advantages.std()) if len(batch) > 1 else 0.0
     if config.normalize_advantages and len(batch) > 1:
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
@@ -141,7 +145,10 @@ def ppo_update(
                 totals["grad_norm"] += float(grad_norm)
             steps += 1
 
-    return {name: value / max(steps, 1) for name, value in totals.items()}
+    stats = {name: value / max(steps, 1) for name, value in totals.items()}
+    stats["adv_mean"] = raw_mean
+    stats["adv_std"] = raw_std
+    return stats
 
 
 def save_checkpoint(
@@ -163,8 +170,7 @@ def save_checkpoint(
             "obs_dim": OBS_DIM,
             "action_dim": ACTION_DIM,
             "feature_version": FEATURE_VERSION,
-            "hidden": model.hidden,
-            "num_layers": model.num_layers,
+            **model.shape,
             "iteration": iteration,
             "model": model.state_dict(),
             "optimizer": None if optimizer is None else optimizer.state_dict(),
@@ -184,6 +190,12 @@ def check_compatible(checkpoint: dict[str, Any], source: str = "checkpoint") -> 
             f"{source} was trained on obs_dim={checkpoint.get('obs_dim')} "
             f"action_dim={checkpoint.get('action_dim')}, but this build uses "
             f"{OBS_DIM}/{ACTION_DIM} -- the encoding changed since it was saved"
+        )
+    if any(key not in checkpoint for key in SHAPE_KEYS):
+        raise IncompatibleCheckpointError(
+            f"{source} was saved before a network's shape was fully recorded (it has no "
+            "head layers), and its weights are named for the old layout, so it cannot be "
+            "loaded into this build's network"
         )
     saved_version = checkpoint.get("feature_version", 0)
     if saved_version != FEATURE_VERSION:
@@ -209,6 +221,11 @@ def load_checkpoint(
     return checkpoint
 
 
+def checkpoint_shape(checkpoint: dict[str, Any]) -> dict[str, int]:
+    """The network shape a checkpoint was saved with (after `check_compatible`)."""
+    return {key: int(checkpoint[key]) for key in SHAPE_KEYS}
+
+
 def build_model_from_checkpoint(
     path: str | Path, *, device: str | torch.device = "cpu"
 ) -> tuple[PokerActorCritic, dict[str, Any]]:
@@ -216,9 +233,7 @@ def build_model_from_checkpoint(
     inference. Used to seat previously trained agents as opponents."""
     checkpoint = torch.load(path, map_location=device, weights_only=True)
     check_compatible(checkpoint, str(path))
-    model = PokerActorCritic(
-        hidden=checkpoint.get("hidden", 512), num_layers=checkpoint.get("num_layers", 3)
-    )
+    model = PokerActorCritic(**checkpoint_shape(checkpoint))
     model.load_state_dict(checkpoint["model"])
     model.to(device).eval()
     for parameter in model.parameters():

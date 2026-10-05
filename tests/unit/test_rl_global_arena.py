@@ -1,12 +1,13 @@
 """Cross-machine population Elo: discovery, sampling, per-model locks, and the
-end-of-run round that plays it, applies it, and (rarely) prunes it.
+end-of-run pass that plays it, applies it, and (rarely) prunes it.
 
 The discovery/sampling/lock/promotion helpers are pure Python and need no
-torch; only `play_global_round`/`run_population_round` load real models.
+torch; only `play_global_sessions`/`run_population_sessions` load real models.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import random
@@ -18,11 +19,12 @@ import pytest
 from pokerlab.rl.global_arena import (
     Candidate,
     add_benchmark_candidates,
-    apply_pending_population_rounds,
+    apply_pending_population_sessions,
     delete_checkpoints,
     discover_all_copies,
     discover_benchmark_population,
     discover_population,
+    draw_tiers_text,
     prune_ghost_members,
     repair_member_refs,
     sample_population,
@@ -32,13 +34,12 @@ from pokerlab.rl.global_store import (
     acquire_locks,
     list_member_labels,
     load_global_registry,
-    migrate_legacy_registry,
     read_member,
     release_locks,
     write_member,
     write_snapshot,
 )
-from pokerlab.rl.pool_registry import PoolMember, PoolRegistry
+from pokerlab.rl.pool_registry import PoolMember, PoolRegistry, parse_k_schedule
 
 
 def _touch(path):
@@ -152,10 +153,9 @@ def _store_with(root, models=(), anchors=()):
 
 def test_a_model_published_during_the_merge_is_not_a_ghost(tmp_path):
     """`existing_labels` is listed once and the merge then runs for tens of
-    minutes -- 27 were measured on a 13,014-session round -- while the fleet
-    keeps publishing. Every model that arrives in that window is missing from
-    the snapshot and was being deleted here: a live model, freshly rated against
-    the frozen series, reset to the default rating with zero games. The
+    minutes while the fleet keeps publishing. Every model that arrives in that
+    window is missing from the snapshot and would be deleted here: a live model,
+    freshly rated, reset to the default rating with zero games. The
     re-check under the lock is what makes the snapshot merely a shortlist.
     """
     global_dir = tmp_path / "global"
@@ -216,22 +216,6 @@ def test_member_store_round_trips_a_member(tmp_path):
     assert read_member(tmp_path, "m1") == member
     assert read_member(tmp_path, "missing") is None
     assert load_global_registry(tmp_path).members == {"m1": member}
-
-
-def test_legacy_registry_json_is_split_into_member_files_once(tmp_path):
-    legacy = PoolRegistry(directory=tmp_path, max_models=10**9)
-    legacy.members["a"] = PoolMember(label="a", kind="model", ref="a.pt", rating=1550.0, games=4)
-    legacy.members["b"] = PoolMember(label="b", kind="model", ref="b.pt", frozen=True)
-    legacy.save()
-
-    assert migrate_legacy_registry(tmp_path) == 2
-    assert read_member(tmp_path, "a").rating == 1550.0
-    assert read_member(tmp_path, "b").frozen
-
-    # Already migrated: a second call must not overwrite what merges have written since.
-    write_member(tmp_path, PoolMember(label="a", kind="model", ref="a.pt", rating=1700.0, games=9))
-    assert migrate_legacy_registry(tmp_path) == 0
-    assert read_member(tmp_path, "a").rating == 1700.0
 
 
 def test_snapshot_mirrors_the_member_files_and_is_not_rewritten_while_fresh(tmp_path):
@@ -372,7 +356,7 @@ def test_many_mergers_at_once_apply_every_session_exactly_once(tmp_path):
         }))
 
     def merge(machine: str):
-        return apply_pending_population_rounds(
+        return apply_pending_population_sessions(
             global_dir=global_dir, root=root, machine=machine, trigger_size=10**9
         )
 
@@ -467,16 +451,17 @@ def test_nothing_is_added_without_any_anchor(tmp_path):
     assert add_benchmark_candidates(global_dir=global_dir, root=root, machine="m") == []
 
 
-# ---- play_global_round / run_population_round (need real models) ------------
+# ---- play_global_sessions / run_population_sessions (need real models) ------------
 
 torch = pytest.importorskip("torch")
 
-from pokerlab.engine.config import GameConfig
-from pokerlab.rl.global_arena import play_global_round, run_population_round
+from support import fixed_mix
+
+from pokerlab.rl.global_arena import play_global_sessions, run_population_sessions
 from pokerlab.rl.policy import PokerActorCritic
 from pokerlab.rl.ppo import save_checkpoint
 
-GAME = GameConfig(num_players=3, starting_stack=100, small_blind=1, big_blind=2)
+GAME = fixed_mix(3)
 
 
 def _make_checkpoint(path, seed=0):
@@ -485,49 +470,62 @@ def _make_checkpoint(path, seed=0):
     save_checkpoint(path, PokerActorCritic(hidden=8, num_layers=1))
 
 
-def test_play_global_round_gives_every_candidate_its_games(tmp_path):
+def _four_candidates(tmp_path):
     candidates = []
     for i in range(4):
         path = tmp_path / f"m{i}.pt"
         _make_checkpoint(path, seed=i)
         candidates.append(Candidate(label=f"m{i}", path=path))
+    return candidates
 
-    sessions = play_global_round(candidates, GAME, games_per_model=3, hands_per_game=2, seed=1)
 
-    due = dict.fromkeys([c.label for c in candidates], 0)
+def test_play_global_sessions_plays_exactly_the_sessions_asked_for(tmp_path):
+    """A pass is `sessions` sessions, each seating `num_players` distinct models
+    drawn at random: nobody is owed a number of games."""
+    candidates = _four_candidates(tmp_path)
+
+    sessions = play_global_sessions(candidates, GAME, sessions=7, session_hands=2, seed=1)
+
+    assert len(sessions) == 7
+    labels = {c.label for c in candidates}
     for session in sessions:
-        for label in session:
-            due[label] += 1
-    assert all(count >= 3 for count in due.values())
+        assert len(session) == 3  # distinct models at one table
+        assert set(session) <= labels
 
 
-def test_play_global_round_reports_its_progress_in_owed_games(tmp_path):
-    """The round is otherwise silent for ninety minutes. Progress counts owed
-    games, not sessions: a session seats several models and decrements each
-    one's debt, so the owed total is exact up front while the session count is
-    not -- and a bar that can overshoot its own denominator is worse than none.
-    """
-    candidates = []
-    for i in range(4):
-        path = tmp_path / f"m{i}.pt"
-        _make_checkpoint(path, seed=i)
-        candidates.append(Candidate(label=f"m{i}", path=path))
+def test_play_global_sessions_draws_its_tables_at_random(tmp_path):
+    """Over enough sessions every candidate is seated, and the draw differs with
+    the seed -- not a fixed rotation."""
+    candidates = _four_candidates(tmp_path)
+    kwargs = {"sessions": 12, "session_hands": 1}
+
+    first = play_global_sessions(candidates, GAME, seed=1, **kwargs)
+    second = play_global_sessions(candidates, GAME, seed=2, **kwargs)
+
+    assert {label for session in first for label in session} == {c.label for c in candidates}
+    assert [sorted(s) for s in first] != [sorted(s) for s in second]
+
+
+def test_play_global_sessions_reports_its_progress_in_sessions(tmp_path):
+    """The pass is otherwise silent for ninety minutes. The total is exactly the
+    number of sessions asked for, known up front, so the bar ends at 100% and can
+    never overshoot its own denominator."""
+    candidates = _four_candidates(tmp_path)
     seen: list[tuple[int, int, str]] = []
 
-    sessions = play_global_round(
+    sessions = play_global_sessions(
         candidates,
         GAME,
-        games_per_model=3,
-        hands_per_game=2,
+        sessions=5,
+        session_hands=2,
         seed=1,
         on_progress=lambda done, total, detail: seen.append((done, total, detail)),
     )
 
-    assert len(seen) == len(sessions)  # one report per session, never batched
-    assert all(total == 4 * 3 for _done, total, _detail in seen)
-    assert [done for done, _t, _d in seen] == sorted(done for done, _t, _d in seen)
-    assert seen[-1][0] == 4 * 3  # it ends at exactly 100%, not near it
-    assert seen[-1][2] == f"{len(sessions)} sessioni"
+    assert len(seen) == len(sessions) == 5  # one report per session, never batched
+    assert all(total == 5 for _done, total, _detail in seen)
+    assert [done for done, _t, _d in seen] == [1, 2, 3, 4, 5]
+    assert seen[-1][2] == "5 sessioni"
 
 
 @pytest.fixture
@@ -543,18 +541,18 @@ def small_population(tmp_path):
     return root
 
 
-def test_run_population_round_rates_participants_from_the_whole_store(small_population):
+def test_run_population_sessions_rates_participants_from_the_whole_store(small_population):
     global_dir = small_population / "global"
 
-    report = run_population_round(
+    report = run_population_sessions(
         global_dir=global_dir,
         root=small_population,
-        game=GAME,
+        mix=GAME,
         machine="host-a",
         population_sample=20,  # more than the 8 available: draws all of them
         benchmark_sample=1,
-        games_per_model=2,
-        hands_per_game=2,
+        sessions=6,
+        session_hands=2,
         seed=1,
         trigger_size=10**9,  # never prune in this test
     )
@@ -565,26 +563,26 @@ def test_run_population_round_rates_participants_from_the_whole_store(small_popu
     assert sum(m.games for m in registry.members.values()) > 0
 
 
-def test_run_population_round_never_moves_a_frozen_anchors_rating(small_population):
+def test_run_population_sessions_never_moves_a_frozen_anchors_rating(small_population):
     global_dir = small_population / "global"
     kwargs = {
         "global_dir": global_dir,
         "root": small_population,
-        "game": GAME,
+        "mix": GAME,
         "machine": "host-a",
         "population_sample": 20,
         "benchmark_sample": 1,
-        "games_per_model": 2,
-        "hands_per_game": 2,
+        "sessions": 6,
+        "session_hands": 2,
         "trigger_size": 10**9,
     }
 
-    run_population_round(seed=1, **kwargs)
+    run_population_sessions(seed=1, **kwargs)
     registry = load_global_registry(global_dir)
     anchor_rating_after_first = registry.members["bench0"].rating
     assert registry.members["bench0"].frozen
 
-    run_population_round(seed=2, **kwargs)
+    run_population_sessions(seed=2, **kwargs)
     registry = load_global_registry(global_dir)
 
     assert registry.members["bench0"].rating == anchor_rating_after_first
@@ -593,9 +591,9 @@ def test_run_population_round_never_moves_a_frozen_anchors_rating(small_populati
 
 def test_a_locked_participant_defers_its_session_instead_of_blocking_the_round(small_population):
     global_dir = small_population / "global"
-    run_population_round(
-        global_dir=global_dir, root=small_population, game=GAME, machine="host-a",
-        population_sample=20, benchmark_sample=1, games_per_model=2, hands_per_game=2,
+    run_population_sessions(
+        global_dir=global_dir, root=small_population, mix=GAME, machine="host-a",
+        population_sample=20, benchmark_sample=1, sessions=6, session_hands=2,
         seed=1, trigger_size=10**9,
     )
     victim = next(iter(load_global_registry(global_dir).members))
@@ -611,7 +609,7 @@ def test_a_locked_participant_defers_its_session_instead_of_blocking_the_round(s
         "population_draw": [], "benchmark_draw": [],
         "sessions": [{victim: 10.0, others[0]: -5.0, others[1]: -5.0}],
     }))
-    report = apply_pending_population_rounds(
+    report = apply_pending_population_sessions(
         global_dir=global_dir, root=small_population, machine="host-a",
         trigger_size=10**9, lock_wait=0.0,
     )
@@ -623,7 +621,7 @@ def test_a_locked_participant_defers_its_session_instead_of_blocking_the_round(s
     assert len(requeued) == 1
 
     release_locks(global_dir, [victim])
-    report = apply_pending_population_rounds(
+    report = apply_pending_population_sessions(
         global_dir=global_dir, root=small_population, machine="host-a", trigger_size=10**9
     )
     assert report.sessions == 1
@@ -633,15 +631,15 @@ def test_a_locked_participant_defers_its_session_instead_of_blocking_the_round(s
 
 def test_a_pending_file_is_applied_exactly_once_however_many_mergers_run(small_population):
     global_dir = small_population / "global"
-    run_population_round(
-        global_dir=global_dir, root=small_population, game=GAME, machine="host-a",
-        population_sample=20, benchmark_sample=1, games_per_model=2, hands_per_game=2,
+    run_population_sessions(
+        global_dir=global_dir, root=small_population, mix=GAME, machine="host-a",
+        population_sample=20, benchmark_sample=1, sessions=6, session_hands=2,
         seed=1, trigger_size=10**9,
     )
     games_after_first = sum(m.games for m in load_global_registry(global_dir).members.values())
 
     # A second merge with nothing pending must change nothing.
-    report = apply_pending_population_rounds(
+    report = apply_pending_population_sessions(
         global_dir=global_dir, root=small_population, machine="host-b", trigger_size=10**9
     )
 
@@ -649,20 +647,20 @@ def test_a_pending_file_is_applied_exactly_once_however_many_mergers_run(small_p
     assert sum(m.games for m in load_global_registry(global_dir).members.values()) == games_after_first
 
 
-def test_a_round_refreshes_a_stale_ref_to_where_the_file_really_is(small_population):
+def test_a_pass_refreshes_a_stale_ref_to_where_the_file_really_is(small_population):
     global_dir = small_population / "global"
     kwargs = {
-        "global_dir": global_dir, "root": small_population, "game": GAME, "machine": "host-a",
-        "population_sample": 20, "benchmark_sample": 1, "games_per_model": 2,
-        "hands_per_game": 2, "trigger_size": 10**9,
+        "global_dir": global_dir, "root": small_population, "mix": GAME, "machine": "host-a",
+        "population_sample": 20, "benchmark_sample": 1, "sessions": 6,
+        "session_hands": 2, "trigger_size": 10**9,
     }
-    run_population_round(seed=1, **kwargs)
+    run_population_sessions(seed=1, **kwargs)
     label = "active0"
     member = read_member(global_dir, label)
     member.ref = "checkpoints/somewhere/that/no/longer/exists.pt"
     write_member(global_dir, member)
 
-    run_population_round(seed=2, **kwargs)
+    run_population_sessions(seed=2, **kwargs)
 
     assert read_member(global_dir, label).ref == str(
         small_population / "models/active0.pt"
@@ -677,7 +675,7 @@ def test_a_stale_claim_is_returned_to_the_queue(tmp_path):
     old = claim.stat().st_mtime - 7200
     os.utime(claim, (old, old))
 
-    report = apply_pending_population_rounds(
+    report = apply_pending_population_sessions(
         global_dir=tmp_path / "global", root=tmp_path / "empty", machine="m"
     )
 
@@ -685,14 +683,14 @@ def test_a_stale_claim_is_returned_to_the_queue(tmp_path):
     assert not list(pending.glob("*.json"))
 
 
-def test_run_population_round_skips_gracefully_with_no_population(tmp_path):
+def test_run_population_sessions_skips_gracefully_with_no_population(tmp_path):
     global_dir = tmp_path / "global"
     empty_root = tmp_path / "empty"
 
-    report = run_population_round(
+    report = run_population_sessions(
         global_dir=global_dir,
         root=empty_root,
-        game=GAME,
+        mix=GAME,
         machine="host-a",
         seed=1,
     )
@@ -701,44 +699,44 @@ def test_run_population_round_skips_gracefully_with_no_population(tmp_path):
     assert not list((global_dir / "locks").glob("*.lock"))  # nothing left locked
 
 
-def test_run_population_round_skips_an_unreadable_checkpoint(small_population):
+def test_run_population_sessions_skips_an_unreadable_checkpoint(small_population):
     (small_population / "models/garbage.pt").write_text("not a checkpoint")
     global_dir = small_population / "global"
     skipped: list[str] = []
 
-    report = run_population_round(
+    report = run_population_sessions(
         global_dir=global_dir,
         root=small_population,
-        game=GAME,
+        mix=GAME,
         machine="host-a",
         population_sample=20,
         benchmark_sample=1,
-        games_per_model=2,
-        hands_per_game=2,
+        sessions=6,
+        session_hands=2,
         seed=1,
         trigger_size=10**9,
         on_skip=lambda path, why: skipped.append(str(path)),
     )
 
     assert any("garbage" in path for path in skipped)
-    assert report.sessions > 0  # the round still completes with the rest
+    assert report.sessions > 0  # the pass still completes with the rest
 
 
-def test_run_population_round_prunes_and_deletes_every_doomed_model(tmp_path):
+def test_run_population_sessions_prunes_and_deletes_every_doomed_model(tmp_path):
     root = tmp_path / "checkpoints"
     for i in range(8):
         _make_checkpoint(root / f"models/active{i}.pt", seed=i)
     global_dir = root / "global"
 
-    report = run_population_round(
+    report = run_population_sessions(
         global_dir=global_dir,
         root=root,
-        game=GAME,
+        mix=GAME,
         machine="host-a",
         population_sample=20,
         benchmark_sample=0,
-        games_per_model=2,
-        hands_per_game=2,
+        sessions=30,
+        session_hands=2,
         seed=1,
         trigger_size=7,  # 8 tracked models >= 7 fires
         eliminate_fraction=0.5,  # doomed = round(eligible * 0.5)
@@ -748,7 +746,7 @@ def test_run_population_round_prunes_and_deletes_every_doomed_model(tmp_path):
     assert report.triggered_elimination
     assert report.eliminated == 4
     assert report.deleted_files == 4
-    # Nothing is promoted any more: no anchor appears, the files are just gone.
+    # Nothing is promoted: no anchor appears, the files are just gone.
     assert len(list((root / "models").glob("*.pt"))) == 4
     assert not (root / "benchmark").exists()
     registry = load_global_registry(global_dir)
@@ -756,9 +754,9 @@ def test_run_population_round_prunes_and_deletes_every_doomed_model(tmp_path):
     assert not any(m.frozen for m in registry.members.values())
 
 
-def test_run_population_round_trigger_is_the_real_disk_population_not_the_ledger(tmp_path):
+def test_run_population_sessions_trigger_is_the_real_disk_population_not_the_ledger(tmp_path):
     """A big backlog of *unregistered* files (the normal state of the real
-    volume: thousands of files no round has sampled yet) must still trigger
+    volume: thousands of files no pass has sampled yet) must still trigger
     pruning -- the trigger cannot be keyed to how many models the ledger
     happens to already track."""
     root = tmp_path / "checkpoints"
@@ -768,15 +766,15 @@ def test_run_population_round_trigger_is_the_real_disk_population_not_the_ledger
     # A near-empty ledger (well under any reasonable trigger) next to a
     # small *real* population -- trigger_size=3 must still fire because 3
     # real files exist, regardless of what the ledger currently tracks.
-    empty_report = run_population_round(
+    empty_report = run_population_sessions(
         global_dir=global_dir,
         root=root,
-        game=GAME,
+        mix=GAME,
         machine="host-a",
         population_sample=3,
         benchmark_sample=0,
-        games_per_model=1,
-        hands_per_game=2,
+        sessions=3,
+        session_hands=2,
         seed=1,
         trigger_size=3,
         eliminate_fraction=0.34,
@@ -785,11 +783,11 @@ def test_run_population_round_trigger_is_the_real_disk_population_not_the_ledger
     assert empty_report.triggered_elimination
 
 
-def test_run_population_round_does_not_trigger_below_the_real_disk_population(tmp_path):
+def test_run_population_sessions_does_not_trigger_below_the_real_disk_population(tmp_path):
     """The inverse: a registry pre-seeded with many entries must NOT trigger
     pruning on its own if the real, current on-disk population is small --
     otherwise stale ledger bookkeeping (from models already deleted by a
-    previous round) could fire pruning against a population that has since
+    previous pass) could fire pruning against a population that has since
     shrunk back down."""
     root = tmp_path / "checkpoints"
     for i in range(3):
@@ -802,15 +800,15 @@ def test_run_population_round_does_not_trigger_below_the_real_disk_population(tm
         )
     registry.save()
 
-    report = run_population_round(
+    report = run_population_sessions(
         global_dir=global_dir,
         root=root,
-        game=GAME,
+        mix=GAME,
         machine="host-a",
         population_sample=3,
         benchmark_sample=0,
-        games_per_model=1,
-        hands_per_game=2,
+        sessions=3,
+        session_hands=2,
         seed=1,
         trigger_size=10,  # only 3 real files exist, well under this
         eliminate_fraction=0.5,
@@ -820,7 +818,7 @@ def test_run_population_round_does_not_trigger_below_the_real_disk_population(tm
     assert not report.triggered_elimination
 
 
-def test_run_population_round_fires_again_when_the_population_crosses_the_trigger_again(tmp_path):
+def test_run_population_sessions_fires_again_when_the_population_crosses_the_trigger_again(tmp_path):
     """The threshold is now a simple gate: once the real on-disk population is
     above it, a prune attempt may fire again as soon as the backlog is above the
     same threshold again."""
@@ -831,25 +829,25 @@ def test_run_population_round_fires_again_when_the_population_crosses_the_trigge
     kwargs = {
         "global_dir": global_dir,
         "root": root,
-        "game": GAME,
+        "mix": GAME,
         "machine": "host-a",
         "population_sample": 20,
         "benchmark_sample": 0,
-        "games_per_model": 2,
-        "hands_per_game": 2,
+        "sessions": 6,
+        "session_hands": 2,
         "trigger_size": 7,
         "eliminate_fraction": 0.5,
         "protect_percentile": 0,
     }
 
-    first = run_population_round(seed=1, **kwargs)
+    first = run_population_sessions(seed=1, **kwargs)
     assert first.triggered_elimination
 
     # Re-grow the backlog above the trigger; the new rule is simply "above
     # threshold -> prune attempt may fire".
     for i in range(8, 16):
         _make_checkpoint(root / f"models/active{i}.pt", seed=i)
-    second = run_population_round(seed=2, **kwargs)
+    second = run_population_sessions(seed=2, **kwargs)
     assert second.triggered_elimination
 
 
@@ -864,37 +862,37 @@ def _doomed_set(tmp_path, ratings):
     return doomed, paths
 
 
-# ---- splitting a round across local processes --------------------------------
+# ---- splitting a pass across local processes --------------------------------
 
 
-def test_shard_games_splits_exactly_and_never_overshoots():
+def test_shard_sessions_splits_exactly_and_never_overshoots():
     """The whole point: `ceil(games / workers)` per shard silently played more
     hands than were asked for whenever the division was uneven."""
-    from pokerlab.rl.global_arena import shard_games
+    from pokerlab.rl.global_arena import shard_sessions
 
     for games in range(40):
         for workers in range(1, 20):
-            per_shard = shard_games(games, workers)
+            per_shard = shard_sessions(games, workers)
             assert len(per_shard) == workers
             assert sum(per_shard) == games, (games, workers)
             # At most one game of imbalance, so no shard is a straggler.
             assert max(per_shard) - min(per_shard) <= 1
 
 
-def test_shard_games_leaves_spare_shards_owing_nothing():
-    from pokerlab.rl.global_arena import shard_games
+def test_shard_sessions_leaves_spare_shards_owing_nothing():
+    from pokerlab.rl.global_arena import shard_sessions
 
-    assert shard_games(3, 5) == [1, 1, 1, 0, 0]
-    assert shard_games(20, 15) == [2] * 5 + [1] * 10
-    assert shard_games(20, 10) == [2] * 10
-    assert shard_games(0, 4) == [0, 0, 0, 0]
+    assert shard_sessions(3, 5) == [1, 1, 1, 0, 0]
+    assert shard_sessions(20, 15) == [2] * 5 + [1] * 10
+    assert shard_sessions(20, 10) == [2] * 10
+    assert shard_sessions(0, 4) == [0, 0, 0, 0]
 
 
 def test_the_module_is_runnable_as_a_shard():
     """`play_sharded` launches `python -m pokerlab.rl.global_arena`, so the module
     needs a `__main__` dispatch. It had none: every shard imported the module,
     did nothing, wrote no output, and was reported through `on_skip` as a missing
-    file -- a sharded round returned *zero* sessions. Nothing in production passes
+    file -- a sharded pass returned *zero* sessions. Nothing in production passes
     `workers > 1`, so it stayed dormant.
 
     Checked by running it with no arguments: `_shard_main` requires
@@ -950,17 +948,17 @@ def test_each_band_gets_a_quarter_of_the_seats():
 def test_the_leftover_seats_go_to_random_bands_so_the_average_is_exact():
     population, ratings = _population(3000), _ratings(3000)
     totals = [0, 0, 0, 0]
-    rounds = 400
-    for seed in range(rounds):
+    passes = 400
+    for seed in range(passes):
         for c in tiered_draw(ratings)(population, 50, random.Random(seed)):
             totals[_band(c.label)] += 1
 
     # 50 seats over 4 bands is 12.5 each. The top ten are capped at 10 and the
     # ~2.5 seats they cannot fill spill over the models not yet drawn.
-    assert totals[0] / rounds == 10
-    assert 12.0 < totals[1] / rounds < 14.0
-    assert 12.0 < totals[2] / rounds < 14.0
-    assert sum(totals) == 50 * rounds
+    assert totals[0] / passes == 10
+    assert 12.0 < totals[1] / passes < 14.0
+    assert 12.0 < totals[2] / passes < 14.0
+    assert sum(totals) == 50 * passes
 
 
 def test_the_tail_is_still_reachable():
@@ -989,7 +987,7 @@ def test_an_unrated_model_is_reachable_through_the_last_band():
 
 def test_the_draw_fills_its_count_even_when_the_top_bands_are_short():
     """Whatever a band cannot fill spills to the models not yet drawn, so a
-    round is never short just because the store has few rated models."""
+    pass is never short just because the store has few rated models."""
     population = _population(60)
     ratings = _ratings(3)
 
@@ -1005,3 +1003,102 @@ def test_a_draw_larger_than_the_population_returns_everyone():
     drawn = tiered_draw(ratings)(population, 50, random.Random(0))
 
     assert {c.label for c in drawn} == {c.label for c in population}
+
+
+def _share_by_tier(tiers, cutoffs, seats=60, passes=300, size=3000):
+    """Mean number of seats per pass that fell in each band between `cutoffs`."""
+    population, ratings = _population(size), _ratings(size)
+    edges = [0, *cutoffs, size]
+    totals = [0] * (len(edges) - 1)
+    for seed in range(passes):
+        for c in tiered_draw(ratings, tiers=tiers)(population, seats, random.Random(seed)):
+            rank = int(c.label[1:])
+            totals[next(i for i in range(len(totals)) if rank < edges[i + 1])] += 1
+    return [total / passes for total in totals]
+
+
+def test_three_tiers_give_a_third_of_the_seats_each():
+    shares = _share_by_tier((100, 1000, None), (100, 1000))
+
+    assert shares == pytest.approx([20.0, 20.0, 20.0], abs=0.01)
+
+
+def test_a_tier_listed_twice_gets_twice_the_seats():
+    shares = _share_by_tier((100, 100, None), (100,))
+
+    assert shares == pytest.approx([40.0, 20.0], abs=0.01)
+
+
+def test_seats_that_do_not_divide_evenly_are_still_exact_on_average():
+    # 50 seats over three tiers is 16.67 each.
+    shares = _share_by_tier((100, 1000, None), (100, 1000), seats=50, passes=600)
+
+    assert shares == pytest.approx([50 / 3] * 3, abs=0.6)
+
+
+def test_without_an_all_tier_the_tail_is_only_reached_by_the_spill():
+    population, ratings = _population(3000), _ratings(3000)
+
+    drawn = tiered_draw(ratings, tiers=(100, 1000))(population, 40, random.Random(0))
+
+    assert len(drawn) == 40
+    assert sum(int(c.label[1:]) >= 1000 for c in drawn) == 0
+
+
+def test_the_draw_tiers_text_is_the_parent_tiers_syntax():
+    assert draw_tiers_text("10, 100 ,ALL") == "10, 100, all"
+    with pytest.raises(argparse.ArgumentTypeError):
+        draw_tiers_text("10, soon")
+
+
+def test_the_merge_rates_at_the_k_schedule_it_is_given(small_population):
+    global_dir = small_population / "global"
+    run_population_sessions(
+        global_dir=global_dir, root=small_population, mix=GAME, machine="host-a",
+        population_sample=20, benchmark_sample=1, sessions=2, session_hands=2,
+        seed=1, trigger_size=10**9,
+    )
+    members = load_global_registry(global_dir).members
+    table = [label for label, m in members.items() if not m.frozen][:3]
+    pending = global_dir / "pending"
+    pending.mkdir(exist_ok=True)
+
+    def moved(k_schedule: str) -> float:
+        before = read_member(global_dir, table[0]).rating
+        (pending / "host-b-20260101-000000-k.json").write_text(json.dumps({
+            "population_draw": [], "benchmark_draw": [],
+            "sessions": [dict(zip(table, [30.0, -10.0, -20.0]))],
+        }))
+        report = apply_pending_population_sessions(
+            global_dir=global_dir, root=small_population, machine="host-a",
+            trigger_size=10**9, k_schedule=parse_k_schedule(k_schedule),
+        )
+        assert report.sessions == 1
+        return read_member(global_dir, table[0]).rating - before
+
+    # Both calls are for a model with some games behind it, so the tier read is
+    # the single one each schedule has.
+    small, large = moved("0:1"), moved("0:10")
+    assert small > 0 and large > 0
+    assert large > small * 5
+
+
+def test_play_global_sessions_seats_one_table_size_per_session_from_the_mixture(tmp_path):
+    from pokerlab.rl.table_mix import TableMix
+
+    mix = TableMix(weights=(1, 1, 1, 0, 0, 0, 0, 0), stack_min_bb=5.0, stack_max_bb=50.0,
+                   small_blind=1, big_blind=2)
+    candidates = _four_candidates(tmp_path)
+
+    sessions = play_global_sessions(candidates, mix, sessions=30, session_hands=2, seed=2)
+
+    assert len(sessions) == 30
+    assert {len(session) for session in sessions} == {2, 3, 4}
+
+
+def test_play_global_sessions_needs_enough_models_for_the_largest_table(tmp_path):
+    from pokerlab.rl.table_mix import TableMix
+
+    mix = TableMix(weights=(1, 0, 0, 0, 0, 1, 0, 0), stack_min_bb=5.0, stack_max_bb=50.0,
+                   small_blind=1, big_blind=2)  # 2- and 7-handed
+    assert play_global_sessions(_four_candidates(tmp_path), mix, sessions=3, session_hands=1) == []

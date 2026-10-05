@@ -3,7 +3,7 @@
 This is the test that pins the contract between the two entry points -- every
 flag the loop passes must be one train accepts -- and the whole life of a model:
 drawn as an opponent, trained, published into the shared store at the end of its
-run, registered in the ranking, and rated by the end-of-run round.
+run, registered in the ranking, and rated by the end-of-run pass.
 """
 
 from __future__ import annotations
@@ -15,6 +15,8 @@ import sys
 
 import pytest
 
+from pokerlab.rl.sweep_log import read_observations
+
 pytest.importorskip("torch")
 
 
@@ -22,17 +24,17 @@ def run_loop(tmp_path, *, generations, extra=()):
     command = [
         sys.executable, "-m", "pokerlab.rl.loop",
         "--workers", "3", "--generations", str(generations),
-        "--iterations", "2", "--hands", "8", "--players", "2", "--stack", "100",
-        "--eval-every", "2", "--eval-sessions", "1", "--archive-every", "2",
-        "--benchmark-hands", "0",
-        # The benchmark directory this points at is empty, so the round against
+        "--iterations", "2", "--hands", "8", "--table-weights", "1", "0", "0", "0", "0", "0", "0", "0",
+        "--stack-min-bb", "50", "--stack-max-bb", "50", "--sb", "1", "--bb", "2",
+        "--eval-every", "2", "--eval-sessions", "1",
+        # The benchmark directory this points at is empty, so the pass against
         # the anchors skips itself -- but say so explicitly rather than relying on
         # that: the production default is 500 sessions of 1000 hands, and a test
         # that grew a benchmark fixture would silently start playing half a
         # million hands per worker.
         "--benchmark-sessions", "2",
         "--global-sample", "6", "--global-benchmark-sample", "0",
-        "--global-games-per-model", "1", "--global-hands-per-game", "2",
+        "--global-sessions", "3", "--session-hands", "2",
         "--machine", "host-a", "--seed-base", "5",
         "--state-dir", str(tmp_path / "state"),
         "--models-dir", str(tmp_path / "models"),
@@ -46,6 +48,9 @@ def run_loop(tmp_path, *, generations, extra=()):
         # sessions is met, which is minutes per worker -- paid once, in the one
         # test below that exercises it, rather than by every test here.
         "--no-elo-fill-in",
+        # The repository's own config.toml sits in the cwd; a test sets what it
+        # needs by flag and must not inherit the fleet's production values.
+        "--config", "",
         *extra,
     ]
     environment = {**os.environ, "OMP_NUM_THREADS": "1", "PYTHONUNBUFFERED": "1"}
@@ -59,7 +64,7 @@ def test_two_generations_publish_rate_and_reuse_models(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
 
     models = sorted(p.name for p in (tmp_path / "models").glob("*.pt"))
-    # Every worker of every generation published exactly its own best model,
+    # Every worker of every generation published exactly its own model,
     # named for the machine, generation and worker that trained it.
     assert len(models) == 6
     assert all(name.startswith("host-a-gen000") and "-w0" in name for name in models)
@@ -72,7 +77,7 @@ def test_two_generations_publish_rate_and_reuse_models(tmp_path):
     rated = [
         json.loads(p.read_text())["games"] for p in (tmp_path / "global" / "members").glob("*.json")
     ]
-    assert any(games > 0 for games in rated), "the end-of-run round must have rated someone"
+    assert any(games > 0 for games in rated), "the end-of-run pass must have rated someone"
 
     # Nothing is left behind: no scratch, no live checkpoints, no locks, no partials.
     assert not list((tmp_path / "work").glob("gen*"))
@@ -88,9 +93,79 @@ def test_two_generations_publish_rate_and_reuse_models(tmp_path):
     log = (tmp_path / "logs" / "gen0002-w00.log").read_text()
     assert "pool: drew" in log and "from" in log and "published host-a-gen0002-w00-agent-" in log
 
+    # Every published model carries how it plays at the end of training, and the
+    # worker's log shows it while it trains.
+    import torch
+
+    published = min((tmp_path / "models").glob("*.pt"))
+    metadata = torch.load(published, map_location="cpu", weights_only=True)["metadata"]
+    assert metadata["style_hands"] > 0
+    events, chances = metadata["style"]["vpip"]
+    assert 0 <= events <= chances
+    assert any(line.startswith("stile (") for line in log.splitlines())
+
+    # And its children left the evidence the sweep optimizer learns from: which
+    # first-generation model each came from, and what the step cost and gained.
+    seen = read_observations(tmp_path / "global")
+    assert seen, "a worker that resumed from a parent must record its step"
+    for observation in seen:
+        assert observation.label.startswith("host-a-gen0002-")
+        assert observation.parent.startswith("host-a-gen0001-")
+        assert observation.cpu_seconds > 0
+        assert observation.settings.keys() == observation.parent_settings.keys()
+
+
+def test_without_inherited_hyperparameters_every_worker_steps_from_the_flags(tmp_path):
+    """The weights still carry over; the settings do not. Every worker of every
+    generation is one step -- x0.8, x1.0 or x1.2 -- from the fleet's own values, so
+    nothing ever drifts off them, and none took a step from its parent, so there is
+    nothing for the optimizer to record."""
+    result = run_loop(
+        tmp_path, generations=2, extra=("--no-inherit-hyperparameters", "--lr", "0.0005")
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "non ereditati" in result.stdout
+
+    for generation in (1, 2):
+        for worker in (0, 1, 2):
+            log = (tmp_path / "logs" / f"gen000{generation}-w0{worker}.log").read_text()
+            marker = next(line for line in log.splitlines() if line.startswith("iperparametri:"))
+            assert "hp_arm=sampled " in marker
+            lr = float(next(t for t in marker.split() if t.startswith("lr=")).split("=")[1])
+            # Inherited, the second generation's lr would be a step from a step.
+            assert any(lr == pytest.approx(0.0005 * m) for m in (0.8, 1.0, 1.2)), lr
+    # The second generation still resumed from the first one's weights.
+    assert "resumed from" in (tmp_path / "logs" / "gen0002-w00.log").read_text()
+    assert read_observations(tmp_path / "global") == []
+
+
+def test_the_network_shape_reaches_every_worker_and_survives_inheritance(tmp_path):
+    """Heads with hidden layers, set from the loop's flags (as `config.toml` would):
+    every published model records them, and the second generation, whose parents have
+    the same shape, resumes from them instead of starting over."""
+    import torch
+
+    result = run_loop(
+        tmp_path,
+        generations=2,
+        extra=("--hidden", "16", "--num-layers", "1", "--head-hidden", "8", "--head-layers", "2"),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    models = sorted((tmp_path / "models").glob("*.pt"))
+    assert len(models) == 6
+    for path in models:
+        saved = torch.load(path, map_location="cpu", weights_only=True)
+        assert (saved["hidden"], saved["num_layers"], saved["head_hidden"], saved["head_layers"]) == (
+            16, 1, 8, 2,
+        )
+        assert saved["metadata"]["head_layers"] == 2
+    second = (tmp_path / "logs" / "gen0002-w00.log").read_text()
+    assert "resumed from" in second and "different network" not in second
+
 
 def test_the_old_per_machine_layout_is_never_created(tmp_path):
-    result = run_loop(tmp_path, generations=1, extra=("--no-global-round",))
+    result = run_loop(tmp_path, generations=1, extra=("--no-global-elo",))
     assert result.returncode == 0, result.stdout + result.stderr
 
     created = {p.name for p in tmp_path.iterdir()}
@@ -103,7 +178,7 @@ def test_a_stop_file_ends_the_loop_after_the_generation_in_flight(tmp_path):
     (tmp_path / "state").mkdir()
     (tmp_path / "state" / "STOP").write_text("")
 
-    result = run_loop(tmp_path, generations=5, extra=("--no-global-round",))
+    result = run_loop(tmp_path, generations=5, extra=("--no-global-elo",))
 
     assert result.returncode == 0
     assert "STOP" in result.stdout
@@ -113,19 +188,15 @@ def test_a_stop_file_ends_the_loop_after_the_generation_in_flight(tmp_path):
 def test_a_run_publishes_its_last_checkpoint_not_its_best_rated(tmp_path):
     """The rule is deliberate and counter-intuitive, so it is pinned here.
 
-    Archiving used to keep whichever checkpoint the in-run rating scored highest.
-    That rating comes from a few hundred hands against the run's own drawn pool,
-    and across 27,610 real runs it called the mid-run model better than the final
-    one 47% of the time -- while a duplicate-deck duel of the two, from the same
-    seed, put the later one ahead in all 6 seeds by +56.7 bb/100 (t = 7.5).
-    Selecting on a coin flip captured 30 of those 57 bb/100; taking the last one
-    captures all of it. Swap this only for a measurement good enough to beat a
-    blind rule -- roughly 95% accurate -- not for the rating that was there.
+    The in-run rating comes from a few thousand hands against the run's own drawn
+    pool, which is a noisy measurement, while training improving the model is a
+    reliable prior. Swap this only for a measurement good enough to beat the blind
+    rule, not for that rating.
     """
     result = run_loop(
         tmp_path,
         generations=1,
-        extra=("--no-global-round", "--archive-every", "1", "--eval-every", "1"),
+        extra=("--no-global-elo", "--eval-every", "1"),
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -135,16 +206,14 @@ def test_a_run_publishes_its_last_checkpoint_not_its_best_rated(tmp_path):
         for line in log.splitlines()
         if "archived" in line and "iterazione" in line
     ]
-    assert archived, "the run must archive at least once"
-    # Every iteration archives, and the last one wins -- regardless of how the
-    # rating moved in between.
-    assert archived == sorted(archived), "archives happen in iteration order"
-    assert archived[-1] == max(archived)
+    # One archive, written when training ends: the last iteration's weights,
+    # whatever the rating did on the way (`--eval-every 1` rated every iteration).
+    assert archived == [2]
     published = [line for line in log.splitlines() if line.startswith("published ")]
     assert published, "and the archive it leaves behind is what gets published"
 
 
-def test_a_worker_that_finished_early_fills_the_wait_with_rating_rounds(tmp_path):
+def test_a_worker_that_finished_early_fills_the_wait_with_rating_passes(tmp_path):
     """The whole handshake, for real: a worker announces it is only killing
     time, the supervisor waits until every live worker says so, writes the flag,
     and they all exit. Getting either half wrong is a deadlock -- the worker
@@ -152,7 +221,7 @@ def test_a_worker_that_finished_early_fills_the_wait_with_rating_rounds(tmp_path
     it would show up as a generation that never ends, so it is worth one real
     run rather than only fakes."""
     result = run_loop(
-        tmp_path, generations=1, extra=("--elo-fill-in", "--fill-min-sessions", "1")
+        tmp_path, generations=1, extra=("--elo-fill-in",)
     )
     assert result.returncode == 0, result.stdout + result.stderr
 

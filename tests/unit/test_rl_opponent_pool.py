@@ -3,17 +3,14 @@ from __future__ import annotations
 import random
 
 import pytest
-from support import make_random_legal_bot
+from support import fixed_mix, make_random_legal_bot
 
-from pokerlab.engine.config import GameConfig
 from pokerlab.players.rl_agent import PolicyDecision
 from pokerlab.rl.rollout import Opponent, OpponentPool, SelfPlayCollector
 
 BIG_BLIND = 2
 STARTING_STACK = 200
-CONFIG = GameConfig(
-    num_players=6, starting_stack=STARTING_STACK, small_blind=1, big_blind=BIG_BLIND
-)
+CONFIG = fixed_mix(6, stack_bb=STARTING_STACK / BIG_BLIND)
 
 
 def uniform_policy(rng: random.Random):
@@ -44,10 +41,8 @@ def test_pool_without_members_falls_back_to_self_play():
 
 
 def test_the_pool_holds_nothing_but_the_models_it_was_given():
-    """No past self of the learner can ever be seated: the snapshot mechanism
-    (`add_snapshot`, `max_snapshots`, `snapshot_share`) was removed at the
-    user's request, so the pool is exactly the previously trained models drawn
-    from the store and nothing else. A snapshot is a copy of the network being
+    """No past self of the learner can ever be seated: the pool is exactly the
+    previously trained models drawn from the store and nothing else. A snapshot is a copy of the network being
     trained, so it drifts with it and anchors nothing -- which is what the fixed
     pool is there to do -- and every seat it took was a seat not facing an
     independently trained model."""
@@ -105,9 +100,7 @@ def test_opponent_seats_never_contribute_training_data():
 def test_the_opponent_probability_decides_how_many_seats_face_a_real_model():
     """The single most consequential number in the training field: at 6-max the
     default 0.5 leaves ~3.5 of 6 seats to copies of the learner. Every one of
-    the remaining 2.5 now faces an externally trained model -- it used to be
-    barely 1.5, because `snapshot_share` took 40% of them for the run's own
-    frozen snapshots, and that mechanism is gone."""
+    the remaining 2.5 faces an externally trained model."""
     from pokerlab.rl.train import TrainConfig
 
     assert TrainConfig().opponent_probability == 0.5

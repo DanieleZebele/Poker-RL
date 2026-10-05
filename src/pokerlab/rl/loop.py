@@ -6,12 +6,11 @@ use N cores (measured: 30 concurrent runs on a 32-core box, ~57 hands/s each).
 
 The loop runs in generations. Each generation launches N `poker-train` workers.
 Every worker draws *its own* opponents from the shared store
-(`checkpoints/models/`, see `rl/training_pool.py`), trains, publishes its best
-model back into that store, and plays a cross-population rating round
+(`checkpoints/models/`, see `rl/training_pool.py`), trains, publishes its final
+model back into that store, and plays a cross-population rating pass
 (`rl/global_arena.py`) -- so nothing is seeded, merged or re-ranked here. The
 ratings live in the global registry (`rl/global_store.py`), one file per model,
-and every machine reads and writes it directly, which is what removed the need
-for per-machine pools, an exchange directory and a retired archive.
+and every machine reads and writes it directly.
 
 What the loop still owns is the choreography around that: which workers inherit
 weights (and from whom), the once-per-generation benchmark against the frozen
@@ -21,6 +20,7 @@ set, sweeping up after runs that were killed, and the status display.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import random
 import re
@@ -32,21 +32,32 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from pokerlab.engine.config import GameConfig
+from pokerlab.config import (
+    ConfigError,
+    ConfigReport,
+    add_config_arguments,
+    diff_settings,
+    format_config,
+    parse_with_config,
+)
 from pokerlab.rl.benchmark import (
+    DEFAULT_ANCHOR_ROTATE_EVERY,
     DEFAULT_BENCHMARK_DIR,
-    DEFAULT_BENCHMARK_HANDS,
     DEFAULT_BENCHMARK_SESSIONS,
+    DEFAULT_RESIDENT_ANCHORS,
 )
 from pokerlab.rl.global_arena import (
+    BENCHMARK_GAMES_PERCENTILE,
+    BENCHMARK_MARGIN,
     DEFAULT_BENCHMARK_SAMPLE,
-    DEFAULT_GAMES_PER_MODEL,
     DEFAULT_GLOBAL_DIR,
-    DEFAULT_HANDS_PER_GAME,
+    DEFAULT_GLOBAL_SESSIONS,
     DEFAULT_POPULATION_SAMPLE,
+    DRAW_TIERS,
+    draw_tiers_text,
 )
 from pokerlab.rl.global_store import (
     DEFAULT_LOCK_SECONDS,
@@ -86,31 +97,51 @@ from pokerlab.rl.monitor import (  # noqa: F401 - re-exported for --status and t
 from pokerlab.rl.phases import FILL_DRAINING_FILENAME, FILL_STOP_FILENAME
 from pokerlab.rl.pool_registry import (
     DEFAULT_ELIMINATION_FRACTION,
+    DEFAULT_K_SCHEDULE,
     DEFAULT_POOL_SIZE,
     DEFAULT_POPULATION_TRIGGER,
     DEFAULT_PROTECT_PERCENTILE,
     PoolRegistry,
+    format_k_schedule,
+    k_schedule_text,
 )
-from pokerlab.rl.ppo import PPOConfig, build_model_from_checkpoint
+from pokerlab.rl.ppo import PPOConfig
 
 # The one thing the loop needs from `train.py`, which it otherwise only ever
-# launches as a subprocess: how many rated sessions a validation round plays,
+# launches as a subprocess: how many rated sessions a validation pass plays,
 # so the default the loop forwards and the default a standalone `poker-train`
 # uses cannot drift apart. No cycle -- train.py does not import loop.py -- and torch is already
 # here through `rl/benchmark.py`.
+from pokerlab.rl.siblings import sibling_parsers
+from pokerlab.rl.sweep_log import read_observations
+from pokerlab.rl.sweep_optimizer import (
+    DEFAULT_EXPLORE,
+    DEFAULT_MIN_GAIN,
+    DEFAULT_WARMUP,
+    DEFAULT_WINDOW,
+    SweepPolicy,
+    build_policy,
+    report_lines,
+)
+from pokerlab.rl.table_mix import add_table_arguments, table_arguments, table_mix_from_args
 from pokerlab.rl.train import (
     DEFAULT_EVAL_SESSIONS,
     DEFAULT_FILL_DEADLINE_MINUTES,
-    DEFAULT_FILL_GAMES_PER_MODEL,
-    DEFAULT_FILL_MIN_SESSIONS,
+    DEFAULT_FILL_SESSIONS,
     RUN_METADATA_VERSION,
     TrainConfig,
+    add_network_arguments,
+    check_network_arguments,
+    network_shape,
 )
 from pokerlab.rl.training_pool import (
     DEFAULT_TOP_N,
     DEFAULT_TOP_SHARE,
     PARENT_TIERS,
     available_labels,
+    format_parent_tiers,
+    parent_tiers_text,
+    parse_parent_tiers,
     pick_parents,
 )
 
@@ -131,16 +162,6 @@ class GenerationRecord:
     best_label: str = ""
     best_rating: float = 0.0
     models_total: int = 0
-    # Against the frozen set: the only number in this record that is comparable
-    # across generations, because it is the only one whose opposition is fixed.
-    benchmark_bb100: float | None = None
-    benchmark_model: str = ""
-    # The best model *this generation produced*, benchmarked separately. The
-    # overall best can be -- and for several generations was -- a model that
-    # predates the loop, in which case the headline number repeats unchanged and
-    # says nothing about whether new training is improving.
-    benchmark_new_bb100: float | None = None
-    benchmark_new_model: str = ""
 
 
 
@@ -212,7 +233,7 @@ def _salvage_archives(
     """Publish an abandoned worker's own archive(s) into the shared store.
 
     A worker directory now holds nothing but what the worker itself produced
-    (its best-so-far `agent-*.pt` and the sidecar recording its rating), so every
+    (its final `agent-*.pt` and the sidecar recording its rating), so every
     such file is a model that would otherwise be invisible to every ranking. It
     is published under the same name the worker would have used, at the rating
     its sidecar recorded. Returns how many were saved, or None if a copy failed
@@ -273,7 +294,7 @@ def sweep_stale_work(
       * Only names of the exact shapes this loop creates are touched.
     Also removes this machine's own stale `.partial` files in the models
     directory (a publish that died mid-copy) and stale `global-arena-shard-*`
-    scratch left in the temp directory by a killed global round.
+    scratch left in the temp directory by a killed global pass.
     """
     report = SweepReport()
     commands = _live_commands()
@@ -338,41 +359,29 @@ def sweep_stale_work(
     return report
 
 
-# --- hyperparameters, one draw per worker -------------------------------------
+# --- hyperparameters, one point per worker ------------------------------------
 #
-# Every worker of a generation used to be launched with the *same* settings, so
-# the fleet produced thousands of runs of one configuration and no evidence
-# about any other. These ladders are what makes a generation a sweep instead:
-# each worker gets its own point, recorded in the model it publishes
-# (`train.run_metadata`), so an outcome can afterwards be attributed to the
-# settings that produced it.
+# Every worker of a generation trains with its own settings, so a generation is a
+# sweep rather than N copies of one configuration. Each worker's point is
+# recorded in the model it publishes (`train.run_metadata`), so an outcome can
+# afterwards be attributed to the settings that produced it.
 #
-# **Each axis is a ladder of allowed values, and both arms move on it.** The
-# sampled arm draws a rung uniformly and independently per axis -- independence
-# is what lets the mean outcome over one axis be read as that axis's effect,
-# with the others averaged out rather than confounded.
-#
-# **The two arms now move by different mechanisms, and that is deliberate.** The
-# sampled arm draws a rung; the inherit arm multiplies its parent's value by one
-# of `HP_MULTIPLIERS` and is *not* snapped back onto the ladder, so a lineage can
-# hold values no rung holds and can walk past the ends of the ladder entirely.
-# Changed at the user's request, from an earlier +/-1 rung step clamped to the
-# ends. Two reasons it is the better fit for that arm:
-#   * **The ends of these ladders are a guess, and the clamp made them
-#     load-bearing.** A parent already on the top rung stayed there two thirds of
-#     the time (both +1, clamped, and 0 returned it), so the ladder's author
-#     decided in advance the furthest the fleet could ever go. Nothing measured
-#     those ends.
-#   * **The real bound is selection, and that one is measured.** A parent is
-#     drawn from the `--pool-top-n` best-rated models, so a lineage that walks
-#     its lr up to something that breaks training rates badly and stops being a
-#     parent. An arithmetic clamp guesses where the edge is; the ranking finds
-#     out.
+# **Every point is a perturbation of another point.** A worker that inherits
+# weights multiplies its parent's value on each axis by one of `HP_MULTIPLIERS`;
+# a worker with no parent to inherit from does the same to the *starting point*,
+# which is what the fleet's own flags (and so `config.toml`) say. The result is
+# not snapped onto any grid, so a lineage can hold values no one chose and can
+# walk arbitrarily far. Two reasons that is the better fit:
+#   * **A clamp would make a guess load-bearing.** Whoever wrote the limits would
+#     decide in advance the furthest the fleet could ever go.
+#   * **The real bound is selection.** A parent is drawn from the `--pool-top-n`
+#     best-rated models, so a lineage that walks its lr up to something that
+#     breaks training rates badly and stops being a parent. An arithmetic clamp
+#     guesses where the edge is; the ranking finds out.
 # The cost, accepted: a lineage really can drift a long way. The step is a
 # random walk in log space, so over N generations its spread is about
-# ln(1.2)*sqrt(2N/3) -- roughly 27x either way over 500 generations, which would
-# put `hands` anywhere between ~12 and ~8600. Nothing stops that but the
-# ranking.
+# ln(1.2)*sqrt(2N/3) -- roughly 27x either way over 500 generations. Nothing
+# stops that but the ranking.
 #
 # **Only two limits survive, and neither is a rung.** A probability axis is
 # capped at 1.0 (see `_HP_PROBABILITY_AXES`), because a probability above 1 is
@@ -380,110 +389,61 @@ def sweep_stale_work(
 # keeps them off zero -- see `_typed`. Nothing has a lower cap, and none is
 # needed: multiplying a positive number by 0.8 never reaches 0.
 #
-# **Multiplication now works on every axis, which it did not before.** One of
-# the two original arguments for a ladder was `self_share`, whose bottom rung was
-# 0.0 and which no multiplier can ever leave; that axis went with the snapshots,
-# and no ladder has a 0 rung any more. The other argument -- that an integer
-# multiplied drifts off any grid an analysis could group by -- still stands and is
-# simply accepted: inherited points are a continuum now. That costs nothing that
-# was not already lost, because an inherited point never could be read as a
-# response curve (it correlates with its parent's quality by construction). The
-# sampled arm is still on the grid, and it is still the readable one.
+# An integer multiplied drifts off any grid an analysis could group by, so
+# points are a continuum. That costs nothing that was not already lost, because
+# an inherited point can never be read as a response curve (it correlates with
+# its parent's quality by construction).
 #
-# The centre rung of every ladder is what the fleet runs today, so the sampled
-# arm is a draw *around* the known-good point rather than a jump away from it.
-#
-# There used to be a `self_share` axis here -- how much of the opponent field was
-# the run's own frozen snapshots. It is gone with the snapshots themselves,
-# removed at the user's request: every opponent seat now faces a previously
-# trained model from the store, so there is nothing left to divide.
-HP_LADDERS: dict[str, tuple[float, ...]] = {
-    "lr": (1.9e-4, 2.4e-4, 3.0e-4, 3.8e-4, 4.7e-4),
-    "hands": (320, 400, 512, 640, 800),
-    "opponent_probability": (0.32, 0.40, 0.50, 0.62, 0.78),
-    "ppo_epochs": (2, 3, 4, 5, 6),
-    "clip_epsilon": (0.13, 0.16, 0.20, 0.25, 0.31),
-    # Added later, centred on the values every earlier run used (`PPOConfig`'s
-    # defaults and `TrainConfig.lam`), so the sampled arm is again a draw around
-    # the known-good point. `minibatch_size` sets how many gradient steps an
-    # epoch takes, `gae_lambda` the bias/variance of the advantages,
-    # `value_coef` how loudly the critic speaks against the policy, and
-    # `max_grad_norm` how large one step may be.
-    "minibatch_size": (512, 724, 1024, 1448, 2048),
-    "gae_lambda": (0.90, 0.93, 0.95, 0.97, 0.99),
-    "value_coef": (0.25, 0.35, 0.5, 0.7, 1.0),
-    "max_grad_norm": (0.25, 0.35, 0.5, 0.7, 1.0),
-    # Centred on 0.0, which is what the fleet runs (see
-    # `PPOConfig.entropy_coefficient` for why it is off). Reopened at the user's
-    # request; a positive bonus buys per-decision dithering, not strategy, so
-    # selection is what decides whether any lineage keeps one.
-    "entropy_coef": (0.0, 0.0, 0.0, 0.001, 0.003),
-    # **How strong a field the worker trains against.** These two were held
-    # fixed with `--pool-models` at first, on the grounds that who a run trains
-    # against decides what its result means; they were then opened at the user's
-    # request, to diversify the *strength* of the opposition across workers as
-    # well as the optimiser settings.
-    #
-    # `draw_training_pool` fills `--pool-models` seats from two sources: a
-    # `pool_top_share` fraction drawn uniformly from the `pool_top_n` best-rated
-    # models, and the rest uniformly from the whole store. So the share decides
-    # *how much* of the field is elite and `top_n` decides *how* elite that part
-    # is -- a smaller `top_n` is a narrower, stronger band. Together they move
-    # the mean rating of the drawn field, which is exactly the "pool strength"
-    # being diversified, and which `--status` already reports per worker in its
-    # `pool` column: the sweep should visibly spread a column that was until now
-    # nearly identical across every row.
-    #
-    # **`--pool-models` stays fixed**, deliberately: it is the *size* of the
-    # field, not its strength, and it is also what the run's cost scales with
-    # (each drawn model is loaded into memory). Varying it would confound a
-    # strength axis with a cost axis.
-    "pool_top_share": (0.32, 0.40, 0.50, 0.62, 0.78),
-    "pool_top_n": (51, 64, 80, 100, 125, 156, 195),
-}
+# The axes that exist. Adding a name here is all it takes for a worker to move
+# along it, provided `Hyperparameters`, `--<axis>` and `train.REPORTED_AXES`
+# know it too (a test fails otherwise). `--pool-models` is deliberately absent:
+# it is the *size* of the field, and what a run's cost scales with, so varying
+# it would confound a strength axis with a cost axis. `pool_top_share` and
+# `pool_top_n` are how strong a field the worker draws: the share decides *how
+# much* of it is elite and `n` *how* elite that part is.
+HP_AXES = (
+    "lr",
+    "hands",
+    "opponent_probability",
+    "ppo_epochs",
+    "clip_epsilon",
+    "minibatch_size",
+    "gae_lambda",
+    "value_coef",
+    "max_grad_norm",
+    "entropy_coef",
+    "pool_top_share",
+    "pool_top_n",
+)
 
 # The axes whose values are counts, so a value is cast back to `int`. Everything
-# else is a float. This exists so `HP_LADDERS` is the only place an axis has to
+# else is a float. This exists so `HP_AXES` is the only place an axis has to
 # be added: both arms build a `Hyperparameters` from the dict generically, and
-# the type is the one thing the ladder itself cannot say (0.0 and 0 look alike).
+# the type is the one thing the axis list itself cannot say (0.0 and 0 look alike).
 _HP_INT_AXES = frozenset({"hands", "ppo_epochs", "pool_top_n", "minibatch_size"})
-
-# What a parent that predates an axis was effectively trained with. Without it
-# every published model (none carries the four newest axes) would look unusable
-# to `perturb_hyperparameters` and the whole fleet would fall back to sampling
-# at once. Only axes added after the metadata schema was fixed belong here; the
-# original ones stay strict, so a half-written parent is still refused.
-_HP_DEFAULTS: dict[str, float] = {
-    "minibatch_size": PPOConfig.minibatch_size,
-    "gae_lambda": TrainConfig.lam,
-    "value_coef": PPOConfig.value_coefficient,
-    "max_grad_norm": PPOConfig.max_grad_norm,
-    "entropy_coef": PPOConfig.entropy_coefficient,
-}
 
 # Zero is absorbing under a multiplier, and 0.0 is where this axis lives, so an
 # upward draw from exactly zero lands on this value instead of staying put.
 # Downward draws from zero stay zero; from a positive value they decay as usual.
 _HP_SEED_FROM_ZERO: dict[str, float] = {"entropy_coef": 1e-3}
 
-# What the inherit arm multiplies its parent's value by, one independent draw per
-# axis. This is ordinary PBT's x{0.8, 1.0, 1.25} with the user's own 1.2, and it
-# replaced a +/-1 step along `HP_LADDERS` -- see the note above HP_LADDERS for
-# why an unbounded multiplier suits that arm and a bounded ladder suits the
-# other. Keeping 1.0 in the set is what lets an axis stay put: with only the two
-# moving multipliers every axis of every inherited worker would move every
-# generation, and with seven axes no lineage would ever hold a setting still.
+# What a worker multiplies its starting value by (its parent's, or the fleet's
+# own when it has none), one independent draw per axis. This is the *default*:
+# `--hp-multipliers` (and so `config.toml`) replaces it. It is ordinary PBT's
+# x{0.8, 1.0, 1.25} with 1.2 -- see the note above for why an unbounded
+# multiplier suits this search. Keeping 1.0 in the set is what lets an axis stay
+# put: with only the two moving multipliers every axis of every worker would move
+# every generation, and with twelve axes no lineage would ever hold a setting
+# still.
 #
 # **These numbers are not symmetric in log space, and the drift is measurable.**
 # 1.2 is not 1/0.8, so the geometric mean of the set is (0.96)^(1/3) = 0.9865:
 # every axis of an inherited lineage shrinks by ~1.35% per generation with
-# nothing opposing it but selection. Simulated over 400 free lineages with no
-# selection at all, 60 generations from lr 3.0e-4 put the median at 1.27e-4 --
-# exactly the 0.9865^60 = 0.44 the geometric mean predicts -- with a spread from
-# 2.9e-6 to 1.2e-2. Canonical PBT uses x1.25 for precisely this reason: 1.25 is
-# 1/0.8, so (0.8, 1.0, 1.25) has a geometric mean of exactly 1 and the walk is
-# unbiased. Keeping 1.2 is the user's choice; the unbiased counterparts, if the
-# drift is ever unwanted, are (0.8, 1.0, 1.25) or (1/1.2, 1.0, 1.2).
+# nothing opposing it but selection: over 60 generations the median lineage
+# lands at 0.9865^60 = 0.44 of where it started. Canonical PBT uses x1.25 for
+# precisely this reason: 1.25 is 1/0.8, so (0.8, 1.0, 1.25) has a geometric mean
+# of exactly 1 and the walk is unbiased. The unbiased counterparts, if the drift
+# is ever unwanted, are (0.8, 1.0, 1.25) or (1/1.2, 1.0, 1.2).
 HP_MULTIPLIERS: tuple[float, ...] = (0.8, 1.0, 1.2)
 
 # The axes that are a probability. Their product is capped at 1.0 -- a
@@ -503,24 +463,24 @@ _HP_COMPLEMENT_AXES = frozenset({"gae_lambda"})
 _COMPLEMENT_FLOOR = 1e-3
 
 # Which arm produced a worker's settings, recorded in its published model as
-# `hp_arm`. Still recorded, and still not cosmetic: an inherited point
-# correlates with its parent's quality by construction -- the parent was drawn
-# from the top 100 -- so it cannot be read as a response curve, while an
-# independent draw can. What has changed is that there is no longer a cohort of
-# independent draws to compare against: see `hyperparameter_plan`.
+# `hp_arm`. Not cosmetic: an inherited point correlates with its parent's
+# quality by construction -- the parent was drawn from the top 100 -- so it
+# cannot be read as a response curve, while a point perturbed from the fleet's own
+# starting values can. See `hyperparameter_plan`.
 #
-# `HP_ARM_SAMPLED` is now reached only by a `poker-loop` run driven by hand,
-# where `launch_worker` is given no plan at all. Production never produces it.
+# `HP_ARM_SAMPLED` is reached only by a `poker-loop` run driven by hand, where
+# `launch_worker` is given no plan at all: the fleet's settings, unperturbed.
+# Production never produces it.
 HP_ARM_SAMPLED = "sampled"
 HP_ARM_INHERITED = "inherited"
 # **The one arm that is not inheritance, and it is not a choice.** A worker can
 # only inherit from a parent whose checkpoint actually carries the metadata; with
-# no parent, or a parent that predates the metadata, there is literally nothing
-# to perturb, so that worker draws a rung of `HP_LADDERS` instead and is labelled
-# here. Since the deliberate sampled arm was removed this is the *whole* of the
-# non-inherited population, which makes the count worth watching rather than
-# worth ignoring: it says how often inheritance was available at all, and it is
-# the only thing left keeping any worker near the ladder's known-good centre.
+# no parent, or a parent without the metadata, there is nothing of a parent's to
+# perturb, so that worker perturbs the fleet's own starting values (the flags, so
+# `config.toml`) and is labelled here. The name predates that -- it used to draw
+# a rung of a ladder -- and stays because it is recorded in published models.
+# This is the *whole* of the non-inherited population, which makes the count
+# worth watching: it says how often inheritance was available at all.
 HP_ARM_FALLBACK = "sampled-fallback"
 
 
@@ -550,10 +510,8 @@ def _typed(values: dict[str, float]) -> dict[str, float | int]:
 
     The count axes are **rounded, never truncated**: `int()` would take 1.6 down
     to 1 and then 0.8 to 0, and `ppo_epochs` 0 is a run that never updates its
-    policy at all. On the sampled path every value is already a ladder rung, so
-    the rounding is the identity there; the inherit path has already produced
-    integers of its own through `_moved_count`, which has a stronger job to do --
-    see its docstring.
+    policy at all. `_moved_count` has already produced integers of its own for the
+    perturbed counts and has a stronger job to do -- see its docstring.
     """
     return {
         axis: round(value) if axis in _HP_INT_AXES else float(value)
@@ -564,13 +522,10 @@ def _typed(values: dict[str, float]) -> dict[str, float | int]:
 def _moved_count(before: float, after: float, multiplier: float) -> int:
     """A count axis's perturbed value: **a move has to actually move.**
 
-    Plain rounding does not, and this was a real one-way ratchet rather than an
+    Plain rounding does not, and the failure is a one-way ratchet rather than an
     edge case. `round(2 * 1.2) = round(2.4) = 2` and `round(2 * 0.8) = 2`, so 2
-    was absorbing in *both* directions -- and 2 is the bottom rung of the
-    `ppo_epochs` ladder, one step below 3 and two below the fleet's own 4, so
-    lineages fell in and could never climb out. Measured on the code before this
-    function existed: **62% of lineages sat stuck at `ppo_epochs` 2 after 20
-    generations and 96% after 200**, against a median of 4 afterwards. (On
+    is absorbing in *both* directions -- and 2 is a perfectly ordinary
+    `ppo_epochs`, so lineages fall in and can never climb out. (On
     `hands` and `pool_top_n` the same state exists and is unreachable in
     practice, ~24 consecutive downward draws away.)
 
@@ -585,8 +540,7 @@ def _moved_count(before: float, after: float, multiplier: float) -> int:
     positive value by 0.8 never reaches 0: `ppo_epochs` 0 is not a smaller
     setting, it is the absence of training. 1 is a legitimate value (one PPO
     pass) and it is *reflecting*, not absorbing -- from 1 the up draw gives 2.
-    Note this does let a lineage reach 1, which the ladder's bottom rung of 2
-    never allowed.
+    Note this does let a lineage reach 1.
     """
     moved = round(after)
     if multiplier != 1.0 and moved == round(before):
@@ -594,125 +548,159 @@ def _moved_count(before: float, after: float, multiplier: float) -> int:
     return max(1, moved)
 
 
-def sample_hyperparameters(rng: random.Random) -> Hyperparameters:
-    """An independent uniform rung on every axis."""
-    drawn = {axis: rng.choice(values) for axis, values in HP_LADDERS.items()}
-    return Hyperparameters(**_typed(drawn), arm=HP_ARM_SAMPLED)
+def starting_hyperparameters(args: argparse.Namespace) -> Hyperparameters:
+    """The fleet's own settings, as the flags and `config.toml` resolved them.
+
+    Where a worker with no parent starts, and what a worker launched without a
+    plan runs unchanged. `args` stays the single definition of every default.
+    """
+    return Hyperparameters(
+        lr=args.lr,
+        hands=args.hands,
+        opponent_probability=args.opponent_probability,
+        ppo_epochs=args.ppo_epochs,
+        clip_epsilon=args.clip_epsilon,
+        pool_top_share=args.pool_top_share,
+        pool_top_n=args.pool_top_n,
+        minibatch_size=args.minibatch_size,
+        gae_lambda=args.gae_lambda,
+        value_coef=args.value_coef,
+        max_grad_norm=args.max_grad_norm,
+        entropy_coef=args.entropy_coef,
+        arm=HP_ARM_SAMPLED,
+    )
 
 
-def perturb_hyperparameters(
-    parent: dict | None, rng: random.Random
-) -> Hyperparameters | None:
-    """The parent's settings, each axis multiplied by one of `HP_MULTIPLIERS`.
+def _perturbed(
+    start: dict,
+    rng: random.Random,
+    *,
+    arm: str,
+    multipliers: Sequence[float],
+    policy: SweepPolicy | None = None,
+) -> Hyperparameters:
+    """`start` with each axis multiplied by one of `multipliers`.
 
-    Returns `None` when the parent carries nothing usable -- no metadata, a
-    schema this build does not know, or a missing axis -- so the caller can fall
-    back to sampling rather than inventing a lineage that does not exist.
-
-    **The product is unbounded and is never snapped back onto `HP_LADDERS`**, so
-    a lineage holds whatever its ancestors' draws multiplied out to and can walk
-    clean past the ends of the ladder. That is the point: this arm is a hill
-    climb, and a clamp would have the ladder's ends -- which nothing ever
-    measured -- decide how far the fleet may go, while the ranking that chooses
-    parents is a bound that was measured. See the note above `HP_LADDERS`.
-
-    `HP_LADDERS` is still what says *which* axes exist, so adding an axis there
-    is all it takes for both arms to move on it; only its *values* have stopped
-    constraining this arm.
+    **The product is unbounded and is never snapped back onto anything**, so a
+    lineage holds whatever its ancestors' draws multiplied out to and can walk
+    arbitrarily far. That is the point: this is a hill climb, and a clamp would
+    have limits nobody measured decide how far the fleet may go, while the ranking
+    that chooses parents is the bound. See the note above `HP_AXES`.
 
     The two limits that remain: a probability is capped at 1.0, and a count is
     floored at 1 by `_moved_count`, which also makes sure a count actually moves
     when the multiplier says it should.
+
+    **Which multiplier an axis takes is `policy`'s call when there is one**
+    (`rl/sweep_optimizer.py`: tilted toward the steps that gained Elo per unit of
+    compute), and a uniform draw from `multipliers` when there is not -- the draw
+    the sweep always made, from the same rng in the same order.
     """
-    if not parent or parent.get("schema") != RUN_METADATA_VERSION:
-        return None
     moved: dict[str, float] = {}
-    for axis in HP_LADDERS:
-        inherited = parent.get(axis, _HP_DEFAULTS.get(axis))
-        if not isinstance(inherited, (int, float)) or isinstance(inherited, bool):
-            return None
-        multiplier = rng.choice(HP_MULTIPLIERS)
+    chosen = policy.draw(rng) if policy is not None else None
+    for axis in HP_AXES:
+        before = start[axis]
+        multiplier = chosen[axis] if chosen is not None else rng.choice(multipliers)
         if axis in _HP_COMPLEMENT_AXES:
-            complement = max(1.0 - float(inherited), _COMPLEMENT_FLOOR)
+            complement = max(1.0 - float(before), _COMPLEMENT_FLOOR)
             moved[axis] = max(0.0, 1.0 - complement * multiplier)
             continue
-        value = float(inherited) * multiplier
-        if inherited == 0 and multiplier > 1.0 and axis in _HP_SEED_FROM_ZERO:
+        value = float(before) * multiplier
+        if before == 0 and multiplier > 1.0 and axis in _HP_SEED_FROM_ZERO:
             value = _HP_SEED_FROM_ZERO[axis]
         if axis in _HP_PROBABILITY_AXES:
             value = min(value, 1.0)
         if axis in _HP_INT_AXES:
             # Direction-aware, because plain rounding leaves a count stuck at 2
             # in both directions -- see `_moved_count`.
-            value = _moved_count(float(inherited), value, multiplier)
+            value = _moved_count(float(before), value, multiplier)
         moved[axis] = value
-    return Hyperparameters(**_typed(moved), arm=HP_ARM_INHERITED)
+    return Hyperparameters(**_typed(moved), arm=arm)
+
+
+def perturb_hyperparameters(
+    parent: dict | None,
+    rng: random.Random,
+    multipliers: Sequence[float] = HP_MULTIPLIERS,
+    policy: SweepPolicy | None = None,
+) -> Hyperparameters | None:
+    """The parent's settings, each axis multiplied by one of `multipliers`.
+
+    Returns `None` when the parent carries nothing usable -- no metadata, a
+    schema this build does not know, or a missing axis -- so the caller can start
+    from the fleet's own settings rather than invent a lineage that does not
+    exist.
+    """
+    if not parent or parent.get("schema") != RUN_METADATA_VERSION:
+        return None
+    for axis in HP_AXES:
+        inherited = parent.get(axis)
+        if not isinstance(inherited, (int, float)) or isinstance(inherited, bool):
+            return None
+    return _perturbed(
+        parent, rng, arm=HP_ARM_INHERITED, multipliers=multipliers, policy=policy
+    )
 
 
 def hyperparameter_plan(
     workers: int,
     parents: list[dict | None],
+    start: Hyperparameters,
     *,
     rng: random.Random,
+    multipliers: Sequence[float] = HP_MULTIPLIERS,
+    policy: SweepPolicy | None = None,
+    fallback_arm: str = HP_ARM_FALLBACK,
 ) -> list[Hyperparameters]:
     """What each worker of a generation trains with: its parent's settings, every
-    axis perturbed.
+    axis perturbed -- or `start`'s, for a worker with no parent.
 
-    **Every worker inherits, and the deliberate sampled arm is gone**, removed at
-    the user's request together with `--hp-inherit-share`. A worker draws a rung
-    of `HP_LADDERS` only when it *cannot* inherit -- no parent, or a parent whose
-    checkpoint carries no usable metadata -- and that case is labelled
-    `HP_ARM_FALLBACK`, not chosen.
+    **Every worker perturbs something.** A worker with a parent whose checkpoint
+    carries usable metadata perturbs that; any other perturbs `start` (the fleet's
+    own flags, so `config.toml`) and is labelled `HP_ARM_FALLBACK`, not chosen.
+    That is how the first generation after an empty store is set: write the values
+    wanted in the file and every worker starts a step or two around them.
 
-    **What that costs, recorded because it was the reason the split existed.**
-    Half the fleet used to be an independent draw, and an independent draw is the
-    only thing a response curve can be read off: an inherited point correlates
-    with its parent's quality by construction, since the parent was drawn from
-    the top 100, so the settings and the selection cannot be separated afterwards.
-    With one arm the fleet is a pure search -- it can find a good configuration
-    and can no longer say *why* it is good, or tell a good setting from a lucky
-    lineage. That is the user's call; the trade is what this paragraph is for.
+    **What that costs.** An independent point is the only thing a response curve
+    can be read off: an inherited point correlates with its parent's quality by
+    construction, since the parent was drawn from the top 100, so the settings and
+    the selection cannot be separated afterwards. The fleet is a pure search -- it
+    can find a good configuration and cannot say *why* it is good, or tell a good
+    setting from a lucky lineage.
 
-    **And the second thing it cost, which is easier to miss.** The sampled arm
-    was re-drawn from the ladder every generation, so half the fleet sat at the
-    known-good centre by construction -- an anchor the search could not drift
-    away from. Nothing anchors it now except the ranking that picks parents,
+    **And nothing anchors the search** except the ranking that picks parents,
     which matters because `HP_MULTIPLIERS` is not symmetric in log space (see the
     note there): every axis of every lineage shrinks ~1.35% per generation on
-    average, and there is no longer a cohort at the centre to pull against it.
+    average, with no cohort at the centre to pull against it.
 
     `parents[w]` is the run metadata of worker `w`'s *weight* parent, or `None`.
     The two inheritances are deliberately coupled: perturbing the settings of a
     model whose weights this worker is not starting from would attribute the
     parent's configuration to a run that never had it.
+
+    With a `policy` every worker -- the fallback ones too -- takes its multipliers
+    from it instead of drawing them uniformly; each worker's call to `policy.draw`
+    is its own posterior sample, which is what keeps the fleet trying both
+    directions where the evidence is thin.
+
+    `fallback_arm` labels the workers that perturb `start` instead of a parent's
+    settings. `run_loop` passes `HP_ARM_SAMPLED` with every parent `None` when
+    `--no-inherit-hyperparameters` is set: then *every* worker is one independent
+    step from the fleet's own values, which is what that arm has always meant.
     """
+    start_values = {axis: getattr(start, axis) for axis in HP_AXES}
     plan: list[Hyperparameters] = []
     for worker in range(workers):
-        inherited = perturb_hyperparameters(parents[worker], rng)
+        inherited = perturb_hyperparameters(parents[worker], rng, multipliers, policy)
         if inherited is not None:
             plan.append(inherited)
             continue
-        plan.append(replace(sample_hyperparameters(rng), arm=HP_ARM_FALLBACK))
+        plan.append(
+            _perturbed(
+                start_values, rng, arm=fallback_arm, multipliers=multipliers, policy=policy
+            )
+        )
     return plan
-
-
-def effective_hyperparameters(
-    hp: Hyperparameters, *, inheriting: bool, fresh_lr: float
-) -> Hyperparameters:
-    """What a worker will really train with, once `--fresh-lr` has had its say.
-
-    A worker with no parent to resume from trains at `--fresh-lr` whatever the
-    sweep drew, because a rate drawn for a warm start means nothing on a cold
-    one. That substitution has to happen in *one* place, or the supervisor
-    reports the draw while the worker trains at something else -- which is
-    exactly what it did: with an empty store the header read
-    `lr 0.00019-0.00047` while every worker logged `lr=0.001`. The worker was
-    right (its metadata records the rate actually passed), so the summary is
-    what had to change.
-    """
-    if inheriting:
-        return hp
-    return replace(hp, lr=fresh_lr)
 
 
 def read_run_metadata(path: Path | None) -> dict | None:
@@ -743,29 +731,27 @@ def inheritance_plan(
     ranking: PoolRegistry,
     models_dir: Path,
     workers: int,
-    fraction: float,
     *,
     rng: random.Random,
     tiers: Sequence[int | None] = PARENT_TIERS,
 ) -> list[Path | None]:
-    """Which model, if any, each worker starts from.
+    """Which model each worker starts from: every worker inherits.
 
-    Half the workers inheriting and half starting from a random network is a
-    deliberate split. Without any inheritance the loop produces an endless
-    supply of models that are all exactly `--iterations` deep and never deeper:
-    it generates *variety*, not *strength*, and the best model never improves.
-    With *every* worker inheriting from the same parent, all of them explore
-    around one point and a dead end (a policy collapsed onto folding, say) traps
-    the whole population at once. Splitting keeps depth and fresh blood in the
-    same loop.
+    Without inheritance the loop only ever produces models exactly
+    `--iterations` deep: it generates *variety*, not *strength*, and a
+    from-scratch worker trains worse and is far likelier to blow past the `kl`
+    threshold early. The variety a fresh start would have supplied comes from the
+    hyperparameter sweep instead. A worker gets `None` only when the store cannot
+    supply a parent at all (an empty store, the very first run ever, or no model
+    rated yet).
 
-    Inheritors take distinct parents drawn at random from the best-rated models
-    on disk (`pick_parents`: top 10/100/1000/all, a quarter each), so the deep half is competing lineages rather than
-    copies of one, and a different set every generation.
+    Parents are distinct and drawn at random from the best-rated models on disk
+    (`pick_parents`: top 10/100/1000/all, a quarter each), so the population is
+    competing lineages rather than copies of one, and a different set every
+    generation.
     """
-    inheriting = min(workers, max(0, round(workers * fraction)))
     parents = pick_parents(
-        ranking.members, available_labels(models_dir), inheriting, rng=rng, tiers=tiers
+        ranking.members, available_labels(models_dir), workers, rng=rng, tiers=tiers
     )
     plan: list[Path | None] = [None] * workers
     for index, label in enumerate(parents):
@@ -787,29 +773,11 @@ def launch_worker(
     checkpoint_path = worker_dir.parent / f"agent-{worker_dir.name}.pt"
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     worker_dir.mkdir(parents=True, exist_ok=True)
-    # Decided once: the same answer picks the learning rate and whether the
-    # worker resumes, so the two cannot drift apart.
     inheriting = inherit_from is not None and inherit_from.exists()
     # No plan means no sweep: the worker runs the fleet's own settings. `main`
-    # always builds one, so this is the hand-driven and test path, and it is
-    # what keeps `args` the single definition of every default.
+    # always builds one, so this is the hand-driven and test path.
     if hp is None:
-        hp = Hyperparameters(
-            lr=args.lr,
-            hands=args.hands,
-            opponent_probability=args.opponent_probability,
-            ppo_epochs=args.ppo_epochs,
-            clip_epsilon=args.clip_epsilon,
-            pool_top_share=args.pool_top_share,
-            pool_top_n=args.pool_top_n,
-            minibatch_size=args.minibatch_size,
-            gae_lambda=args.gae_lambda,
-            value_coef=args.value_coef,
-            max_grad_norm=args.max_grad_norm,
-            entropy_coef=args.entropy_coef,
-            arm=HP_ARM_SAMPLED,
-        )
-    hp = effective_hyperparameters(hp, inheriting=inheriting, fresh_lr=args.fresh_lr)
+        hp = starting_hyperparameters(args)
     command = [
         sys.executable,
         "-u",
@@ -817,13 +785,15 @@ def launch_worker(
         "pokerlab.rl.train",
         "--iterations", str(args.iterations),
         "--hands", str(hp.hands),
-        "--players", str(args.players),
-        "--stack", str(args.stack),
-        "--sb", str(args.sb),
-        "--bb", str(args.bb),
-        # Already resolved above by `effective_hyperparameters`: an inheritor
-        # keeps the swept rate, a worker with no parent takes `--fresh-lr`.
+        *table_arguments(table_mix_from_args(args)),
         "--lr", str(hp.lr),
+        # The fleet's network shape, as `config.toml` resolved it when this
+        # generation started.
+        *[
+            token
+            for key, value in network_shape(args).items()
+            for token in (f"--{key.replace('_', '-')}", str(value))
+        ],
         "--seed", str(seed),
         "--device", args.device,
         "--models-dir", str(args.models_dir),
@@ -849,19 +819,21 @@ def launch_worker(
         "--hp-arm", hp.arm,
         "--eval-every", str(args.eval_every),
         "--eval-sessions", str(args.eval_sessions),
-        "--archive-every", str(args.archive_every),
         "--checkpoint", str(checkpoint_path),
-        # --benchmark-dir stays: the worker rates its published model against
-        # opponents drawn from it (--benchmark-sessions). What is gone is the live
-        # per-worker benchmark that used to be forwarded here as
-        # --benchmark-every/--benchmark-hands/--benchmark-seed: removed at the
-        # user's request, the reading no longer wanted and the hands no longer
-        # worth a worker's time. `poker-loop`'s own once-per-generation
-        # benchmark (run_generation_benchmark) is a different thing and stays.
+        # The worker rates its published model against opponents drawn from the
+        # frozen set (--benchmark-sessions): the only benchmark there is.
         "--benchmark-dir", str(args.benchmark_dir),
         "--global-dir", str(args.global_dir),
         "--global-lock-seconds", str(args.global_lock_seconds),
         "--benchmark-sessions", str(args.benchmark_sessions),
+        "--benchmark-resident", str(args.benchmark_resident),
+        "--benchmark-rotate-every", str(args.benchmark_rotate_every),
+        "--k-schedule", args.k_schedule,
+        "--draw-tiers", args.draw_tiers,
+        # Every value is already on this command line, resolved by the supervisor
+        # when the generation started. A worker reading the file again would only
+        # add a way to die: a file saved halfway between the two reads.
+        "--config", "",
     ]
     if args.elo_fill_in:
         # Only the supervisor can supply the stop file, which is why the phase
@@ -870,31 +842,40 @@ def launch_worker(
         command += [
             "--elo-fill-in",
             "--fill-stop-file", str(fill_stop),
-            "--fill-min-sessions", str(args.fill_min_sessions),
             "--fill-deadline-minutes", str(args.fill_deadline_minutes),
-            "--fill-games-per-model", str(args.fill_games_per_model),
+            "--fill-sessions", str(args.fill_sessions),
         ]
-    if args.global_round:
+    if args.global_elo:
         command += [
-            "--global-round",
+            "--global-elo",
             "--global-root", str(args.global_root),
             "--global-sample", str(args.global_sample),
             "--global-benchmark-sample", str(args.global_benchmark_sample),
-            "--global-games-per-model", str(args.global_games_per_model),
-            "--global-hands-per-game", str(args.global_hands_per_game),
+            "--global-sessions", str(args.global_sessions),
+            "--session-hands", str(args.session_hands),
             "--global-trigger-size", str(args.global_trigger_size),
             "--global-eliminate-fraction", str(args.global_eliminate_fraction),
             "--global-protect-percentile", str(args.global_protect_percentile),
+            "--benchmark-games-percentile", str(args.benchmark_games_percentile),
+            "--benchmark-margin", str(args.benchmark_margin),
         ]
     else:
-        command.append("--no-global-round")
+        command.append("--no-global-elo")
     if inheriting:
         # `--resume` reads --checkpoint, so the parent is copied into place
         # first. Only the weights carry over: archives hold no optimizer state,
         # so Adam restarts cold, which costs a short transient and is much
         # cheaper than throwing the weights away too.
         shutil.copy2(inherit_from, checkpoint_path)
+        # The worker records which model it came from, so the finished child can
+        # say how much Elo it gained over it (`rl/sweep_log.py`).
         command.append("--resume")
+        # Only a worker whose settings are its parent's (perturbed) took a step
+        # from it. One that runs the fleet's own values took no step, and a
+        # "step" of toml-minus-parent would confound the optimizer's evidence with
+        # nothing but how far the parent's lineage had drifted.
+        if hp.arm == HP_ARM_INHERITED:
+            command += ["--parent-label", inherit_from.stem]
     environment = dict(os.environ)
     # One core per worker: torch's intra-op threads buy nothing on a small MLP
     # and would have N workers fighting over the same cores.
@@ -905,12 +886,11 @@ def launch_worker(
     return subprocess.Popen(command, stdout=handle, stderr=subprocess.STDOUT, env=environment)
 
 
-# How often the supervisor looks at its workers while they train. It used to
-# block in `process.wait()` and learn nothing until one exited, which is no
-# longer possible: a worker in the Elo fill-in phase deliberately does not exit
-# until this supervisor tells it to, so blocking on it would deadlock the
-# generation. Ten seconds against runs measured in hours costs nothing, and the
-# workers themselves only look at the stop file between rounds (~3 minutes), so
+# How often the supervisor looks at its workers while they train. It polls
+# instead of blocking in `process.wait()`: a worker in the Elo fill-in phase
+# deliberately does not exit until this supervisor tells it to, so blocking on
+# it would deadlock the generation. Ten seconds against runs measured in hours costs nothing, and the
+# workers themselves only look at the stop file between passes (~3 minutes), so
 # polling faster would buy nothing either.
 FILL_POLL_SECONDS = 10.0
 
@@ -926,9 +906,9 @@ def wait_for_workers(
 
     Returns `(worker, returncode)` for each worker that exited non-zero.
 
-    **Why this is not `process.wait()` any more.** Workers now finish at
+    **Why this is not `process.wait()`.** Workers finish at
     genuinely different times -- `--hands` is drawn per worker -- and the fast
-    ones spend the difference playing rating rounds instead of idling. Such a
+    ones spend the difference playing rating passes instead of idling. Such a
     worker is waiting for *this* supervisor to tell it the generation is over,
     and this supervisor was waiting for that worker to exit: each would have
     held the other until the worker's own deadline expired hours later.
@@ -937,7 +917,7 @@ def wait_for_workers(
     `FILL_DRAINING_FILENAME` in its scratch directory, meaning "I am done with
     my own work and only killing time"; when every worker still alive says that,
     the generation has really finished, and the supervisor creates `fill_stop`,
-    which every worker checks between rounds. The flag is created once and never
+    which every worker checks between passes. The flag is created once and never
     withdrawn here -- the next generation removes it before launching anything,
     so a stale flag cannot release the next generation's workers the moment they
     start.
@@ -976,21 +956,62 @@ def wait_for_workers(
     return failures
 
 
-# The fleet's machines are 32-core, and `run.sh` caps its own choice at the same
-# number (`DEFAULT_WORKER_CEILING`); the two are kept equal on purpose, so
-# `poker-loop` run by hand behaves like `./run.sh start` on the same box. Unlike
-# run.sh's, this one is *not* reduced by the machine's cores or free memory, so a
-# small VM driven by hand should pass `--workers` explicitly.
+# The most workers a machine runs, set fleet-wide in `config.toml` as
+# `worker_ceiling`. It is a *ceiling*, not a count: a small VM is held lower by
+# its own cores and free memory (`auto_workers`), which is why this can safely be
+# one number for every host while `--workers` itself stays machine-local.
+#
+# Twenty-five, not "every core": filling a 32-core box (nproc - 2 = 30) is what
+# the fleet ran before, and five of seven machines went unresponsive under it;
+# the cause was never established, but a machine at its own ceiling has no
+# headroom for the end-of-run phases, where every worker of a generation arrives
+# at the same moment and each loads ~55 models it did not hold while training.
+# Watch this one: if machines start going unresponsive, this and
+# `--global-sessions` are the two dials.
 DEFAULT_WORKERS = 25
+# Each worker is its own Python+torch process at roughly this much once its pool
+# is loaded, and the system keeps `RESERVED_MEMORY_MB` for itself.
+WORKER_MEMORY_MB = 700
+RESERVED_MEMORY_MB = 3000
 
-# What the `benchmark_arena` run requested by an added anchor is asked to do.
-# Values, not flags, on purpose: decided once for the whole fleet. K is not among
-# them -- the arena always uses the hyperbolic staircase.
-ARENA_MIN_ROUNDS = 50
-ARENA_MAX_ROUNDS = 500
-# Converged when no anchor has drifted more than this over the drift window.
-ARENA_TOLERANCE = 1.0
 
+def available_memory_mb() -> int | None:
+    """`MemAvailable` in MB, or None where `/proc/meminfo` is not there."""
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def auto_workers(
+    ceiling: int, *, cores: int | None = None, free_mb: int | None = None
+) -> int:
+    """How many workers this machine takes: `ceiling`, or less where its cores
+    (all but two) or its free memory (after the system's share) say so; never
+    below 1. Where the memory cannot be read only the cores and the ceiling count.
+    """
+    cores = os.cpu_count() or 1 if cores is None else cores
+    free_mb = available_memory_mb() if free_mb is None else free_mb
+    chosen = min(ceiling, cores - 2)
+    if free_mb is not None:
+        chosen = min(chosen, (free_mb - RESERVED_MEMORY_MB) // WORKER_MEMORY_MB)
+    return max(1, chosen)
+
+
+def resolve_workers(args: argparse.Namespace) -> argparse.Namespace:
+    """`args` with `--workers 0` (auto) turned into a number. Done again after
+    every config reload, so editing `worker_ceiling` takes effect at the next
+    generation."""
+    if args.workers > 0:
+        return args
+    return replace_namespace(args, workers=auto_workers(args.worker_ceiling))
+
+
+def replace_namespace(args: argparse.Namespace, **changes) -> argparse.Namespace:
+    return argparse.Namespace(**{**vars(args), **changes})
 
 def run_requested_benchmark_arena(
     args: argparse.Namespace, global_dir: Path, generation: int
@@ -1022,13 +1043,14 @@ def run_requested_benchmark_arena(
         "--global-dir", str(global_dir),
         "--machine", args.machine,
         "--workers", str(args.workers),
-        "--tolerance", str(ARENA_TOLERANCE),
-        "--min-rounds", str(ARENA_MIN_ROUNDS),
-        "--max-rounds", str(ARENA_MAX_ROUNDS),
     ]
-    print(f"  arena delle ancore per {added} nuovi modelli: "
-          f"{ARENA_MIN_ROUNDS}-{ARENA_MAX_ROUNDS} round, "
-          f"convergenza {ARENA_TOLERANCE}; log in {log_path}", flush=True)
+    # What it is asked to do -- total sessions, session length -- is not decided
+    # here: the arena reads it from `config.toml` like everything else, from the
+    # very file this supervisor was given. K is not among them: the arena always
+    # uses the hyperbolic staircase.
+    if args.config is not None:
+        command += ["--config", args.config]
+    print(f"  arena delle ancore per {added} nuovi modelli; log in {log_path}", flush=True)
     started = time.time()
     environment = dict(os.environ)
     # One thread per shard, as everywhere else: the arena shards the play across
@@ -1049,102 +1071,12 @@ def run_requested_benchmark_arena(
     return True
 
 
-def run_generation_benchmark(
-    args: argparse.Namespace,
-    ranking: PoolRegistry,
-    game: GameConfig,
-    generation: int = 0,
-) -> tuple[float | None, str, float | None, str]:
-    """Score two models against the frozen set: the best rated one in the store,
-    and the best one *this generation produced*.
-
-    Both are needed, and the second is the one that answers "is the loop
-    working". The overall best can be a model that predates the loop, which
-    makes the headline benchmark repeat the identical number and say nothing at
-    all about the newly trained models.
-
-    Returns `(None, "", None, "")` when no benchmark directory is configured or
-    it holds too few opponents -- a missing benchmark must not stop the loop.
-    """
-    empty = (None, "", None, "")
-    benchmark_dir = Path(args.benchmark_dir)
-    if args.benchmark_hands <= 0 or not benchmark_dir.is_dir():
-        return empty
-
-    from pokerlab.rl.benchmark import load_benchmark_opponents, run_benchmark
-
-    opponents = load_benchmark_opponents(
-        benchmark_dir,
-        game,
-        device=args.device,
-        on_skip=lambda path, why: print(f"  benchmark, saltato {path.name}: {why}", flush=True),
-    )
-    if len(opponents) < game.num_players - 1:
-        print(f"  benchmark saltato: solo {len(opponents)} avversari in {benchmark_dir}", flush=True)
-        return empty
-
-    on_disk = set(available_labels(args.models_dir))
-    models = [
-        m for m in ranking.ranked() if m.label in on_disk and not m.frozen and m.games > 0
-    ]
-    prefix = f"{args.machine}-gen{generation:04d}-"
-    fresh_models = [
-        m for m in ranking.ranked() if m.label in on_disk and m.label.startswith(prefix)
-    ]
-    if not models and not fresh_models:
-        return empty
-
-    def score(member) -> float | None:
-        try:
-            model, _checkpoint = build_model_from_checkpoint(
-                Path(args.models_dir) / f"{member.label}.pt", device=args.device
-            )
-        except Exception as exc:  # noqa: BLE001 - one bad file must not stop the loop
-            print(f"  benchmark saltato, {member.label} illeggibile: {exc}", flush=True)
-            return None
-        return run_benchmark(
-            model,
-            opponents,
-            game,
-            hands=args.benchmark_hands,
-            seed=args.benchmark_seed,
-            device=args.device,
-        ).bb_per_100
-
-    best = models[0] if models else fresh_models[0]
-    fresh = fresh_models[0] if fresh_models else None
-    # Re-scoring the same file twice would be pure waste: the benchmark is
-    # deterministic, so an identical model returns an identical number.
-    best_score = score(best)
-    fresh_score = None
-    fresh_label = ""
-    if fresh is not None:
-        fresh_label = fresh.label
-        fresh_score = best_score if fresh.label == best.label else score(fresh)
-    return best_score, best.label, fresh_score, fresh_label
-
-
 def format_leaderboard(registry: PoolRegistry, limit: int = 15) -> str:
     rows = [f"{'#':>3}  {'modello':<52}{'rating':>8}{'partite':>9}"]
     ranked = [member for member in registry.ranked() if not member.frozen]
     for position, member in enumerate(ranked[:limit], start=1):
         rows.append(f"{position:>3}  {member.label:<52}{member.rating:8.0f}{member.games:9d}")
     return "\n".join(rows)
-
-
-def render_trend(marks: list[float], width: int = 40) -> str:
-    """A bar per generation, scaled to the range actually observed.
-
-    Absolute bb/100 values mean little on their own here; what the eye needs is
-    whether the line goes up.
-    """
-    if len(marks) < 2:
-        return ""
-    low, high = min(marks), max(marks)
-    span = high - low or 1.0
-    blocks = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
-    bars = "".join(blocks[min(int((m - low) / span * len(blocks)), len(blocks) - 1)] for m in marks[-width:])
-    return f"  {low:+.0f} {bars} {high:+.0f} bb/100"
 
 
 def print_status(args: argparse.Namespace) -> None:
@@ -1177,7 +1109,42 @@ def print_status(args: argparse.Namespace) -> None:
     # printed into the supervisor log as each generation ends.
 
 
-def run_loop(args: argparse.Namespace) -> None:
+def build_sweep_policy(args: argparse.Namespace, global_dir: Path) -> SweepPolicy | None:
+    """The optimizer's policy for this generation, or None when it must not steer.
+
+    Read once per generation from what the finished children recorded
+    (`sweep_log`), and printed, because an optimizer whose estimates cannot be seen
+    is one nobody can distrust. **With `--no-sweep-optimizer` it still reads, fits
+    and prints** -- the report is how one decides whether to turn it on -- and only
+    withholds the policy, so the workers draw uniformly as before. **It never stops
+    a generation**: whatever goes wrong reading or fitting is reported and the
+    workers draw uniformly.
+    """
+    try:
+        policy = build_policy(
+            read_observations(global_dir, args.sweep_window),
+            HP_AXES,
+            _HP_COMPLEMENT_AXES,
+            args.hp_multipliers,
+            explore=args.sweep_explore,
+            warmup=args.sweep_warmup,
+            min_gain=args.sweep_min_gain,
+        )
+    except Exception as error:  # noqa: BLE001 - evidence off a shared volume
+        print(f"  sweep: ottimizzatore saltato per errore: {error}", flush=True)
+        return None
+    for line in report_lines(policy, steering=args.sweep_optimizer):
+        print(line, flush=True)
+    return policy if args.sweep_optimizer else None
+
+
+def run_loop(
+    args: argparse.Namespace,
+    reload: Callable[[], tuple[argparse.Namespace, ConfigReport]] | None = None,
+) -> None:
+    """Run generations until stopped. With `reload`, `config.toml` is re-read at
+    the start of every generation (see `refresh_args`)."""
+    args = resolve_workers(args)
     state_dir = Path(args.state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
     work_root = Path(args.work_dir)
@@ -1199,9 +1166,6 @@ def run_loop(args: argparse.Namespace) -> None:
     state.workers = args.workers
     state.save(state_path)
 
-    game = GameConfig(
-        num_players=args.players, starting_stack=args.stack, small_blind=args.sb, big_blind=args.bb
-    )
     plan_rng = random.Random()
     stopping = False
 
@@ -1236,6 +1200,8 @@ def run_loop(args: argparse.Namespace) -> None:
             print(f"trovato {stop_path}, fine.")
             break
 
+        if reload is not None:
+            args = refresh_args(args, reload)
         state.generation += 1
         generation = state.generation
         record = GenerationRecord(
@@ -1258,28 +1224,31 @@ def run_loop(args: argparse.Namespace) -> None:
             ranking,
             models_dir,
             args.workers,
-            args.inherit_fraction,
             rng=plan_rng,
+            tiers=parse_parent_tiers(args.parent_tiers),
         )
         # Read once per generation, off the very checkpoints the workers are
         # about to resume from: at most `--workers` files, and only for the
         # workers that have a parent at all.
+        sweep_policy = build_sweep_policy(args, global_dir)
+        if args.inherit_hyperparameters:
+            parent_settings = [read_run_metadata(parent) for parent in plan]
+            fallback_arm = HP_ARM_FALLBACK
+        else:
+            # The weights are inherited, the settings are not: every worker is one
+            # independent step from the fleet's own values (`config.toml`), whoever
+            # its parent was, and is labelled `sampled`.
+            parent_settings = [None] * args.workers
+            fallback_arm = HP_ARM_SAMPLED
         hp_plan = hyperparameter_plan(
             args.workers,
-            [read_run_metadata(parent) for parent in plan],
+            parent_settings,
+            starting_hyperparameters(args),
             rng=plan_rng,
+            multipliers=args.hp_multipliers,
+            policy=sweep_policy,
+            fallback_arm=fallback_arm,
         )
-        # Resolved here, exactly as `launch_worker` resolves it again (the
-        # substitution is idempotent), so the header below and the workers' own
-        # logs cannot report different learning rates.
-        hp_plan = [
-            effective_hyperparameters(
-                hp,
-                inheriting=plan[worker] is not None and plan[worker].exists(),
-                fresh_lr=args.fresh_lr,
-            )
-            for worker, hp in enumerate(hp_plan)
-        ]
         processes = []
         for worker in range(args.workers):
             worker_dir = work_root / f"gen{generation:04d}-w{worker:02d}"
@@ -1296,20 +1265,26 @@ def run_loop(args: argparse.Namespace) -> None:
             )
         inheriting = sum(1 for parent in plan if parent is not None)
         print(f"  {inheriting}/{args.workers} ereditano i pesi, "
-              f"{args.workers - inheriting} partono da zero (lr {args.fresh_lr:g}); "
+              f"{args.workers - inheriting} partono da zero; "
               f"ognuno pesca il proprio pool da {len(available_labels(models_dir))} modelli",
               flush=True)
         arms = [hp.arm for hp in hp_plan]
-        # The fallback count is the one worth printing, and now more than before:
-        # it is the *whole* of the non-inherited population, so it says how often
-        # inheritance was available at all. An arm silently empty is exactly what
-        # this line exists to make impossible to miss.
-        print(f"  iperparametri: {arms.count(HP_ARM_INHERITED)} ereditati e perturbati"
-              + (f", {arms.count(HP_ARM_FALLBACK)} campionati per mancanza di "
-                 f"metadati nel genitore" if HP_ARM_FALLBACK in arms else "")
-              + f"; lr {min(hp.lr for hp in hp_plan):g}-{max(hp.lr for hp in hp_plan):g}, "
-              f"mani {min(hp.hands for hp in hp_plan)}-{max(hp.hands for hp in hp_plan)}",
-              flush=True)
+        spread = (
+            f"lr {min(hp.lr for hp in hp_plan):g}-{max(hp.lr for hp in hp_plan):g}, "
+            f"mani {min(hp.hands for hp in hp_plan)}-{max(hp.hands for hp in hp_plan)}"
+        )
+        if not args.inherit_hyperparameters:
+            print(f"  iperparametri: non ereditati, ogni worker perturba i valori di "
+                  f"config.toml; {spread}", flush=True)
+        else:
+            # The fallback count is the one worth printing:
+            # it is the *whole* of the non-inherited population, so it says how often
+            # inheritance was available at all. An arm silently empty is exactly what
+            # this line exists to make impossible to miss.
+            print(f"  iperparametri: {arms.count(HP_ARM_INHERITED)} ereditati e perturbati"
+                  + (f", {arms.count(HP_ARM_FALLBACK)} dai valori di partenza (nessun "
+                     f"genitore con metadati)" if HP_ARM_FALLBACK in arms else "")
+                  + f"; {spread}", flush=True)
 
         state.phase = "training"
         state.save(state_path)
@@ -1319,7 +1294,7 @@ def run_loop(args: argparse.Namespace) -> None:
             record.failed += 1
             print(f"  worker {worker} uscito con codice {code}", flush=True)
 
-        # Each worker publishes its own best model as it exits; this catches the
+        # Each worker publishes its own model as it exits; this catches the
         # ones that died first, and removes the scratch either way.
         state.phase = "publishing"
         state.save(state_path)
@@ -1328,23 +1303,7 @@ def run_loop(args: argparse.Namespace) -> None:
         record.published_models = sum(1 for label in available_labels(models_dir) if label.startswith(prefix))
         print(f"  pubblicati {record.published_models} nuovi modelli", flush=True)
 
-        state.phase = "benchmark"
-        state.save(state_path)
         ranking = load_global_registry(global_dir)
-        (
-            record.benchmark_bb100,
-            record.benchmark_model,
-            record.benchmark_new_bb100,
-            record.benchmark_new_model,
-        ) = run_generation_benchmark(args, ranking, game, generation)
-        if record.benchmark_bb100 is not None:
-            print(f"  benchmark, migliore assoluto ({record.benchmark_model}): "
-                  f"{record.benchmark_bb100:+.1f} bb/100", flush=True)
-        if record.benchmark_new_bb100 is not None:
-            print(f"  benchmark, migliore di questa generazione "
-                  f"({record.benchmark_new_model}): "
-                  f"{record.benchmark_new_bb100:+.1f} bb/100", flush=True)
-
         ranked = [m for m in ranking.ranked() if not m.frozen]
         best = ranked[0] if ranked else None
         record.best_label = best.label if best else ""
@@ -1371,30 +1330,80 @@ def run_loop(args: argparse.Namespace) -> None:
     state.save(state_path)
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Continuous self-play training: N worker processes, one shared store of models."
     )
     parser.add_argument("--status", action="store_true", help="print the leaderboard and exit")
     parser.add_argument(
         "--workers", type=int, default=DEFAULT_WORKERS,
-        help="concurrent training processes",
+        help="concurrent training processes; 0 = as many as this machine holds, "
+             "up to --worker-ceiling (what run.sh passes)",
+    )
+    parser.add_argument(
+        "--worker-ceiling", type=int, default=DEFAULT_WORKERS,
+        help="with --workers 0, the most workers any machine runs; a small one "
+             "still gets fewer, held by its cores (all but two) and free memory",
     )
     parser.add_argument(
         "--generations", type=int, default=0, help="0 runs until stopped (Ctrl-C or a STOP file)"
     )
-    parser.add_argument("--iterations", type=int, default=100, help="iterations per worker run")
+    parser.add_argument("--iterations", type=int, default=1000, help="iterations per worker run")
     parser.add_argument("--hands", type=int, default=512)
-    parser.add_argument("--players", type=int, default=6)
-    parser.add_argument("--stack", type=int, default=200)
-    parser.add_argument("--sb", type=int, default=1)
-    parser.add_argument("--bb", type=int, default=2)
+    add_table_arguments(parser)
+    add_network_arguments(parser)
     parser.add_argument("--lr", type=float, default=3e-4,
-                        help="learning rate of the workers that inherit weights")
+                        help="starting learning rate of the workers with no parent "
+                        "to inherit settings from; every worker then perturbs it")
     parser.add_argument(
-        "--fresh-lr", type=float, default=1e-3,
-        help="learning rate of the workers that start from a random network; "
-             "higher than --lr because they have further to travel (default 1e-3)",
+        "--hp-multipliers", type=float, nargs="+", default=list(HP_MULTIPLIERS),
+        help="the factors a worker draws from, independently per axis, to move its "
+        "starting settings (its parent's, or the flags' when it has no parent); "
+        "repeat a value to make it likelier, keep 1.0 in the list so an axis can "
+        "stay put",
+    )
+    parser.add_argument(
+        "--inherit-hyperparameters", dest="inherit_hyperparameters", action="store_true",
+        default=True,
+        help="a worker starts from its parent's settings and perturbs them; on by default",
+    )
+    parser.add_argument(
+        "--no-inherit-hyperparameters", dest="inherit_hyperparameters", action="store_false",
+        help="a worker does not start from its parent's settings: it perturbs the "
+        "values of config.toml (or the flags) instead, as one with no parent does. "
+        "The weights are still inherited",
+    )
+    parser.add_argument(
+        "--sweep-optimizer", dest="sweep_optimizer", action="store_true", default=True,
+        help="choose the multipliers from what the finished children gained in Elo "
+        "per unit of compute, instead of drawing them uniformly; on by default, and "
+        "uniform until --sweep-warmup children have been seen. Off, the estimate is "
+        "still fitted and printed each generation, it just does not steer",
+    )
+    parser.add_argument(
+        "--no-sweep-optimizer", dest="sweep_optimizer", action="store_false",
+        help="draw every multiplier uniformly, as the sweep did before the optimizer "
+        "(the estimate is still printed)",
+    )
+    parser.add_argument(
+        "--sweep-explore", type=float, default=DEFAULT_EXPLORE,
+        help="probability that an axis is drawn uniformly whatever the optimizer "
+        "thinks: an axis every worker moves the same way stops varying, and its "
+        "effect stops being measurable",
+    )
+    parser.add_argument(
+        "--sweep-warmup", type=int, default=DEFAULT_WARMUP,
+        help="children that must have been observed before the optimizer steers",
+    )
+    parser.add_argument(
+        "--sweep-window", type=int, default=DEFAULT_WINDOW,
+        help="how many of the most recent children the optimizer reads; older ones "
+        "describe a fleet that has moved on",
+    )
+    parser.add_argument(
+        "--sweep-min-gain", type=float, default=DEFAULT_MIN_GAIN,
+        help="Elo a unit of relative cost is worth, at least: the objective is gain "
+        "per compute, and with no average gain left it would otherwise reward cost",
     )
     parser.add_argument("--device", default="cpu")
     parser.add_argument(
@@ -1413,10 +1422,7 @@ def main() -> None:
     parser.add_argument("--pool-top-n", type=int, default=DEFAULT_TOP_N)
     # These exist here only as the value a worker gets when no plan is drawn,
     # which is the hand-driven path; what production launches with comes from
-    # `hyperparameter_plan`. (`--hp-inherit-share` used to sit here, deciding how
-    # much of a generation drew its own settings instead of inheriting them. It
-    # is gone with the sampled arm: every worker inherits now, and the only ones
-    # that do not are the ones that cannot.)
+    # `hyperparameter_plan`.
     parser.add_argument("--ppo-epochs", type=int, default=PPOConfig.epochs)
     parser.add_argument("--clip-epsilon", type=float, default=PPOConfig.clip_epsilon)
     parser.add_argument("--minibatch-size", type=int, default=PPOConfig.minibatch_size)
@@ -1439,32 +1445,15 @@ def main() -> None:
     parser.add_argument("--eval-every", type=int, default=100)
     parser.add_argument(
         "--eval-sessions", type=int, default=DEFAULT_EVAL_SESSIONS,
-        help="rated sessions per validation round of a worker, each 1000 hands. "
+        help="rated sessions per validation pass of a worker, each 1000 hands. "
         "At --eval-every 100 over a 1000-iteration run that is 100 rated "
-        "sessions, which continue into the round against the frozen anchors",
+        "sessions, which continue into the pass against the frozen anchors",
     )
-    parser.add_argument("--archive-every", type=int, default=50)
     parser.add_argument(
         "--benchmark-dir",
         type=Path,
         default=DEFAULT_BENCHMARK_DIR,
-        help="frozen opponents, never seated in training; the only cross-generation metric",
-    )
-    parser.add_argument(
-        "--benchmark-hands", type=int, default=DEFAULT_BENCHMARK_HANDS, help="0 disables"
-    )
-    parser.add_argument(
-        "--benchmark-seed",
-        type=int,
-        default=12345,
-        help="held fixed so every generation is dealt the identical hands",
-    )
-    parser.add_argument(
-        "--inherit-fraction",
-        type=float,
-        default=1.0,
-        help="share of workers that resume from a top-rated model instead of a "
-        "random network (0 = every run starts from scratch)",
+        help="frozen opponents, never seated in training; each worker rates its model against them",
     )
     parser.add_argument(
         "--machine",
@@ -1472,18 +1461,18 @@ def main() -> None:
         help="identifier prefixed to published models, so hosts cannot collide",
     )
     parser.add_argument(
-        "--global-round",
-        dest="global_round",
+        "--global-elo",
+        dest="global_elo",
         action="store_true",
         default=True,
-        help="have every worker try one cross-population Elo round "
+        help="have every worker try one cross-population Elo pass "
         "(rl/global_arena.py) at the end of its run; on by default",
     )
     parser.add_argument(
-        "--no-global-round",
-        dest="global_round",
+        "--no-global-elo",
+        dest="global_elo",
         action="store_false",
-        help="disable the end-of-run population round for every worker",
+        help="disable the end-of-run population pass for every worker",
     )
     # On by default here, and off by default in `poker-train`: the phase only
     # makes sense when there are other workers to wait for, and only a
@@ -1493,7 +1482,7 @@ def main() -> None:
         dest="elo_fill_in",
         action="store_true",
         default=True,
-        help="have a worker that finished early keep playing rating rounds "
+        help="have a worker that finished early keep playing rating passes "
         "until the rest of its generation catches up; on by default",
     )
     parser.add_argument(
@@ -1503,32 +1492,43 @@ def main() -> None:
         help="let a worker that finished early exit and leave its core idle",
     )
     parser.add_argument(
-        "--fill-min-sessions", type=int, default=DEFAULT_FILL_MIN_SESSIONS,
-        help="sessions each filling worker plays before the stop file can end "
-        "its phase, so a generation still gets a rating phase when every worker "
-        "finishes together",
-    )
-    parser.add_argument(
         "--fill-deadline-minutes", type=float, default=DEFAULT_FILL_DEADLINE_MINUTES,
         help="hard cap on one worker's fill-in phase, in minutes; the only cap "
         "there is, and what stops a worker whose supervisor died from filling "
         "forever",
     )
     parser.add_argument(
-        "--fill-games-per-model", type=int, default=DEFAULT_FILL_GAMES_PER_MODEL,
-        help="rated sessions each drawn model owes per fill-in round",
+        "--fill-sessions", type=int, default=DEFAULT_FILL_SESSIONS,
+        help="rated sessions of one fill-in pass, models drawn at random",
     )
     parser.add_argument("--global-dir", type=Path, default=DEFAULT_GLOBAL_DIR)
     parser.add_argument("--global-root", type=Path, default=Path("checkpoints"))
     parser.add_argument("--global-sample", type=int, default=DEFAULT_POPULATION_SAMPLE)
     parser.add_argument("--global-benchmark-sample", type=int, default=DEFAULT_BENCHMARK_SAMPLE)
     parser.add_argument(
-        "--global-games-per-model", type=int, default=DEFAULT_GAMES_PER_MODEL,
-        help="rated sessions each drawn model owes per population round; the "
-        "round's cost is very nearly linear in it (~1.1 s per session)",
+        "--draw-tiers", type=draw_tiers_text, default=format_parent_tiers(DRAW_TIERS),
+        help="who the population passes (end of run and fill-in) seat: the cutoffs "
+             "of the rating ranking, each with an equal share of the seats (a tier is "
+             "the best N rated models, or 'all'); a tier listed twice gets twice the "
+             "share; forwarded to every worker",
     )
-    parser.add_argument("--global-hands-per-game", type=int, default=DEFAULT_HANDS_PER_GAME)
+    parser.add_argument(
+        "--global-sessions", type=int, default=DEFAULT_GLOBAL_SESSIONS,
+        help="rated sessions of the end-of-run population pass, models drawn at "
+        "random; the pass's cost is very nearly linear in it (~1.1 s per session)",
+    )
     parser.add_argument("--global-lock-seconds", type=int, default=DEFAULT_LOCK_SECONDS)
+    parser.add_argument(
+        "--k-schedule", type=k_schedule_text, default=format_k_schedule(DEFAULT_K_SCHEDULE),
+        help="the Elo K staircase as games:K pairs, e.g. '0:16, 20:11, 45:7.4': the K a "
+             "model is rated at once it has played that many sessions; forwarded to every worker",
+    )
+    parser.add_argument(
+        "--parent-tiers", type=parent_tiers_text, default=format_parent_tiers(PARENT_TIERS),
+        help="where a worker's parent comes from: each worker picks one of these bands "
+             "with equal probability (a band is the best N rated models, or 'all'), then "
+             "a model uniformly inside it; a band listed twice is drawn twice as often",
+    )
     parser.add_argument("--global-trigger-size", type=int, default=DEFAULT_POPULATION_TRIGGER)
     parser.add_argument(
         "--global-eliminate-fraction", type=float, default=DEFAULT_ELIMINATION_FRACTION
@@ -1537,11 +1537,32 @@ def main() -> None:
         "--global-protect-percentile", type=float, default=DEFAULT_PROTECT_PERCENTILE
     )
     parser.add_argument(
+        "--benchmark-games-percentile", type=float, default=BENCHMARK_GAMES_PERCENTILE,
+        help="a model becomes a frozen anchor only if its games are above this "
+        "percentile of the population's (a rating built on few games is not evidence)",
+    )
+    parser.add_argument(
+        "--benchmark-margin", type=float, default=BENCHMARK_MARGIN,
+        help="a model becomes a frozen anchor only if its rating is more than this "
+        "many points above the best anchor; candidates added together must also "
+        "clear each other by more than this",
+    )
+    parser.add_argument(
         "--benchmark-sessions", type=int, default=DEFAULT_BENCHMARK_SESSIONS,
         help="rated sessions of 1000 hands each worker's published model plays "
         "against opponents drawn at random from the frozen set, before the "
-        "population round (0 disables). This is what the model is published "
+        "population pass (0 disables). This is what the model is published "
         "with: its rating and its session count both come out of it",
+    )
+    parser.add_argument(
+        "--benchmark-resident", type=int, default=DEFAULT_RESIDENT_ANCHORS,
+        help="frozen anchors each worker holds in memory at once during that "
+        "round (a random slice, dropped for the next)",
+    )
+    parser.add_argument(
+        "--benchmark-rotate-every", type=int, default=DEFAULT_ANCHOR_ROTATE_EVERY,
+        help="rated sessions played against one slice of anchors before a new "
+        "slice is drawn",
     )
     parser.add_argument("--seed-base", type=int, default=1000)
     parser.add_argument("--top", type=int, default=15, help="rows shown in the leaderboard")
@@ -1556,7 +1577,70 @@ def main() -> None:
         action="store_true",
         help="keep each worker's scratch directory and skip the residue sweep",
     )
-    args = parser.parse_args()
+    add_config_arguments(parser)
+    return parser
+
+
+def _sibling_parsers() -> list[argparse.ArgumentParser]:
+    """Every other CLI that reads `config.toml`: a key meant for one is not a typo here."""
+    return sibling_parsers("pokerlab.rl.loop", with_torch=True)
+
+
+def load_args(argv: Sequence[str]) -> tuple[argparse.Namespace, ConfigReport]:
+    """Flags and `config.toml` resolved into one namespace (flags win)."""
+    args, report = parse_with_config(build_parser(), argv, siblings=_sibling_parsers)
+    # Here and not in argparse's `type=`, so a bad list in the file is a
+    # `ConfigError` like any other: a warning on a reload, an exit at startup.
+    if not all(math.isfinite(m) and m > 0 for m in args.hp_multipliers):
+        raise ConfigError("hp_multipliers must be positive numbers")
+    try:
+        check_network_arguments(args)
+    except ValueError as error:
+        raise ConfigError(str(error)) from error
+    if not 0.0 <= args.sweep_explore <= 1.0:
+        raise ConfigError("sweep_explore must be between 0 and 1")
+    if args.sweep_warmup < 0 or args.sweep_window < 1:
+        raise ConfigError("sweep_warmup must be >= 0 and sweep_window >= 1")
+    if not math.isfinite(args.sweep_min_gain) or args.sweep_min_gain < 0:
+        raise ConfigError("sweep_min_gain must be a non-negative number")
+    return args, report
+
+
+def refresh_args(
+    args: argparse.Namespace,
+    reload: Callable[[], tuple[argparse.Namespace, ConfigReport]],
+) -> argparse.Namespace:
+    """`args` as the file reads *now*, or `args` unchanged if it cannot be read.
+
+    Called once per generation, which is what lets the fleet be retuned without
+    restarting a supervisor that lives for weeks. A file saved halfway or with a
+    typo must never reach a running loop, so any problem is a warning and the
+    previous values carry on.
+    """
+    try:
+        fresh, _report = reload()
+    except ConfigError as error:
+        print(f"  config: {error}; tengo i valori precedenti", flush=True)
+        return args
+    fresh = resolve_workers(fresh)
+    changes = diff_settings(vars(args), vars(fresh))
+    if changes:
+        print("  config riletto, cambiato: " + "; ".join(changes), flush=True)
+    return fresh
+
+
+def main() -> None:
+    argv = sys.argv[1:]
+    parser = build_parser()
+    try:
+        args, report = load_args(argv)
+    except ConfigError as error:
+        parser.exit(2, f"{parser.prog}: config: {error}\n")
+    if args.print_config:
+        print(format_config(vars(args), [k for k, v in report.applied.items() if vars(args)[k] == v]))
+        return
+    if report.path is not None and not args.status:
+        print(f"config: {report.path}, {len(report.applied)} valori", flush=True)
 
     if args.status:
         if args.watch <= 0:
@@ -1574,7 +1658,7 @@ def main() -> None:
         except KeyboardInterrupt:
             return
         return
-    run_loop(args)
+    run_loop(args, reload=lambda: load_args(argv))
 
 
 if __name__ == "__main__":

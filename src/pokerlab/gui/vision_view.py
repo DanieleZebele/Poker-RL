@@ -9,8 +9,7 @@ table, and only "Conferma" writes the PNG and its label to `vision_data/crops/`.
 These are the examples the card recognition is built from. The dealer and player
 sections collect their own crops the same way, and every section has an
 "Anteprima" showing its zones as captured now. Checking what is *read* is left to
-the spot screen, which reads every zone every half second (a "Test vision model"
-section that did it here was removed at the user's request).
+the spot screen, which reads every zone every half second.
 """
 
 from __future__ import annotations

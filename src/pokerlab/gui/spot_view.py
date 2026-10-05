@@ -56,7 +56,7 @@ ENGINE_SMALL_BLIND = 1
 ENGINE_BIG_BLIND = 2
 DEFAULT_STACK_BB = "100"
 # How often the hand and the board are read off the poker client.
-# Half a second, at the user's request (it was 2 s): a reading costs ~60 ms on
+# Half a second: a reading costs ~60 ms on
 # the Tk thread (one grab of every zone, see `capture.grab_regions`), so this
 # keeps the screen ~88% free, and catches a raise before it is swept into the pot.
 SCREEN_POLL_MS = 500
@@ -342,7 +342,7 @@ class SpotFrame(ttk.Frame):
         self.log.pack(fill="x")
         advisors = ttk.LabelFrame(side, text=f"Consiglio dei top {DEFAULT_ADVISORS}", padding=6)
         advisors.pack(fill="both", expand=True, pady=(8, 0))
-        # No "ask" button (removed at the user's request): the models answer by
+        # No "ask" button: the models answer by
         # themselves whenever it is your turn with both your cards known.
         ttk.Label(advisors, textvariable=self.status_var, wraplength=300).pack(anchor="w", pady=2)
         self.advice = tk.Text(advisors, width=36, state="disabled", wrap="word")

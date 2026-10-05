@@ -6,7 +6,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from pokerlab.engine.config import GameConfig
+from support import fixed_mix
+
 from pokerlab.rl.action_space import ACTION_DIM
 from pokerlab.rl.features import OBS_DIM
 from pokerlab.rl.policy import PokerActorCritic, make_policy_fn
@@ -79,17 +80,16 @@ def test_gradients_flow_to_both_heads(model):
     mask = torch.ones(8, ACTION_DIM, dtype=torch.bool)
     logits, values = model(features, mask)
     (logits.sum() + values.sum()).backward()
-    assert model.policy_head.weight.grad is not None
-    assert model.value_head.weight.grad is not None
-    assert torch.any(model.policy_head.weight.grad != 0.0)
+    assert model.policy_head[-1].weight.grad is not None
+    assert model.value_head[-1].weight.grad is not None
+    assert torch.any(model.policy_head[-1].weight.grad != 0.0)
 
 
 def test_a_network_policy_plays_a_real_session_and_produces_trajectories(model):
     """The end-to-end bridge: torch tensors on one side, the plain-Python
     engine on the other, with no engine changes in between."""
     torch.manual_seed(1)
-    config = GameConfig(num_players=4, starting_stack=200, small_blind=1, big_blind=2)
-    collector = SelfPlayCollector(config, make_policy_fn(model), rng=random.Random(5))
+    collector = SelfPlayCollector(fixed_mix(4, stack_bb=100), make_policy_fn(model), rng=random.Random(5))
     trajectories = collector.collect(15)
 
     assert trajectories

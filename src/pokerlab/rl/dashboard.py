@@ -40,6 +40,7 @@ from urllib.parse import parse_qs, urlparse
 # not tidiness: importing torch on the NFS server under load was measured at over
 # five minutes. `rl/monitor.py` exists so this file never has to import
 # `rl/loop.py`, which pulls torch in through `rl/ppo.py`.
+from pokerlab.config import add_config_arguments, resolve_cli
 from pokerlab.rl.global_store import DEFAULT_MODELS_DIR
 from pokerlab.rl.monitor import (
     DEFAULT_MAX_POINTS,
@@ -50,6 +51,7 @@ from pokerlab.rl.monitor import (
     worker_history,
     worker_progress,
 )
+from pokerlab.rl.siblings import sibling_parsers
 from pokerlab.rl.training_pool import available_labels
 
 DEFAULT_BENCHMARK_DIR = Path("checkpoints/benchmark")
@@ -160,15 +162,14 @@ def store_ratings(global_dir: Path) -> dict:
 
     Read straight out of the `registry.json` snapshot rather than through
     `load_ranking`, because nothing here needs `PoolMember` objects and parsing
-    ~9,200 of them is wasted work for four numbers (measured: 0.21 s either way,
-    so this is about not carrying the objects rather than about speed). The
+    thousands of them is wasted work for four numbers (so this is about not
+    carrying the objects rather than about speed). The
     snapshot may be a few minutes stale, which is exactly what a monitoring page
     wants -- and it is never used to decide anything.
 
-    **The top-1% mean is the number to watch**: the population's best models have
-    been flat at ~1578-1610 across every age cohort, which is the evidence that the
-    loop generates variety without accumulating strength (see "The ranking is wrong
-    at the top" in CLAUDE.md).
+    **The top-1% mean is the number to watch**: if the population's best models
+    stay flat across every age cohort, the loop generates variety without
+    accumulating strength.
     """
     snapshot = Path(global_dir) / "registry.json"
     try:
@@ -338,7 +339,7 @@ function dur(a){
 }
 
 // The two stages that take the best part of an hour each -- the benchmark
-// round and the population round -- report how far in they are. Without it the
+// pass and the population pass -- report how far in they are. Without it the
 // cell reads "elo: gioco" for ninety minutes and says nothing about whether the
 // worker is moving.
 function stage(w){
@@ -377,15 +378,13 @@ function tiles(d){
 }
 
 /* How this machine's generation splits between the two arms, so the sweep is
-   visible without opening a panel. Absent when no worker recorded any, which is
-   every log written before the sweep existed. */
+   visible without opening a panel. Absent when no worker recorded any. */
 function sweepPill(m){
   const counts = new Map();
   for (const w of m.workers){
     const hp = w.hyperparameters;
     if (!hp || !Object.keys(hp).length) continue;
-    /* An absent hp_arm is counted, not skipped: it is how a machine still
-       running an old supervisor identifies itself. */
+    /* An absent hp_arm is counted, not skipped. */
     const arm = hp.hp_arm || '';
     counts.set(arm, (counts.get(arm) || 0) + 1);
   }
@@ -406,7 +405,7 @@ function machine(m){
     <span class="pill">${esc(m.phase)}</span>
     <span class="pill">${m.done}/${m.workers.length} worker completi</span>
     ${m.finish_eta === null || m.finish_eta === undefined ? ''
-      : `<span class="pill" title="il worker piu' lento nei giri finali di elo e ancore">fine ~${dur(m.finish_eta)}</span>`}
+      : `<span class="pill" title="il worker piu' lento nelle passate finali di elo e ancore">fine ~${dur(m.finish_eta)}</span>`}
     ${sweepPill(m)}
     <span class="grow"></span>
     <span class="bar"><i style="width:${pct}%"></i></span><span class="dim">${pct}%</span>
@@ -427,7 +426,7 @@ function machine(m){
       <td>${sig(w.eval)}</td>
       <td class="mono">${w.rating === '-' ? '<span class="dim">&ndash;</span>' : esc(w.rating)}</td>
       <td class="mono dim">${w.pool_rating === '-' ? '<span class="dim">&ndash;</span>' : esc(w.pool_rating)}</td>
-      <td${w.benchmark_live ? ' class="dim" title="provvisorio: giro contro le ancore in corso (' + w.benchmark_sessions + ' sessioni)"' : ''}>${num(w.benchmark_bb100, 1)}</td>
+      <td${w.benchmark_live ? ' class="dim" title="provvisorio: passata contro le ancore in corso (' + w.benchmark_sessions + ' sessioni)"' : ''}>${num(w.benchmark_bb100, 1)}</td>
       <td class="mono${w.benchmark_live ? ' dim' : ''}">${w.benchmark_rating === '-' ? '<span class="dim">&ndash;</span>' : esc(w.benchmark_rating) + (w.benchmark_live ? '~' : '')}</td>
       <td class="dim">${w.entropy}</td>
       <td>${age(w.age)}</td>
@@ -444,10 +443,10 @@ function machine(m){
       contro pool e propri snapshot (~&plusmn;3 bb/100 a finestra piena) &middot;
       eval = ultima valutazione contro il pool estratto &middot;
       pool = rating medio del campo pescato da quel worker, cio&egrave; contro chi valgono eval e rating &middot;
-      serie = giro finale per ogni cartella benchmark &middot;
+      serie = passata finale per ogni cartella benchmark &middot;
       entropia = quanto la policy sta ancora mischiando (tetto ln 11 = 2.40) &middot;
       <b>!</b> = log fermo da oltre 10 minuti &middot;
-      la fase mostra l'avanzamento e il tempo stimato per i due giri finali (serie ed elo), che durano circa un'ora ciascuno &middot;
+      la fase mostra l'avanzamento e il tempo stimato per le due passate finali (serie ed elo), che durano circa un'ora ciascuno &middot;
       <b>clicca una riga</b> per gli iperparametri di quel worker e le curve di addestramento</p>
   </div>`;
 }
@@ -557,6 +556,98 @@ function chartBox(title, note, last, sets, o){
     <canvas></canvas></div>`;
 }
 
+/* The critic's target, by table size and by effective stack. A light-to-dark ramp
+   of one hue rather than a colour per group: the groups are ordered (smaller to
+   larger table, shorter to deeper stack) and eight unrelated colours would not say
+   so. The lightness range stays clear of both ends so a line reads on the light
+   and the dark theme alike. */
+const STACK_ORDER = ['<10', '10-30', '30+'];
+function ramp(i, n){
+  return `hsl(212, 62%, ${n < 2 ? 55 : Math.round(76 - 36 * i / (n - 1))}%)`;
+}
+function groupSets(series, order){
+  const names = order.filter(k => (series || {})[k] && series[k].length);
+  return names.map((k, i) => ({name: k, color: ramp(i, names.length), pts: series[k]}));
+}
+function lastOf(pts){ return pts && pts.length ? pts[pts.length - 1][1] : null; }
+
+/* How the model plays: each statistic's rate over its recent training hands
+   (`rl/style_log.py`), in percent. Preflop and postflop get a chart each, so no
+   chart carries more than five lines. A statistic the page does not know by name
+   still shows, under its own name, in the second chart. */
+const STYLE_LABELS = {
+  vpip: 'VPIP', pfr: 'PFR', three_bet: '3-bet', fold_to_three_bet: 'fold al 3-bet',
+  steal: 'steal', aggression: 'aggressivit\u00e0', cbet: 'c-bet',
+  fold_to_cbet: 'fold alla c-bet', wtsd: 'WTSD',
+};
+const STYLE_PREFLOP = ['vpip', 'pfr', 'three_bet', 'fold_to_three_bet', 'steal'];
+
+function styleSpec(hist, names, title){
+  const series = hist.style_rate || {}, latest = hist.style_latest || {};
+  const shown = names.filter(k => (series[k] || []).length);
+  const sets = shown.map((k, i) => ({
+    name: STYLE_LABELS[k] || k, color: ramp(i, shown.length),
+    pts: series[k].map(p => [p[0], p[1] * 100]),
+  }));
+  /* The legend already names the lines, so the last values go in the note with
+     the sample behind each: a rate over 40 chances and over 4,000 are not the same.
+     Names come from a fixed map or from `\\w+` in the log line, so need no escaping. */
+  const values = shown.map(k => {
+    const pts = series[k];
+    return `${STYLE_LABELS[k] || k} ${(pts[pts.length - 1][1] * 100).toFixed(0)}% (${latest[k][0]}/${latest[k][1]})`;
+  }).join(' &middot; ');
+  return {
+    o: {d: 0, zero: true}, sets, title,
+    note: shown.length
+      ? `% delle volte che ha scelto l'azione quando poteva, sulle ultime ${hist.style_hands} mani sedute dal modello (finestra mobile) &middot; ora: ${values}`
+      : '',
+    last: '',
+  };
+}
+
+function styleSpecs(hist){
+  const all = Object.keys(hist.style_rate || {});
+  const post = all.filter(k => !STYLE_PREFLOP.includes(k));
+  const known = ['aggression', 'cbet', 'fold_to_cbet', 'wtsd'];
+  post.sort((a, b) => (known.indexOf(a) + 1 || 99) - (known.indexOf(b) + 1 || 99));
+  return [
+    styleSpec(hist, STYLE_PREFLOP, 'stile del modello: preflop (%)'),
+    styleSpec(hist, post, 'stile del modello: postflop (%)'),
+  ];
+}
+
+function valueSpecs(hist){
+  const cs = getComputedStyle(document.documentElement);
+  const C = k => cs.getPropertyValue(k).trim();
+  const sizeSets = groupSets(hist.value_sd_size,
+    Object.keys(hist.value_sd_size || {}).sort((a, b) => a - b));
+  const stackSets = groupSets(hist.value_sd_stack, STACK_ORDER);
+  const evSets = groupSets(hist.value_ev_stack, STACK_ORDER);
+  const spSize = hist.value_spread_size || [], spStack = hist.value_spread_stack || [];
+  const x = v => v === null ? '&ndash;' : v.toFixed(1) + 'x';
+  return [
+    {o: {d: 3, zero: true}, sets: stackSets,
+     title: 'target del critico per stack (sd)',
+     note: 'deviazione standard del return per stack effettivo, in bb: <10, 10-30, 30+; '
+         + 'le linee lontane dicono che la scala fissa del reward pesa in modo diverso',
+     last: stackSets.length ? 'spread ' + x(lastOf(spStack)) : '&ndash;'},
+    {o: {d: 3, zero: true}, sets: sizeSets,
+     title: 'target del critico per tavolo (sd)',
+     note: 'deviazione standard del return, dal tavolo da 2 (chiaro) a quello da 9 (scuro)',
+     last: sizeSets.length ? 'spread ' + x(lastOf(spSize)) : '&ndash;'},
+    {o: {d: 2, zero: true}, sets: evSets,
+     title: 'varianza spiegata dal critico per stack',
+     note: '0 = non meglio della media, sotto 0 = peggio; calcolata sui valori con cui la policy ha giocato',
+     last: '&ndash;'},
+    {o: {d: 1, ref: 2},
+     sets: [{name: 'tavoli', color: C('--accent'), pts: spSize, dots: true},
+            {name: 'stack', color: C('--warn'), pts: spStack, dots: true}],
+     title: 'spread del target (max sd / min sd)',
+     note: 'tratteggio: 2x = soglia oltre cui servirebbe una scala per gruppo',
+     last: (spSize.length || spStack.length) ? x(lastOf(spSize)) + ' / ' + x(lastOf(spStack)) : '&ndash;'},
+  ];
+}
+
 function renderCharts(host, hist){
   const cs = getComputedStyle(document.documentElement);
   const C = k => cs.getPropertyValue(k).trim();
@@ -598,6 +689,7 @@ function renderCharts(host, hist){
     note: 'cumulativo da 1500, 10 sessioni da 1000 mani per punto; K 24 le prime 10 sessioni, poi 8 e 3: si muove presto e poi si assesta',
     last: rating.length ? fmtN(rating[rating.length - 1][1], 0) : '&ndash;',
   });
+  specs.push(...valueSpecs(hist), ...styleSpecs(hist));
   host.innerHTML = specs.map(s => chartBox(s.title, s.note, s.last, s.sets, s.o)).join('');
   const canvases = host.querySelectorAll('canvas');
   specs.forEach((s, i) => draw(canvases[i], s.sets, s.o));
@@ -618,11 +710,6 @@ const HP_LABELS = {
 const HP_ARM_LABELS = {
   sampled: 'campionati', inherited: 'ereditati e perturbati',
   'sampled-fallback': 'campionati: genitore senza metadati',
-  /* Launched by a supervisor that predates the sweep: it runs fine, it was just
-     never given an arm. A supervisor lives for weeks and only picks up new
-     behaviour when restarted, so this is the fleet saying which hosts still
-     need it. */
-  '': 'senza sweep: supervisor da riavviare',
 };
 
 function hpHtml(key){
@@ -645,8 +732,8 @@ function hpHtml(key){
   return '<div class="hp">' + chips.join('') + '</div>';
 }
 
-/* Built in one place because three call sites used to repeat the same string,
-   and the settings block has to appear in all of them. */
+/* Built in one place because the settings block has to appear in every call
+   site. */
 function panelHtml(key){
   return '<td colspan="12">' + hpHtml(key)
     + '<div class="charts"><div class="empty">carico...</div></div></td>';
@@ -799,13 +886,14 @@ def make_handler(state: State, refresh: int):
     return Handler
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The flags; `--iterations` is the key `config.toml` shares with the loop."""
     parser = argparse.ArgumentParser(
         description="Serve a browser view of every machine's training, read-only."
     )
     parser.add_argument("--host", default="127.0.0.1",
                         help="0.0.0.0 to reach it from the other machines")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--dashboard-port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--machines-dir", type=Path, default=DEFAULT_MACHINES_DIR)
     parser.add_argument("--models-dir", type=Path, default=DEFAULT_MODELS_DIR)
     parser.add_argument("--benchmark-dir", type=Path, default=DEFAULT_BENCHMARK_DIR)
@@ -817,13 +905,26 @@ def main(argv: list[str] | None = None) -> int:
                         help="the loop's --iterations, which every progress bar is "
                         "scaled against; a wrong value draws every worker at the "
                         "wrong fraction")
-    parser.add_argument("--refresh", type=int, default=15, help="seconds between polls")
-    args = parser.parse_args(argv)
+    parser.add_argument("--dashboard-refresh", type=int, default=15, help="seconds between polls")
+    add_config_arguments(parser)
+    return parser
+
+
+def _sibling_parsers() -> list[argparse.ArgumentParser]:
+    return sibling_parsers("pokerlab.rl.dashboard", with_torch=False)
+
+
+def main(argv: list[str] | None = None) -> int:
+    # Lenient, and torch-free by construction: the dashboard cannot import
+    # `poker-train`'s parser to learn its keys, so it skips what it does not know.
+    args = resolve_cli(build_parser(), argv, siblings=_sibling_parsers, lenient=True)
+    if args is None:
+        return 0
 
     state = State(args)
-    server = QuietServer((args.host, args.port), make_handler(state, args.refresh))
+    server = QuietServer((args.host, args.dashboard_port), make_handler(state, args.dashboard_refresh))
     shown = "localhost" if args.host in ("127.0.0.1", "localhost") else args.host
-    print(f"dashboard su http://{shown}:{args.port}  (ogni {args.refresh}s, Ctrl-C per uscire)")
+    print(f"dashboard su http://{shown}:{args.dashboard_port}  (ogni {args.dashboard_refresh}s, Ctrl-C per uscire)")
     print(f"  macchine: {args.machines_dir}\n  modelli : {args.models_dir}")
     try:
         server.serve_forever()

@@ -21,6 +21,7 @@ reproducible.
 
 from __future__ import annotations
 
+import argparse
 import random
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -122,6 +123,46 @@ def build_training_registry(models_dir: str | Path, drawn: Sequence[PoolMember])
 PARENT_TIERS: tuple[int | None, ...] = (10, 100, 1000, None)
 
 
+def format_parent_tiers(tiers: Sequence[int | None]) -> str:
+    """`tiers` as the `--parent-tiers` flag and `config.toml` write them:
+    `"10, 100, 1000, all"`."""
+    return ", ".join("all" if band is None else str(band) for band in tiers)
+
+
+def parse_parent_tiers(text: str) -> tuple[int | None, ...]:
+    """The inverse of `format_parent_tiers`; `ValueError` says what is wrong.
+
+    Each entry is a band size (the best N rated models) or `all`. A band listed
+    twice is drawn twice as often, which is how the draw is weighted.
+    """
+    tiers: list[int | None] = []
+    for part in text.split(","):
+        part = part.strip().lower()
+        if not part:
+            continue
+        if part == "all":
+            tiers.append(None)
+            continue
+        try:
+            band = int(part)
+        except ValueError:
+            raise ValueError(f"'{part}' is neither a number nor 'all'") from None
+        if band < 1:
+            raise ValueError(f"a band must hold at least one model, not {band}")
+        tiers.append(band)
+    if not tiers:
+        raise ValueError("at least one band is needed")
+    return tuple(tiers)
+
+
+def parent_tiers_text(text: str) -> str:
+    """argparse `type=` for the parent bands: validates, returns canonical text."""
+    try:
+        return format_parent_tiers(parse_parent_tiers(text))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+
+
 def pick_parents(
     ranking: Mapping[str, PoolMember],
     labels: Sequence[str],
@@ -135,8 +176,8 @@ def pick_parents(
 
     Every parent first draws a band of the ranking (the top 10, 100, 1000 or all
     rated models, equally likely) and then a model uniformly inside it, so the
-    top band is deep but the lineage is not confined to it. Distinct so the
-    inheriting half of a generation is competing lineages rather than copies of
+    top band is deep but the lineage is not confined to it. Distinct so a
+    generation is competing lineages rather than copies of
     one model; a band already exhausted by earlier picks falls back to the
     unused models of the whole ranking.
     """

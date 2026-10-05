@@ -11,7 +11,6 @@ import json
 import pytest
 
 from pokerlab.rl.pool_registry import (
-    DEFAULT_K_FACTOR,
     DEFAULT_K_SCHEDULE,
     DEFAULT_RATING,
     PoolMember,
@@ -23,7 +22,13 @@ from pokerlab.rl.pool_registry import (
 
 
 def make_registry(tmp_path, max_models: int = 3) -> PoolRegistry:
-    return PoolRegistry(directory=tmp_path, max_models=max_models)
+    return PoolRegistry(directory=tmp_path, max_models=max_models, k_schedule=DEFAULT_K_SCHEDULE)
+
+
+def equal_k_delta(results, ratings, k: float = 16.0) -> dict[str, float]:
+    """`pairwise_elo_delta` with the same K for everyone, for the tests about the
+    arithmetic of a session rather than about which K a model gets."""
+    return pairwise_elo_delta(results, ratings, k_factors=dict.fromkeys(results, k))
 
 
 def add_model_file(
@@ -39,7 +44,7 @@ def add_model_file(
 
 
 def test_the_bigger_stack_gains_rating_and_the_smaller_one_loses_it():
-    deltas = pairwise_elo_delta({"a": 50.0, "b": -50.0}, {"a": 1500.0, "b": 1500.0})
+    deltas = equal_k_delta({"a": 50.0, "b": -50.0}, {"a": 1500.0, "b": 1500.0})
     assert deltas["a"] > 0
     assert deltas["b"] < 0
 
@@ -47,7 +52,7 @@ def test_the_bigger_stack_gains_rating_and_the_smaller_one_loses_it():
 def test_evenly_matched_players_trade_nothing_on_a_chopped_pot():
     """A chopped pot leaves both stacks unchanged -- a real outcome in poker,
     not a degenerate case (see CLAUDE.md), so it must score as a draw."""
-    deltas = pairwise_elo_delta({"a": 0.0, "b": 0.0}, {"a": 1500.0, "b": 1500.0})
+    deltas = equal_k_delta({"a": 0.0, "b": 0.0}, {"a": 1500.0, "b": 1500.0})
     assert deltas["a"] == pytest.approx(0.0)
     assert deltas["b"] == pytest.approx(0.0)
 
@@ -55,13 +60,13 @@ def test_evenly_matched_players_trade_nothing_on_a_chopped_pot():
 def test_a_session_is_zero_sum_in_rating():
     results = {"a": 120.0, "b": -30.0, "c": -90.0}
     ratings = {"a": 1600.0, "b": 1500.0, "c": 1400.0}
-    deltas = pairwise_elo_delta(results, ratings)
+    deltas = equal_k_delta(results, ratings)
     assert sum(deltas.values()) == pytest.approx(0.0, abs=1e-9)
 
 
 def test_beating_a_stronger_opponent_is_worth_more():
-    underdog = pairwise_elo_delta({"a": 10.0, "b": -10.0}, {"a": 1200.0, "b": 1800.0})
-    favourite = pairwise_elo_delta({"a": 10.0, "b": -10.0}, {"a": 1800.0, "b": 1200.0})
+    underdog = equal_k_delta({"a": 10.0, "b": -10.0}, {"a": 1200.0, "b": 1800.0})
+    favourite = equal_k_delta({"a": 10.0, "b": -10.0}, {"a": 1800.0, "b": 1200.0})
     assert underdog["a"] > favourite["a"]
 
 
@@ -69,8 +74,8 @@ def test_table_size_does_not_rescale_the_rating_step():
     """Without the per-opponent normalisation a 6-handed session would move a
     rating five times as far as a heads-up one, silently making K depend on
     how many seats happened to be filled."""
-    heads_up = pairwise_elo_delta({"a": 10.0, "b": -10.0}, {"a": 1500.0, "b": 1500.0})
-    six_max = pairwise_elo_delta(
+    heads_up = equal_k_delta({"a": 10.0, "b": -10.0}, {"a": 1500.0, "b": 1500.0})
+    six_max = equal_k_delta(
         {"a": 10.0, **{f"o{i}": -10.0 for i in range(5)}},
         {"a": 1500.0, **{f"o{i}": 1500.0 for i in range(5)}},
     )
@@ -82,8 +87,8 @@ def test_updates_are_computed_from_pre_session_ratings(tmp_path):
     the session, otherwise the result depends on iteration order."""
     results = {"a": 30.0, "b": 10.0, "c": -40.0}
     ratings = {"a": 1500.0, "b": 1500.0, "c": 1500.0}
-    forward = pairwise_elo_delta(results, ratings)
-    reversed_order = pairwise_elo_delta(dict(reversed(list(results.items()))), ratings)
+    forward = equal_k_delta(results, ratings)
+    reversed_order = equal_k_delta(dict(reversed(list(results.items()))), ratings)
     for label in results:
         assert forward[label] == pytest.approx(reversed_order[label])
 
@@ -172,7 +177,11 @@ def test_an_unregistered_participant_is_rated_but_not_persisted(tmp_path):
     registry = make_registry(tmp_path)
     add_model_file(registry, "member", rating=1500.0)
 
-    deltas = registry.record_session({"learner": 50.0, "member": -50.0})
+    deltas = registry.record_session_with_ratings(
+        {"learner": 50.0, "member": -50.0},
+        {"learner": 1500.0, "member": 1500.0},
+        k_factors={"learner": k_for_games(0)},
+    )
 
     assert deltas["learner"] > 0
     assert "learner" not in registry.members
@@ -389,26 +398,19 @@ def test_the_schedule_has_twenty_steps_and_bottoms_out_at_a_hundredth():
     assert all(1.35 < r < 1.6 for r in ratios), "a constant factor per tier, near 1.4745"
 
 
-def test_the_schedule_burns_in_fast_and_then_settles_below_the_flat_k():
-    """The schedule used to be uniformly gentler than the flat K, on the grounds
-    that the flat one was for ratings that must converge in a handful of sessions
-    and the schedule for ratings accumulated over hundreds. That split was wrong
-    at one end: a rating starting at 1500 has ~80 points to travel before it says
-    anything, and neither 3.0 nor a flat 8 could carry it there inside a run. The
-    schedule now does both jobs -- a bounded burn-in first, then the settled
-    tiers -- which is why the learner's own evaluation was moved onto it."""
+def test_the_schedule_burns_in_fast_and_then_settles():
+    """The schedule does both jobs: a bounded burn-in first, because a rating
+    starting at 1500 has tens of points to travel before it says anything, then
+    the settled tiers."""
     assert k_for_games(0) == DEFAULT_K_SCHEDULE[0][1]
-    # Fast where a rating is still unknown...
-    assert k_for_games(0) > DEFAULT_K_FACTOR
-    # ...and it has to come down inside a run, or it is not a burn-in but a
-    # permanently jumpy rating. A run plays ~100 rated sessions of validation
-    # before it ever reaches the anchors, so by then it must already be gentler
-    # than the flat K.
-    assert k_for_games(100) < DEFAULT_K_FACTOR
-    # And by the end of the round against the anchors, materially gentler still:
+    # It has to come down inside a run, or it is not a burn-in but a permanently
+    # jumpy rating. A run plays ~100 rated sessions of validation before it ever
+    # reaches the anchors, so by then it must already be gentler.
+    assert k_for_games(0) > k_for_games(100)
+    # And by the end of the pass against the anchors, materially gentler still:
     # that is the distinction the schedule exists for -- hold the order steady
     # rather than chase the last session.
-    assert k_for_games(600) <= DEFAULT_K_FACTOR / 4
+    assert k_for_games(600) <= k_for_games(0) / 4
 
 
 def test_a_veteran_moves_less_than_a_newcomer_at_the_same_table(tmp_path):
@@ -428,19 +430,17 @@ def test_a_veteran_moves_less_than_a_newcomer_at_the_same_table(tmp_path):
     assert vet_gain < new_loss, "which is the whole point"
 
 
-def test_without_a_schedule_every_member_uses_the_flat_k(tmp_path):
+def test_without_a_schedule_or_a_k_a_session_cannot_be_rated(tmp_path):
+    """There is no flat K to fall back on: a registry that was given no schedule
+    and a caller that named no K have nothing to rate with, and say so."""
     registry = PoolRegistry(directory=tmp_path)
     registry.members["vet"] = PoolMember(label="vet", kind="model", ref="v.pt", games=1500)
     registry.members["new"] = PoolMember(label="new", kind="model", ref="n.pt", games=0)
 
-    registry.record_session({"vet": 50.0, "new": -50.0})
+    with pytest.raises(ValueError, match="K-factor"):
+        registry.record_session({"vet": 50.0, "new": -50.0})
 
-    # Equally rated, so the expected score is 0.5 and the winner moves by half
-    # the flat K. Written off the constant rather than as a literal: the value
-    # has moved once (24 -> 12) and what this test is about is that *both*
-    # members use the same one, whatever it is.
-    assert registry.members["vet"].rating == pytest.approx(DEFAULT_RATING + DEFAULT_K_FACTOR * 0.5)
-    assert registry.members["new"].rating == pytest.approx(DEFAULT_RATING - DEFAULT_K_FACTOR * 0.5)
+    assert registry.members["vet"].games == 1500, "nothing was applied"
 
 
 def test_a_session_is_rated_at_the_experience_the_model_had_when_it_sat_down(tmp_path):
@@ -461,14 +461,12 @@ def test_a_session_is_rated_at_the_experience_the_model_had_when_it_sat_down(tmp
     assert registry.members["a"].games == boundary
 
 
-def test_an_unregistered_participant_keeps_the_default_k_under_a_schedule(tmp_path):
+def test_an_unregistered_participant_with_no_k_of_its_own_is_an_error(tmp_path):
     registry = PoolRegistry(directory=tmp_path, k_schedule=DEFAULT_K_SCHEDULE)
     registry.members["vet"] = PoolMember(label="vet", kind="model", ref="v.pt", games=1500)
 
-    deltas = registry.record_session({"vet": 50.0, "learner": -50.0})
-
-    assert deltas["vet"] == pytest.approx(k_for_games(1500) * 0.5)
-    assert deltas["learner"] == pytest.approx(DEFAULT_K_FACTOR * -0.5)
+    with pytest.raises(ValueError, match="learner"):
+        registry.record_session({"vet": 50.0, "learner": -50.0})
 
 
 def test_a_caller_can_give_an_unregistered_participant_its_own_k(tmp_path):
@@ -526,21 +524,18 @@ def test_the_k_schedule_is_gentle_enough_to_keep_the_top_in_order():
     values = [v for _, v in DEFAULT_K_SCHEDULE]
     assert thresholds == sorted(thresholds) and values == sorted(values, reverse=True)
     # The tiers that decide anything have to be reachable by the models the
-    # schedule can actually *move* -- the non-frozen ones, measured at median 911
-    # rated games, 90th percentile ~1,780 and max 2,727 over the 9,433 on the
-    # volume. Twelve of the twenty tiers sit inside that range and the rest are
-    # deliberate headroom, reached by nobody who can move: the schedule follows the
-    # curve down to K = 0.01 at ~70,000 games because the population's game counts
-    # only grow, and grow faster than they used to now that a model publishes with
-    # the ~600 rated sessions it earned rather than with zero.
+    # schedule can actually *move* -- the non-frozen ones, whose game counts stay
+    # in the low thousands. Twelve of the twenty tiers sit inside that range and
+    # the rest are deliberate headroom: the schedule follows the curve down to
+    # K = 0.01 at ~70,000 games because the population's game counts only grow.
     reachable = [t for t in thresholds if t < 2727]
     assert len(reachable) >= 12, "the live part of the schedule must stay fine-grained"
     assert len(reachable) > len(thresholds) / 2, "most tiers live, not headroom"
     assert thresholds[-1] > 2727
     # The tier a model lands in on publication day: ~100 validation sessions plus
-    # the round against the anchors. It must be well down the schedule -- that is
+    # the pass against the anchors. It must be well down the schedule -- that is
     # the whole reason the count continues from training -- but not at the floor,
-    # or later population rounds could never move it again.
+    # or later population passes could never move it again.
     published = k_for_games(600)
     assert values[-1] < published < values[0] / 4
 
@@ -555,3 +550,32 @@ def test_a_veteran_moves_far_less_than_a_newcomer_for_the_same_result():
     )
     assert deltas["new"] > 0 and deltas["old"] < 0
     assert abs(deltas["new"]) > 3 * abs(deltas["old"])
+
+
+def test_the_k_schedule_round_trips_through_its_text_form():
+    from pokerlab.rl.pool_registry import (
+        DEFAULT_K_SCHEDULE,
+        format_k_schedule,
+        parse_k_schedule,
+    )
+
+    assert parse_k_schedule(format_k_schedule(DEFAULT_K_SCHEDULE)) == DEFAULT_K_SCHEDULE
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["", "16", "0:x", "10:16", "0:16, 0:11", "0:16, 50:11, 20:7", "0:0", "0:-2", "0:inf"],
+)
+def test_a_k_schedule_that_is_not_a_staircase_is_refused(text):
+    from pokerlab.rl.pool_registry import parse_k_schedule
+
+    with pytest.raises(ValueError):
+        parse_k_schedule(text)
+
+
+def test_a_parsed_schedule_drives_the_k_a_model_is_rated_at():
+    from pokerlab.rl.pool_registry import k_for_games, parse_k_schedule
+
+    schedule = parse_k_schedule("0:20, 50:5")
+    assert k_for_games(49, schedule) == 20.0
+    assert k_for_games(50, schedule) == 5.0

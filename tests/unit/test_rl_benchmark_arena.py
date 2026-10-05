@@ -22,7 +22,7 @@ from pokerlab.rl.benchmark_arena import (
     write_ratings,
 )
 from pokerlab.rl.global_store import read_member, write_member
-from pokerlab.rl.pool_registry import MODEL, PoolMember, PoolRegistry
+from pokerlab.rl.pool_registry import DEFAULT_K_SCHEDULE, MODEL, PoolMember, PoolRegistry
 
 
 def anchor_store(tmp_path, count=6, series=2, rating=1500.0):
@@ -83,6 +83,19 @@ def test_each_anchor_moves_by_the_k_of_its_own_experience(tmp_path):
     assert (fresh.games, veteran.games) == (1, 100_001)
 
 
+def test_the_k_schedule_of_the_config_file_is_the_one_the_anchors_are_rated_with(tmp_path):
+    """One scale for the whole fleet: the staircase the file sets, not a private copy."""
+    root, global_dir = anchor_store(tmp_path, count=2, series=1)
+    anchors = {a.label: a for a in collect_anchors(root, global_dir)}
+
+    apply_sessions(anchors, [{"s1-m0": 100.0, "s1-m1": -100.0}], ((0, 2.0),))
+
+    # K = 2 for both, one pair, one opponent: a win from near-equal ratings (the
+    # fixture gives them 1500 and 1501) moves each by about K / 2.
+    assert anchors["s1-m0"].delta == pytest.approx(1.0, abs=0.01)
+    assert anchors["s1-m1"].delta == pytest.approx(-1.0, abs=0.01)
+
+
 def test_a_session_with_only_one_known_participant_is_ignored(tmp_path):
     root, global_dir = anchor_store(tmp_path, count=2, series=1)
     anchors = {a.label: a for a in collect_anchors(root, global_dir)}
@@ -115,7 +128,9 @@ def test_an_anchor_stays_unreachable_to_everything_else(tmp_path):
         "a": PoolMember(label="a", kind=MODEL, ref="a.pt", rating=1500.0, frozen=True),
         "b": PoolMember(label="b", kind=MODEL, ref="b.pt", rating=1500.0),
     }
-    registry = PoolRegistry(directory=global_dir, max_models=10, members=members)
+    registry = PoolRegistry(
+        directory=global_dir, max_models=10, members=members, k_schedule=DEFAULT_K_SCHEDULE
+    )
 
     registry.record_session({"a": 500.0, "b": -500.0})
 
@@ -176,84 +191,162 @@ def test_a_restored_backup_does_not_need_the_checkpoints(tmp_path):
 
 
 def test_drift_is_net_movement_not_the_distance_travelled():
-    """The load-bearing detail. With a flat K an Elo rating never stops moving --
-    it jitters around equilibrium forever, in proportion to K -- so a rule like
-    "stop when every delta is small" would never fire. Net drift ignores a model
-    that bounced and came back, and catches one that is still climbing."""
+    """A rating jittering around a settled value has not moved: with a flat K Elo
+    never stops moving, so "stop when every delta is small" would never fire. Net
+    drift ignores a model that went up three and back down three."""
     from pokerlab.rl.benchmark_arena import drift
 
-    jitter = [{"a": 1500.0}, {"a": 1503.0}, {"a": 1497.0}, {"a": 1500.5}]
-    climbing = [{"a": 1500.0}, {"a": 1510.0}, {"a": 1520.0}, {"a": 1530.0}]
+    jitter = [(0, {"a": 1500.0}), (100, {"a": 1503.0}), (200, {"a": 1497.0}),
+              (300, {"a": 1500.5})]
+    climbing = [(0, {"a": 1500.0}), (100, {"a": 1510.0}), (200, {"a": 1520.0}),
+                (300, {"a": 1530.0})]
+    assert drift(jitter, window=300)[0] == pytest.approx(0.5)
+    assert drift(climbing, window=300)[0] == pytest.approx(30.0)
 
-    assert drift(jitter, window=3)[0] == pytest.approx(0.5)
-    assert drift(climbing, window=3)[0] == pytest.approx(30.0)
 
-
-def test_drift_is_infinite_before_the_window_is_full():
-    """Nothing can be concluded from fewer rounds than the window, and returning
-    infinity keeps the caller from declaring convergence on no evidence."""
+def test_drift_is_infinite_until_a_checkpoint_a_window_old_exists():
+    """There is nothing to compare with before the run is `window` sessions old."""
     from pokerlab.rl.benchmark_arena import drift
 
-    assert drift([{"a": 1500.0}], window=5) == (float("inf"), float("inf"))
-    assert drift([{"a": 1500.0}] * 5, window=5) == (float("inf"), float("inf"))
-    assert drift([{"a": 1500.0}] * 6, window=5) == (0.0, 0.0)
+    assert drift([(0, {"a": 1500.0})], window=500) == (float("inf"), float("inf"))
+    assert drift([(0, {"a": 1500.0}), (400, {"a": 1500.0})], window=500) == (
+        float("inf"), float("inf"))
+    assert drift([(0, {"a": 1500.0}), (500, {"a": 1500.0})], window=500) == (0.0, 0.0)
+
+
+def test_drift_compares_with_the_latest_checkpoint_at_least_a_window_old():
+    from pokerlab.rl.benchmark_arena import drift
+
+    history = [(0, {"a": 1500.0}), (200, {"a": 1520.0}), (400, {"a": 1530.0}),
+               (600, {"a": 1531.0})]
+    # window 350: the reference is the checkpoint at 200 (600 - 350 = 250 >= 200).
+    assert drift(history, window=350)[0] == pytest.approx(11.0)
 
 
 def test_drift_reports_the_worst_anchor_not_the_average():
-    """One anchor still moving means the ranking is not settled, however quiet
-    the others are -- so the stopping rule reads the maximum."""
+    """One anchor still moving means the order is not settled however quiet the
+    others are."""
     from pokerlab.rl.benchmark_arena import drift
 
-    history = [{"a": 1500.0, "b": 1500.0}] * 3 + [{"a": 1500.0, "b": 1540.0}]
-    worst, average = drift(history, window=3)
-    assert worst == pytest.approx(40.0)
-    assert average == pytest.approx(20.0)
+    history = [(0, {"a": 1500.0, "b": 1500.0, "c": 1500.0}),
+               (300, {"a": 1500.0, "b": 1500.0, "c": 1512.0})]
+    worst, average = drift(history, window=300)
+    assert worst == pytest.approx(12.0)
+    assert average == pytest.approx(4.0)
 
 
 def test_drift_ignores_an_anchor_that_was_not_there_before():
     from pokerlab.rl.benchmark_arena import drift
 
-    history = [{"a": 1500.0}] * 3 + [{"a": 1501.0, "new": 1600.0}]
-    assert drift(history, window=3)[0] == pytest.approx(1.0)
+    history = [(0, {"a": 1500.0}), (300, {"a": 1501.0, "new": 1600.0})]
+    assert drift(history, window=300)[0] == pytest.approx(1.0)
+
+
+def test_the_arena_stops_when_the_ratings_settle_but_not_before_the_minimum(
+    tmp_path, monkeypatch, capsys
+):
+    """Convergence is judged in sessions: no anchor moved more than the tolerance
+    over the window, and at least the minimum has been played."""
+    import pokerlab.rl.benchmark_arena as module
+
+    root, global_dir = anchor_store(tmp_path)
+    played: list[int] = []
+    monkeypatch.setattr(
+        module,
+        "play_global_sessions",
+        lambda candidates, mix, *, sessions, **k: played.append(sessions) or [
+            {candidates[0].label: 0.0, candidates[1].label: 0.0}
+        ] * sessions,
+    )
+    monkeypatch.setattr(module, "write_snapshot", lambda *a, **k: True)
+
+    assert module.main([
+        "--config", "", *SIX_SEATS, "--root", str(root), "--global-dir", str(global_dir),
+        "--arena-max-sessions", "100", "--arena-min-sessions", "8",
+        "--arena-window", "4", "--arena-tolerance", "1000", "--dry-run",
+        "--arena-checkpoint-sessions", "2",
+    ]) == 0
+
+    # Tolerance so loose that only the minimum holds it back: it stops at 8, not
+    # at the window (4) and not at the cap (100).
+    assert sum(played) == 8
+    assert "CONVERGENZA" in capsys.readouterr().out
+
+
+def test_hitting_the_cap_is_reported_as_not_converged(tmp_path, monkeypatch, capsys):
+    import pokerlab.rl.benchmark_arena as module
+
+    root, global_dir = anchor_store(tmp_path)
+    monkeypatch.setattr(
+        module,
+        "play_global_sessions",
+        lambda candidates, mix, *, sessions, **k: [
+            {candidates[0].label: 100.0, candidates[1].label: -100.0}
+        ] * sessions,
+    )
+    monkeypatch.setattr(module, "write_snapshot", lambda *a, **k: True)
+
+    assert module.main([
+        "--config", "", *SIX_SEATS, "--root", str(root), "--global-dir", str(global_dir),
+        "--arena-max-sessions", "6", "--arena-min-sessions", "2",
+        "--arena-window", "2", "--arena-tolerance", "0.0001", "--dry-run",
+        "--arena-checkpoint-sessions", "2",
+    ]) == 0
+    assert "NON CONVERGE" in capsys.readouterr().out
 
 
 # ---- keeping the shared snapshot current --------------------------------------
 
 
-def drive_rounds(monkeypatch, argv):
+# The test store holds six anchors: a six-handed table is the largest it seats.
+SIX_SEATS = ["--table-weights", "0", "0", "0", "0", "1", "0", "0", "0"]
+
+
+def drive_checkpoints(monkeypatch, argv, *, checkpoint=2):
     """Drive `main` with the play stubbed out, reporting every snapshot refresh.
 
     Only the choreography is under test here -- how often the snapshot is
-    rewritten -- so the round returns no sessions and the ratings never move.
+    rewritten -- so every session is a draw between two anchors and the ratings
+    barely move. `checkpoint` shrinks the batch size so a handful of sessions
+    spans several of them.
     """
     import pokerlab.rl.benchmark_arena as module
 
     refreshes: list[dict] = []
-    monkeypatch.setattr(module, "play_global_round", lambda *a, **k: [])
+    monkeypatch.setattr(
+        module,
+        "play_global_sessions",
+        lambda candidates, mix, *, sessions, **k: [
+            {candidates[0].label: 0.0, candidates[1].label: 0.0}
+        ] * sessions,
+    )
     monkeypatch.setattr(
         module,
         "write_snapshot",
         lambda global_dir, **kwargs: bool(refreshes.append(kwargs)) or True,
     )
-    assert module.main(argv) == 0
+    assert module.main([
+        "--config", "", *SIX_SEATS, "--arena-checkpoint-sessions", str(checkpoint), *argv,
+    ]) == 0
     return refreshes
 
 
-def test_every_round_refreshes_the_shared_snapshot(tmp_path, monkeypatch):
+def test_every_checkpoint_refreshes_the_shared_snapshot(tmp_path, monkeypatch):
     """The member files are the truth, but nothing reads them one at a time:
-    `--status`, the dashboard and the GUI all read `registry.json`. A convergence
+    `--status`, the dashboard and the GUI all read `registry.json`. A long
     run can hold the anchors for days, so refreshing the snapshot only at the end
     would leave the whole fleet reporting the ratings the run started from."""
     root, global_dir = anchor_store(tmp_path)
 
-    refreshes = drive_rounds(monkeypatch, [
+    refreshes = drive_checkpoints(monkeypatch, [
         "--root", str(root), "--global-dir", str(global_dir),
-        "--max-rounds", "2", "--min-rounds", "1", "--report-every", "0",
+        "--arena-max-sessions", "6", "--arena-min-sessions", "6",
     ])
 
-    assert len(refreshes) >= 2, "at least one refresh per round, not just at the end"
+    # Six sessions in batches of two: three checkpoints, plus the final write.
+    assert len(refreshes) >= 4, "one refresh per checkpoint, not just at the end"
     # Forced: the staleness rule `write_snapshot` applies by default would skip
-    # rounds that finish inside its window.
+    # checkpoints that finish inside its window.
     assert all(call["force"] for call in refreshes)
 
 
@@ -262,18 +355,96 @@ def test_a_dry_run_refreshes_nothing(tmp_path, monkeypatch):
     write like any other."""
     root, global_dir = anchor_store(tmp_path)
 
-    refreshes = drive_rounds(monkeypatch, [
+    refreshes = drive_checkpoints(monkeypatch, [
         "--root", str(root), "--global-dir", str(global_dir),
-        "--max-rounds", "2", "--min-rounds", "1", "--report-every", "0",
+        "--arena-max-sessions", "6", "--arena-min-sessions", "6",
         "--dry-run",
     ])
 
     assert refreshes == []
 
 
-def test_the_per_round_line_shows_each_series_span_and_shift(tmp_path):
+def test_the_checkpoint_line_shows_each_series_span_and_shift(tmp_path):
     from pokerlab.rl.benchmark_arena import format_series_line
 
     root, global_dir = anchor_store(tmp_path, count=4, series=2)
     line = format_series_line(collect_anchors(root, global_dir))
     assert "b1" in line and "b2" in line
+
+
+def test_the_config_file_sets_the_arena_and_a_flag_beats_it(tmp_path, monkeypatch):
+    """Convergence (tolerance, window, minimum and maximum, all in sessions) and the
+    session length come from `config.toml`, which is also how the arena the loop
+    requests for a new anchor is parameterised."""
+    import pokerlab.rl.benchmark_arena as module
+
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "arena_max_sessions = 700\narena_tolerance = 0.25\narena_window = 300\n"
+        "arena_min_sessions = 500\narena_checkpoint_sessions = 50\nsession_hands = 40\nlr = 0.01\n",
+        encoding="utf-8",
+    )
+    args = module.resolve_cli(module.build_parser(), ["--config", str(path)], lenient=True)
+    assert (args.arena_max_sessions, args.arena_tolerance) == (700, 0.25)
+    assert (args.arena_window, args.arena_min_sessions) == (300, 500)
+    assert args.arena_checkpoint_sessions == 50
+    assert args.session_hands == 40
+
+    args = module.resolve_cli(
+        module.build_parser(), ["--config", str(path), "--arena-max-sessions", "900"], lenient=True
+    )
+    assert args.arena_max_sessions == 900
+
+
+def test_the_arena_never_plays_past_the_maximum(tmp_path, monkeypatch):
+    """The cap is exact: the last batch takes whatever is left of it."""
+    root, global_dir = anchor_store(tmp_path)
+    played: list[int] = []
+
+    import pokerlab.rl.benchmark_arena as module
+
+    monkeypatch.setattr(
+        module,
+        "play_global_sessions",
+        lambda candidates, mix, *, sessions, **k: played.append(sessions) or [
+            {candidates[0].label: 0.0, candidates[1].label: 0.0}
+        ] * sessions,
+    )
+    monkeypatch.setattr(module, "write_snapshot", lambda *a, **k: True)
+
+    assert module.main([
+        "--config", "", *SIX_SEATS, "--root", str(root), "--global-dir", str(global_dir),
+        "--arena-max-sessions", "10", "--arena-min-sessions", "10",
+        "--arena-tolerance", "-1", "--dry-run", "--arena-checkpoint-sessions", "4",
+    ]) == 0
+
+    assert played == [4, 4, 2]
+
+
+def test_zero_sessions_only_refreshes_the_snapshot(tmp_path, monkeypatch):
+    root, global_dir = anchor_store(tmp_path)
+    import pokerlab.rl.benchmark_arena as module
+
+    played: list[int] = []
+    refreshes: list[dict] = []
+    monkeypatch.setattr(module, "play_global_sessions", lambda *a, **k: played.append(1) or [])
+    monkeypatch.setattr(
+        module, "write_snapshot", lambda global_dir, **k: bool(refreshes.append(k)) or True
+    )
+
+    assert module.main([
+        "--config", "", *SIX_SEATS, "--root", str(root), "--global-dir", str(global_dir),
+        "--arena-max-sessions", "0",
+    ]) == 0
+
+    assert played == [] and len(refreshes) == 1
+
+
+def test_a_checkpoint_must_hold_at_least_one_session(tmp_path):
+    import pokerlab.rl.benchmark_arena as module
+
+    root, global_dir = anchor_store(tmp_path)
+    assert module.main([
+        "--config", "", "--root", str(root), "--global-dir", str(global_dir),
+        "--arena-checkpoint-sessions", "0",
+    ]) == 2
