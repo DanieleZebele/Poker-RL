@@ -18,13 +18,15 @@ from __future__ import annotations
 
 import itertools
 import tkinter as tk
+from tkinter import font as tkfont
 from tkinter import messagebox, ttk
 from types import SimpleNamespace
 
 from pokerlab.cards.card import Card
 from pokerlab.cli.play import discover_global_top_models
 from pokerlab.engine.actions import Action, ActionType, LegalAction
-from pokerlab.engine.state import PlayerStatus
+from pokerlab.engine.state import PlayerStatus, Street
+from pokerlab.engine.stats import StatsTracker
 from pokerlab.gui.spot import (
     DEFAULT_ADVISORS,
     Spot,
@@ -299,6 +301,10 @@ class SpotFrame(ttk.Frame):
         self._sync_note = ""  # what the last action rebuild did, for the status line
         self._screen_stacks: dict[int, float] = {}  # chair -> stack read now, in BB
         self._screen_job: str | None = None
+        # What the players at the table have done over the hands seen on the screen, read by
+        # the models as at every table they were trained on. Keyed by chair, which is what
+        # stays put from one hand to the next; see `_record_finished_hand`.
+        self.stats = StatsTracker()
 
         self._build()
         self.refresh()
@@ -317,6 +323,7 @@ class SpotFrame(ttk.Frame):
         stack.bind("<Return>", lambda _e: self._default_stack_changed())
         ttk.Button(top, text="Annulla ultima azione", command=self._undo).pack(side="left", padx=3)
         ttk.Button(top, text="Azzera azioni", command=self._clear).pack(side="left", padx=3)
+        ttk.Button(top, text="Azzera statistiche", command=self.reset_stats).pack(side="left", padx=3)
         ttk.Button(top, text="Torna al menu", command=self.app.show_setup).pack(side="right")
 
         main = ttk.Frame(self)
@@ -531,6 +538,9 @@ class SpotFrame(ttk.Frame):
             text = self.stack_vars[chair].get().strip()
             stacks[seat] = self._chips(self.stack_vars[chair], "Stack") if text else default
         hole = tuple(self.hole) if all(card is not None for card in self.hole) else None
+        seat_stats = self.stats.vectors(
+            {seat: self._stats_id(chair) for seat, chair in enumerate(self.layout.order())}
+        )
         return Spot(
             num_players=self.layout.players,
             starting_stack=default,
@@ -541,7 +551,70 @@ class SpotFrame(ttk.Frame):
             board=tuple(self.board),
             script=list(self.script),
             stacks=stacks,
+            seat_stats=seat_stats,
         )
+
+    @staticmethod
+    def _stats_id(chair: int) -> str:
+        return f"chair{chair}"
+
+    def reset_stats(self) -> None:
+        """Forget everything seen so far (another table, say) and redraw."""
+        self.stats = StatsTracker()
+        self.refresh()
+
+    def _record_finished_hand(self) -> None:
+        """Give the tracker the hand the screen has just left, as the actions rebuilt from it.
+
+        Called at a hand boundary (a new deal, the button moving) *before* the new seating is
+        applied, while the layout, the script and the chairs still describe that hand. Only
+        hands read off the screen are recorded, never a spot built by hand.
+
+        What is counted is what the readings proved (see `action_sync`). WTSD included: a
+        player who saw the flop and never folded reached the showdown unless everyone else
+        folded, and the folds are in the actions. The limit is the end of the hand: a last
+        fold missed because the next deal replaced the hand between two readings makes the
+        player left look like they reached the showdown, and a showdown whose face-up cards
+        are read as "out" can add a fold that never happened. Every seat at the table is
+        counted as dealt in; a player who sat down mid-hand and waits for the next deal gets
+        one spurious chance, which is noise."""
+        if not self.script:
+            return
+        try:
+            state = replay(self.build_spot())
+        except ValueError:
+            return
+        if not state.records:
+            return
+        seats = range(self.layout.players)
+        ids = {seat: self._stats_id(chair) for seat, chair in enumerate(self.layout.order())}
+        self.stats.record_hand(
+            state.records,
+            dealt=list(seats),
+            button_seat=0,
+            board_cards=self._board_reached(state.records),
+            player_ids=ids,
+        )
+
+    def _board_reached(self, records) -> int:
+        """How many board cards the hand had: the board last read, or what the streets of the
+        recorded actions imply if the screen had already cleared it by the next deal."""
+        by_street = {Street.FLOP: 3, Street.TURN: 4, Street.RIVER: 5}
+        return max([len(self.board), *(by_street.get(record.street, 0) for record in records)])
+
+    def _stats_text(self, chair: int) -> str:
+        """VPIP and PFR of the player on this chair, once they have been seen."""
+        player = self._stats_id(chair)
+        hands = self.stats.hands(player)
+        if not hands:
+            return ""
+        rates = self.stats.rates(player)
+
+        def percent(name: str) -> str:
+            events, chances = rates[name]
+            return f"{events / chances:.0%}" if chances else "-"
+
+        return f"VPIP {percent('vpip')} PFR {percent('pfr')} ({hands} mani)"
 
     def _player_name(self, chair: int) -> str:
         return self.name_vars[chair].get().strip() or f"Posto {chair}"
@@ -694,6 +767,8 @@ class SpotFrame(ttk.Frame):
                     # The screen disagrees with what the rebuilt actions leave:
                     # a missed or misread action, worth a look.
                     text += f"  ≠ schermo {self._bb(round(shown * self._big_blind()))}"
+            if seat != spot.my_seat and (stats := self._stats_text(chair)):
+                text += f"\n{stats}"
             self.chair_ui[chair].info.configure(text=text)
         if len(state.board) > len(spot.board):
             self.warning.configure(
@@ -815,6 +890,9 @@ class SpotFrame(ttk.Frame):
 
         change = diff_reading(self._last_reading, reading, self._last_hand, self._last_dealer)
         self._last_reading = reading
+        if change.new_hand or change.dealer is not None:
+            # The hand on the screen is over: count it while the seating still describes it.
+            self._record_finished_hand()
         if reading.seats is not None:
             self._seat_states = {
                 chair_for_client_seat(DEALER_PLAYERS, seat): state for seat, state in reading.seats.items()
@@ -852,9 +930,13 @@ class SpotFrame(ttk.Frame):
             counts = {label: sum(state == key for state in reading.seats.values())
                       for key, label in SEAT_STATE_LABELS.items()}
             seats = ", posti: " + ", ".join(f"{n} {label}" for label, n in counts.items() if n)
+        tracked = sum(
+            1 for chair in self.layout.chairs if chair != USER_CHAIR and self.stats.hands(self._stats_id(chair))
+        )
+        statistics = f" | statistiche: {tracked} avversari osservati" if tracked else ""
         self.screen_var.set(
             f"Schermo ({time.strftime('%H:%M:%S')}): mano {hole}, board {board}{dealer}{seats}"
-            f"{self._sync_note}{problems}"
+            f"{self._sync_note}{statistics}{problems}"
         )
         if change.any or synced or stacks_moved:
             self.refresh()
@@ -937,12 +1019,15 @@ class SpotFrame(ttk.Frame):
         hand elsewhere is left alone). Clears the actions if anything moved.
         The button stays where it was if that chair is still occupied."""
         from pokerlab.gui.screen_reader import DEALER_PLAYERS, seated_seats
+        from pokerlab.vision.labels import SEAT_EMPTY
 
         self._seating_read = True
         seated = seated_seats(seats)
         moved = False
         for seat in seats:
             chair = chair_for_client_seat(DEALER_PLAYERS, seat)
+            if seats[seat] == SEAT_EMPTY:
+                self.stats.forget(self._stats_id(chair))  # whoever sits there next is someone else
             if seat in seated and self.layout.add(chair):
                 self.stack_vars[chair].set(self.stack_var.get())
                 self.name_vars[chair].set(f"Avv. {chair}")
@@ -1031,10 +1116,15 @@ class SpotFrame(ttk.Frame):
         self._write(self.log, "\n".join(lines))
 
     @staticmethod
-    def _write(widget: tk.Text, text: str) -> None:
+    def _write(widget: tk.Text, text: str, bold_lines: tuple[int, ...] = ()) -> None:
+        """Replace the text; the (1-based) `bold_lines` are shown in bold."""
         widget.configure(state="normal")
         widget.delete("1.0", "end")
         widget.insert("1.0", text)
+        if bold_lines:
+            widget.tag_configure("bold", font=tkfont.Font(font=widget.cget("font"), weight="bold"))
+            for line in bold_lines:
+                widget.tag_add("bold", f"{line}.0", f"{line}.end")
         widget.configure(state="disabled")
 
     # -- the models ---------------------------------------------------------
@@ -1056,7 +1146,11 @@ class SpotFrame(ttk.Frame):
             return
         self.status_var.set(f"{len(advice)} modelli consultati.")
         lines = []
+        bold_lines: tuple[int, ...] = ()
         for item in advice:
+            if not lines:
+                # The best-rated model's likeliest action, on the line after its name.
+                bold_lines = (2,)
             lines.append(
                 f"{item.label}  (elo {item.rating:.0f})\n"
                 f"  -> {describe_action(item.best.action, state.observation, spot.big_blind)}"
@@ -1068,7 +1162,7 @@ class SpotFrame(ttk.Frame):
                     f"{b.label} {b.probability:.0%}" for b in item.bins if b.probability >= 0.01
                 )
             )
-        self._write(self.advice, "\n".join(lines))
+        self._write(self.advice, "\n".join(lines), bold_lines)
 
     def _load_models(self) -> bool:
         if self.models is not None:

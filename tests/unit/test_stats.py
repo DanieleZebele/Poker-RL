@@ -9,6 +9,7 @@ from pokerlab.engine.actions import Action, ActionType, LegalAction
 from pokerlab.engine.config import GameConfig
 from pokerlab.engine.state import ActionRecord, Street
 from pokerlab.engine.stats import (
+    HandCounts,
     STAT_SLOTS,
     STATS,
     USED_SLOTS,
@@ -321,3 +322,15 @@ def test_a_tracker_changes_nothing_about_how_the_hands_are_played():
         return list(table.stacks)
 
     assert final_stacks(None) == final_stacks(StatsTracker())
+
+
+def test_forgetting_a_player_leaves_them_unknown_and_the_others_alone():
+    tracker = StatsTracker()
+    tracker.add("a", HandCounts((1,) * 9, (1,) * 9))
+    tracker.add("b", HandCounts((0,) * 9, (1,) * 9))
+
+    tracker.forget("a")
+    tracker.forget("nobody")  # harmless
+
+    assert tracker.hands("a") == 0 and tracker.vector("a") is None
+    assert tracker.hands("b") == 1

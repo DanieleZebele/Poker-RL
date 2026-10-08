@@ -280,6 +280,12 @@ class StatsTracker:
                 events[i] -= old.events[i]
                 chances[i] -= old.opportunities[i]
 
+    def forget(self, player_id: str) -> None:
+        """Drop everything known about a player: whoever sat in a seat has left."""
+        self._hands.pop(player_id, None)
+        self._events.pop(player_id, None)
+        self._chances.pop(player_id, None)
+
     def hands(self, player_id: str) -> int:
         return len(self._hands.get(player_id, ()))
 

@@ -408,3 +408,63 @@ def test_the_models_page_shows_every_amount_in_big_blinds(app):
     finally:
         frame.destroy()
         gc.collect()
+
+
+def test_the_models_are_shown_the_statistics_the_spot_was_given_and_the_replay_records_nothing():
+    vector = (1.0,) + (0.25,) * 19
+    spot = Spot(num_players=3, starting_stack=200, seat_stats={1: vector})
+
+    state = replay(spot)
+
+    assert dict(state.observation.seat_stats) == {1: vector}
+    assert replay(Spot(num_players=3, starting_stack=200)).observation.seat_stats == {}
+
+
+def test_a_replay_reports_the_blinds_and_the_scripted_actions_but_not_the_ones_that_finish_the_hand():
+    raised = Action(ActionType.RAISE, 6)
+    spot = Spot(num_players=3, starting_stack=200, script=[raised])
+
+    state = replay(spot)
+    assert [(r.action_type, r.amount) for r in state.records] == [
+        (ActionType.POST_BLIND, 1),
+        (ActionType.POST_BLIND, 2),
+        (ActionType.RAISE, 6),
+    ]
+
+    folds = replay(replace_script(spot, [Action(ActionType.FOLD), Action(ActionType.FOLD)]))
+    assert folds.finished
+    assert [r.action_type for r in folds.records][-2:] == [ActionType.FOLD, ActionType.FOLD]
+
+
+def replace_script(spot, script):
+    from dataclasses import replace
+
+    return replace(spot, script=script)
+
+
+def test_the_likeliest_action_of_the_top_model_is_in_bold(app, monkeypatch):
+    from pokerlab.gui import spot_view
+    from pokerlab.gui.spot import BinAdvice, ModelAdvice
+
+    def opinion(label, rating):
+        best = BinAdvice(1, "check/call", Action(ActionType.CALL), 0.7, True)
+        other = BinAdvice(0, "fold", Action(ActionType.FOLD), 0.3, True)
+        return ModelAdvice(label, rating, best, [best, other], 0.1)
+
+    frame = spot_view.SpotFrame(app)
+    try:
+        monkeypatch.setattr(spot_view, "advise", lambda *a, **k: [opinion("primo", 1900), opinion("secondo", 1800)])
+        frame.models = [object()]
+        spot = Spot(num_players=3, starting_stack=200)
+        frame._consult(replay(spot), spot)
+
+        text = frame.advice.get("1.0", "end")
+        assert text.splitlines()[0].startswith("primo") and "secondo" in text
+        ranges = [str(r) for r in frame.advice.tag_ranges("bold")]
+        assert ranges == ["2.0", "2.end"] or (len(ranges) == 2 and ranges[0].startswith("2."))
+        bold = frame.advice.get(*frame.advice.tag_ranges("bold"))
+        assert bold.strip().startswith("->") and "70%" in bold
+        assert "secondo" not in bold
+    finally:
+        frame.destroy()
+        gc.collect()

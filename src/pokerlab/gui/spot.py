@@ -44,7 +44,7 @@ from typing import TYPE_CHECKING, Any
 from pokerlab.cards.card import Card, Rank, Suit
 from pokerlab.engine.actions import Action, ActionType, IllegalActionError, LegalAction
 from pokerlab.engine.config import GameConfig
-from pokerlab.engine.state import Street
+from pokerlab.engine.state import ActionRecord, Street
 from pokerlab.engine.table import Table
 from pokerlab.players.base import Observation, Player
 
@@ -175,6 +175,11 @@ class Spot:
     # Per-seat stacks, when they are not all `starting_stack`.
     stacks: dict[int, int] = field(default_factory=dict)
     seed: int = 0
+    # What the opponents' statistics say (`engine/stats.py::StatsTracker.vector`), by seat,
+    # for the seats the tracker has seen. They go into the `Observation`s the models read,
+    # as they do at every table the models were trained and rated on; a seat missing here
+    # reads as "unknown".
+    seat_stats: dict[int, tuple[float, ...]] = field(default_factory=dict)
 
     def game(self) -> GameConfig:
         return GameConfig(
@@ -270,6 +275,51 @@ class SpotState:
     # this says where the rest was dropped -- so the caller reports it instead of
     # crashing or silently ignoring actions.
     invalid_from: int | None = None
+    # The engine's own records of the hand so far: the blinds, then every scripted action.
+    # What a `StatsTracker` is fed when the hand is over (`analyse_hand` reads these).
+    records: list[ActionRecord] = field(default_factory=list)
+
+
+class _FixedStats:
+    """Stands in for a `StatsTracker` in a replay: hands the statistics the spot was given to
+    the `Table`, which puts them in the `Observation`s, and records nothing. The replayed
+    hand is a rebuilt one, run again at every edit, so letting the real tracker watch it
+    would count it over and over."""
+
+    def __init__(self, by_seat: dict[int, tuple[float, ...]]) -> None:
+        self._by_seat = dict(by_seat)
+
+    def vectors(self, player_ids) -> dict[int, tuple[float, ...]]:
+        return {seat: vector for seat, vector in self._by_seat.items() if seat in player_ids}
+
+    def record_hand(self, *args, **kwargs) -> None:
+        return None
+
+
+def _table(spot: Spot, replayer: "_Replayer") -> Table:
+    """One shared Replayer in every seat: it is the engine that decides whose turn it is, so
+    the script is consumed in the engine's own order and a caller cannot describe a sequence
+    out of turn."""
+    game = spot.game()
+    table = Table(
+        game,
+        [replayer] * game.num_players,
+        rng=ArrangingRandom(spot.placements(), seed=spot.seed),
+        stats_tracker=_FixedStats(spot.seat_stats) if spot.seat_stats else None,
+    )
+    table.stacks = spot.table_stacks()
+    return table
+
+
+def _scripted_records(actions: list[ActionRecord], consumed: int) -> list[ActionRecord]:
+    """The blinds and the first `consumed` decisions: what the script made happen, without
+    the passive actions the replayer plays after it to let the hand finish."""
+    blinds = 0
+    for record in actions:
+        if record.action_type is not ActionType.POST_BLIND:
+            break
+        blinds += 1
+    return list(actions[: blinds + consumed])
 
 
 class _Replayer(Player):
@@ -341,11 +391,8 @@ def replay(spot: Spot) -> SpotState:
 
 def _legal_prefix(spot: Spot) -> tuple[Spot, int] | None:
     """`spot` with the refused action and everything after it dropped."""
-    game = spot.game()
-    rng = ArrangingRandom(spot.placements(), seed=spot.seed)
     replayer = _Replayer("spot", "spot", spot.script)
-    table = Table(game, [replayer] * game.num_players, rng=rng)
-    table.stacks = spot.table_stacks()
+    table = _table(spot, replayer)
     try:
         table.play_hand()
     except IllegalActionError:
@@ -357,15 +404,10 @@ def _legal_prefix(spot: Spot) -> tuple[Spot, int] | None:
 
 
 def _replay_once(spot: Spot) -> SpotState:
-    game = spot.game()
-    rng = ArrangingRandom(spot.placements(), seed=spot.seed)
     replayer = _Replayer("spot", "spot", spot.script)
-    # One shared Replayer in every seat: it is the engine that decides whose turn
-    # it is, so the script is consumed in the engine's own order and a caller
-    # cannot describe a sequence out of turn.
-    table = Table(game, [replayer] * game.num_players, rng=rng)
-    table.stacks = spot.table_stacks()
-    table.play_hand()
+    table = _table(spot, replayer)
+    result = table.play_hand()
+    records = _scripted_records(result.hand_history.actions, replayer.consumed)
 
     if replayer.captured is None:
         # The hand ended. Anything the script had left is reported as dropped:
@@ -383,6 +425,7 @@ def _replay_once(spot: Spot) -> SpotState:
             taken=replayer.taken,
             finished=True,
             invalid_from=leftover,
+            records=records,
         )
 
     observation, legal_actions = replayer.captured
@@ -397,6 +440,7 @@ def _replay_once(spot: Spot) -> SpotState:
         bets={info.seat: info.current_bet for info in observation.seats},
         taken=replayer.taken,
         finished=False,
+        records=records,
     )
 
 

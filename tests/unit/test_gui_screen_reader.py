@@ -335,3 +335,136 @@ def test_each_chair_shows_what_is_left_and_flags_a_screen_that_disagrees(app):
     finally:
         frame.destroy()
         gc.collect()
+
+
+def _bets(**raised):
+    blinds = {0: 0.0, 1: 0.5, 2: 1.0, 3: 0.0, 4: 0.0, 5: 0.0}
+    return {**blinds, **{int(seat[1:]): amount for seat, amount in raised.items()}}
+
+
+def _play_a_hand_then_move_the_button(frame):
+    """UTG (client seat 3) raises, seat 4 folds; then the button moves: a new hand."""
+    frame.apply_reading(full_reading(_bets(), board=[]))
+    frame.apply_reading(full_reading(_bets(s3=3.0), out={4}, board=[]))
+    assert len(frame.script) == 2
+    frame.apply_reading(full_reading(_bets(), board=[], dealer=1))
+
+
+def test_a_hand_read_off_the_screen_feeds_the_statistics_when_the_next_one_starts(app):
+    from pokerlab.gui.spot_table import chair_for_client_seat as chair
+    from pokerlab.gui.spot_view import SpotFrame
+
+    frame = SpotFrame(app)
+    frame._consult = lambda state, spot: None
+    try:
+        _play_a_hand_then_move_the_button(frame)
+
+        utg, folder = f"chair{chair(6, 3)}", f"chair{chair(6, 4)}"
+        assert frame.stats.hands(utg) == 1
+        assert frame.stats.rates(utg)["vpip"] == (1, 1) and frame.stats.rates(utg)["pfr"] == (1, 1)
+        assert frame.stats.rates(folder)["vpip"] == (0, 1)
+        assert frame.stats.rates(utg)["wtsd"] == (0, 0)  # nobody saw a flop
+        assert "statistiche" in frame.screen_var.get()
+        assert "VPIP 100% PFR 100% (1 mani)" in frame.chair_ui[chair(6, 3)].info.cget("text")
+    finally:
+        frame.destroy()
+        gc.collect()
+
+
+def test_the_models_read_those_statistics_in_the_next_hand(app):
+    from pokerlab.gui.spot import replay
+    from pokerlab.gui.spot_table import chair_for_client_seat as chair
+    from pokerlab.gui.spot_view import SpotFrame
+
+    frame = SpotFrame(app)
+    frame._consult = lambda state, spot: None
+    try:
+        _play_a_hand_then_move_the_button(frame)
+
+        state = replay(frame.build_spot())
+        seen = dict(state.observation.seat_stats)
+        raiser = frame.layout.seat_of(chair(6, 3))
+        assert raiser in seen and seen[raiser][0] == 1.0  # "statistics supplied"
+        assert frame.stats.hands(f"chair{chair(6, 3)}") == 1  # the replay itself recorded nothing
+    finally:
+        frame.destroy()
+        gc.collect()
+
+
+def test_a_hand_built_by_hand_is_not_counted(app):
+    from pokerlab.gui.spot_view import SpotFrame
+
+    frame = SpotFrame(app)
+    frame._consult = lambda state, spot: None
+    try:
+        frame.add_player(3)
+        frame._append(Action(ActionType.RAISE, 6))
+        frame.set_dealer(3)  # editing the table clears the script without any hand having been seen
+        frame._clear()
+        assert all(frame.stats.hands(f"chair{c}") == 0 for c in range(9))
+    finally:
+        frame.destroy()
+        gc.collect()
+
+
+def test_a_seat_that_empties_is_forgotten_and_the_button_clears_the_rest(app):
+    from pokerlab.gui.spot_table import chair_for_client_seat as chair
+    from pokerlab.gui.spot_view import SpotFrame
+
+    frame = SpotFrame(app)
+    frame._consult = lambda state, spot: None
+    try:
+        _play_a_hand_then_move_the_button(frame)
+        utg = f"chair{chair(6, 3)}"
+        assert frame.stats.hands(utg) == 1
+
+        seats = {s: "in_gioco" for s in range(6)}
+        seats[3] = "libero"  # the player left; the next hand starts with another dealer
+        frame.apply_reading(seats_reading(seats, dealer=2))
+        assert frame.stats.hands(utg) == 0
+        assert frame.stats.hands(f"chair{chair(6, 4)}") == 1  # the others keep their history
+
+        frame.reset_stats()
+        assert frame.stats.hands(f"chair{chair(6, 4)}") == 0
+    finally:
+        frame.destroy()
+        gc.collect()
+
+
+def _three_handed(frame):
+    frame.add_player(3)
+    frame.add_player(6)  # chairs 0, 3, 6: seats 0 (BTN), 1 (SB), 2 (BB)
+    return [f"chair{c}" for c in (0, 3, 6)]
+
+
+def test_a_player_who_saw_the_flop_and_never_folded_reached_the_showdown(app):
+    from pokerlab.gui.spot_view import SpotFrame
+
+    frame = SpotFrame(app)
+    frame._consult = lambda state, spot: None
+    try:
+        ids = _three_handed(frame)
+        call, check = Action(ActionType.CALL), Action(ActionType.CHECK)
+        frame.script = [call, call, check] + [check] * 3 * 3  # preflop, then checked down three streets
+        frame._record_finished_hand()
+        assert [frame.stats.rates(i)["wtsd"] for i in ids] == [(1, 1)] * 3
+    finally:
+        frame.destroy()
+        gc.collect()
+
+
+def test_a_hand_won_by_a_bet_on_the_flop_is_no_showdown_for_anyone(app):
+    from pokerlab.gui.spot_view import SpotFrame
+
+    frame = SpotFrame(app)
+    frame._consult = lambda state, spot: None
+    try:
+        ids = _three_handed(frame)
+        call, check, fold = Action(ActionType.CALL), Action(ActionType.CHECK), Action(ActionType.FOLD)
+        frame.script = [call, call, check, Action(ActionType.BET, 4), fold, fold]
+        frame._record_finished_hand()
+        # the flop was seen by all three (the board is only implied by the flop actions)
+        assert [frame.stats.rates(i)["wtsd"] for i in ids] == [(0, 1)] * 3
+    finally:
+        frame.destroy()
+        gc.collect()

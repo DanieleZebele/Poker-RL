@@ -733,9 +733,8 @@ model can adapt to whoever is in front of it.
   reads them in its rating too, and a hand costs ~27% more CPU, so every rated pass is
   slower): a fleet reset, which `FEATURE_VERSION` 3 already is. Pinned by
   `test_a_session_gives_the_models_the_statistics_of_the_players_in_front_of_them` and
-  `test_every_session_starts_with_blank_statistics_whoever_sat_in_the_last_one`. Still
-  without them: the spot screen (no tracker, so zeros; see the TODO). The GUI's table has one per
-  session now.
+  `test_every_session_starts_with_blank_statistics_whoever_sat_in_the_last_one`. The GUI's table has one per
+  session, and so does the spot screen (see "Spot screen statistics" in the GUI section).
 
 ## Continuous training loop (`rl/loop.py`)
 
@@ -2205,6 +2204,32 @@ dependency (Flask, etc.) — it ships with Python. Architecture:
   - `advise` bypasses `RLAgentPlayer` (it samples and drops the distribution) and
     returns the full softmax; torch is imported lazily and the models are loaded on
     the first "Chiedi", not when the screen opens.
+- **Spot screen statistics (`SpotFrame.stats`, a `StatsTracker` for as long as the screen is
+  open).** The models advising there read their opponents' VPIP/PFR/... like at any table.
+  - **Fed only by hands read off the screen, at a hand boundary** (a new deal or the button
+    moving, `_record_finished_hand`, called in `apply_reading` *before* the new seating is
+    applied, while the layout still describes the old hand): the script rebuilt by `action_sync`
+    goes to `StatsTracker.record_hand` as the engine's own records (`SpotState.records`: the
+    blinds and the scripted actions only, not the passive ones the replayer plays to finish the
+    hand). A spot built by hand is never recorded. Readings stay every 0.5 s.
+  - **Identity is the chair** (`chair<N>`, what stays put between hands); a seat the screen
+    shows empty (`libero`) is forgotten (`StatsTracker.forget`), since someone else sits there
+    next. "Azzera statistiche" forgets everyone (another table).
+  - **Into the models: `Spot.seat_stats`** (by engine seat, from `tracker.vectors`), handed to
+    the replay's `Table` through `_FixedStats`, which records nothing -- the replayed hand is
+    rebuilt at every edit and the real tracker must not count it. Each chair shows
+    "VPIP x% PFR y% (n mani)" once seen.
+  - **Limits, accepted.** WTSD is counted like the others: a player who saw the flop and never
+    folded reached the showdown unless everyone else folded, and the board is the one last read
+    or what the streets of the actions imply (`_board_reached`; the screen may clear the board
+    before the next deal). The weak point is the end of a hand: a last fold missed because the
+    next deal replaced the hand between two readings makes the player left look like a showdown;
+    and a showdown whose face-up cards are read as "out" can make `action_sync` add a fold that
+    never happened (so the checks that closed the street are lost). More generally the last
+    actions of a hand can be missed, which leans the figures towards what is easy to see.
+    Every seated player counts as dealt in. Pinned in `test_gui_screen_reader.py` and
+    `test_gui_spot.py`.
+- **The likeliest action of the top model is bold** in the advice panel (`_write(bold_lines=)`).
 - **Cards are drawn on a `tk.Canvas`, not image files** (`gui/cards_canvas.py`):
   a plain rectangle plus rank/suit text (Unicode ♠♥♦♣, red for hearts/
   diamonds, black for spades/clubs) for a face-up card, a solid-fill
@@ -2784,14 +2809,6 @@ current behaviour is coherent. Any figure quoted comes from a measurement that
 must be repeated on the population it will be used against: models change, and so
 do the numbers.
 
-- **Opponent statistics on the spot screen.** Every training and rated table has a
-  `StatsTracker` (see "Opponent statistics"), and so does the GUI's table now (a fresh one
-  per session, `start_session`, following the human too -- `test_a_session_gives_the_models_
-  their_opponents_statistics`). The spot screen has none: it is one hand rebuilt from a
-  script, with no history of earlier hands, so a model advising there reads every opponent
-  as unknown, which in training it sees only on a table's first hand and which makes it
-  play 12-20% differently (tighter, more passive: `hud_study`). Its statistics need a
-  source first (the vision reader following the client across hands, say).
 - **Style constraints on the models, to keep the population's strategies diverse
   (idea, not yet designed).** Every model is trained toward the same objective
   (bb won against the drawn field) and the fleet's selection pressure is a single
