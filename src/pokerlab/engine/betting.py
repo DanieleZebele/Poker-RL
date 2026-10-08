@@ -141,6 +141,37 @@ def apply_action(hand_state: HandState, seat: int, action: Action) -> None:
     )
 
 
+def post_antes(hand_state: HandState, ante: int, order: list[int]) -> None:
+    """Every seat in `order` puts `ante` chips (or all it has) in the pot, before the blinds.
+
+    The ante counts towards `total_committed` -- so the pots, side pots included, are built
+    with it -- but not towards `current_bet`: it is dead money, not a bet the others have to
+    match, and the big blind is still the bet to call. A player whose stack the ante takes
+    is all-in for it and can win only the layer of the pot it paid into."""
+    for seat in order:
+        ps = hand_state.seat_state(seat)
+        pot_before = hand_state.pot_total()
+        stack_before = ps.stack
+        paid = min(ante, ps.stack)
+        ps.stack -= paid
+        ps.total_committed += paid
+        if ps.stack == 0 and ps.status == PlayerStatus.ACTIVE:
+            ps.status = PlayerStatus.ALL_IN
+        hand_state.action_log.append(
+            ActionRecord(
+                street=hand_state.street,
+                seat=seat,
+                player_id=ps.player_id,
+                action_type=ActionType.POST_ANTE,
+                amount=ps.current_bet,
+                stack_before=stack_before,
+                stack_after=ps.stack,
+                pot_before=pot_before,
+                timestamp=time.time(),
+            )
+        )
+
+
 def post_blinds(hand_state: HandState, sb_seat: int, bb_seat: int) -> None:
     for ps, blind in ((hand_state.seat_state(sb_seat), hand_state.small_blind), (hand_state.seat_state(bb_seat), hand_state.big_blind)):
         pot_before = hand_state.pot_total()

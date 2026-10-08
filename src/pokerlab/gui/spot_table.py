@@ -1,9 +1,9 @@
-"""The seating of the "ask the models" table: nine chairs round an oval.
+"""The seating of the "ask the models" table: eight chairs round the screen's edges.
 
 Pure Python, no Tkinter, so the part that decides who acts after whom is
 testable without a display.
 
-There are nine chairs, numbered clockwise as seen on screen starting from the one
+There are eight chairs, numbered clockwise as seen on screen starting from the one
 at the bottom, which is always yours. The player holding the dealer button is the
 one the engine calls seat 0 (`gui/spot.py` documents why: `Table` puts the button
 on the lowest seat on a table's first hand), and the occupied chairs read
@@ -13,42 +13,53 @@ describing the order of play, and nobody has to type a seat number.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 
-CHAIRS = 9
+CHAIRS = 8
 # The chair at the bottom of the table. The user is always seated, so it is never
 # removed, and it is where "your cards" live.
 USER_CHAIR = 0
 
 
-# Where a seat of the poker client sits among these nine chairs, by table size:
+# Where a seat of the poker client sits among these eight chairs, by table size:
 # client seat k (0 = you at the bottom, then clockwise on screen) goes to the
-# chair nearest its angle. 6-max seats are 60 degrees apart and chairs 40, so
-# seats 2 and 4 land exactly (chairs 3, 6), seats 1 and 5 symmetrically 20
-# degrees off (chairs 2, 7), and seat 3, straight across, between two chairs:
-# chair 4 was picked, 5 would be as good.
-CLIENT_SEAT_CHAIRS = {6: (0, 2, 3, 4, 6, 7)}
+# chair nearest its angle. At 8-max the client's seats are the chairs themselves,
+# 45 degrees apart like them. 6-max seats are 60 degrees apart, so seat 3,
+# straight across, lands exactly (chair 4) and the others 15 degrees off theirs,
+# symmetrically (chairs 1, 3 on the left, 5, 7 on the right).
+CLIENT_SEAT_CHAIRS = {6: (0, 1, 3, 4, 5, 7), 8: tuple(range(8))}
 
 
 def chair_for_client_seat(players: int, seat: int) -> int:
     return CLIENT_SEAT_CHAIRS[players][seat]
 
 
-def chair_position(
-    chair: int, center: tuple[float, float], radii: tuple[float, float]
-) -> tuple[float, float]:
-    """Where a chair sits on screen (y grows downwards).
+# Where each chair's box sits on the canvas, as fractions of its width and height,
+# and which corner or side of the box is pinned there. Chair 0 is at the bottom and
+# the numbers increase clockwise *as seen on screen*: bottom-left corner, the middle
+# of the left side, top-left corner, top, and down the right -- a square round the
+# felt rather than an oval. Each box is pinned by the side facing the edge, so it
+# grows inwards (a box at the top grows down when its actions appear) and the boxes
+# never cover one another as long as the canvas holds three of them a side.
+_SLOTS = {
+    0: (0.5, 1.0, "s"),
+    1: (0.0, 1.0, "sw"),
+    2: (0.0, 0.5, "w"),
+    3: (0.0, 0.0, "nw"),
+    4: (0.5, 0.0, "n"),
+    5: (1.0, 0.0, "ne"),
+    6: (1.0, 0.5, "e"),
+    7: (1.0, 1.0, "se"),
+}
+assert len(_SLOTS) == CHAIRS
 
-    Chair 0 is at the bottom and the numbers increase clockwise *as seen on
-    screen*: from the bottom the next chair is to the left, then up the left side,
-    across the top and down the right.
-    """
-    angle = 2 * math.pi * chair / CHAIRS
-    return (
-        center[0] - radii[0] * math.sin(angle),
-        center[1] + radii[1] * math.cos(angle),
-    )
+
+def chair_slot(chair: int, size: tuple[float, float], margin: float = 0) -> tuple[float, float, str]:
+    """`(x, y, anchor)` of a chair's box on a canvas of `size` (y grows downwards),
+    `margin` in from the edges; `anchor` is Tk's, the point of the box placed there."""
+    fx, fy, anchor = _SLOTS[chair]
+    width, height = size
+    return margin + fx * (width - 2 * margin), margin + fy * (height - 2 * margin), anchor
 
 
 @dataclass

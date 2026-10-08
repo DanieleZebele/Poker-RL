@@ -132,7 +132,7 @@ def test_dealer_zones_are_named_per_table_size_and_seat():
     from pokerlab.vision.regions import dealer_region_name
 
     assert dealer_region_name(6, 0) == "dealer_6_0" and dealer_region_name(6, 5) == "dealer_6_5"
-    for players, seat in ((6, 6), (6, -1), (9, 0)):
+    for players, seat in ((6, 6), (6, -1), (8, 8), (9, 0), (7, 0)):
         with pytest.raises(ValueError):
             dealer_region_name(players, seat)
 
@@ -496,6 +496,34 @@ def test_the_card_section_looks_like_the_others(app):
         assert frame.card_zone_buttons[HOLE_CARDS][1].cget("text") == "✓ Mie carte"
         assert frame.card_zone_buttons[BOARD][1].cget("text") == "Board"
         assert frame.vision_var.get() == "zone mancanti: Board | Zona salvata."
+    finally:
+        frame.destroy()
+        gc.collect()
+
+
+def test_the_seat_sections_switch_to_an_eight_seat_table(app, monkeypatch, tmp_path):
+    from pokerlab.gui import vision_view
+    from pokerlab.vision import capture, labels
+    from pokerlab.vision.regions import Region, RegionConfig, dealer_region_name, player_region_name
+
+    monkeypatch.setattr(capture, "grab_region", lambda region: region)
+    monkeypatch.setattr(labels, "DEALER_DIR", tmp_path)
+    frame = vision_view.VisionFrame(app)
+    try:
+        frame.regions = RegionConfig()
+        assert len(frame.dealer_zone_buttons) == 6 and len(frame.player_zone_buttons) == 6
+        assert frame.set_players(8) and not frame.set_players(8)
+        assert len(frame.dealer_zone_buttons) == 8 and len(frame.player_zone_buttons) == 8
+        assert len(frame.stack_zone_buttons) == 8 and len(frame.amount_zone_buttons) == 9  # pot + 8
+        assert "8 giocatori" in str(frame.dealer_zone_buttons[0].master.master.cget("text"))
+        frame.regions.set(dealer_region_name(6, 1), Region(5, 5, 30, 30))  # a 6-max zone: not ours now
+        frame.regions.set(dealer_region_name(8, 7), Region(50, 5, 30, 30))
+        labeler = frame._save_dealer()
+        assert [zone for _seat, zone, *_ in labeler.shots] == ["dealer_8_7"]
+        labeler.cancel()
+        assert "zone mancanti" in frame.players_var.get()
+        assert player_region_name(8, 7) == "player_8_7"
+        assert frame.set_players(6) and len(frame.dealer_zone_buttons) == 6
     finally:
         frame.destroy()
         gc.collect()

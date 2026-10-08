@@ -29,7 +29,8 @@ from pokerlab.vision.regions import (
     stack_region_name,
 )
 
-# The table size whose dealer zones are read (the only one mapped so far).
+# The table size whose per-seat zones are read unless told otherwise; the spot
+# screen chooses 6 or 8 (`regions.DEALER_TABLE_SIZES`).
 DEALER_PLAYERS = 6
 
 
@@ -67,7 +68,10 @@ class VisionNotAvailable(Exception):
 
 
 class ScreenReader:
-    def __init__(self, crops_dir: Path | None = None) -> None:
+    def __init__(self, crops_dir: Path | None = None, players: int = DEALER_PLAYERS) -> None:
+        """`players`: the table size whose seat zones are read (`dealer_<players>_*`,
+        `player_<players>_*`, ...); it can be changed between two readings."""
+        self.players = players
         try:
             from pokerlab.vision import recognize
         except ImportError as exc:
@@ -77,6 +81,7 @@ class ScreenReader:
         self._recognizer = None
         self._crop_count = -1
         self._sit_out_templates: list = []
+        self._empty_backgrounds: dict = {}  # zone -> that zone's empty-seat thumbnails
         self._seat_crop_count = -1
         self._amount_reader = None
         self._amount_crop_count = -1
@@ -103,11 +108,11 @@ class ScreenReader:
         if not regions.regions:
             reading.problems.append("zone non impostate (Collect vision data)")
             return reading
-        for seat in range(DEALER_PLAYERS):
-            region = regions.get(dealer_region_name(DEALER_PLAYERS, seat))
+        for seat in range(self.players):
+            region = regions.get(dealer_region_name(self.players, seat))
             if region is not None and max(region.width, region.height) > DEALER_ZONE_MAX_SIDE:
                 # A player box drawn as a dealer zone: its stack chip is gold too.
-                regions.clear(dealer_region_name(DEALER_PLAYERS, seat))
+                regions.clear(dealer_region_name(self.players, seat))
                 reading.problems.append(f"zona gettone del posto {seat} troppo grande, ignorata: rifalla")
         # Every zone in one grab (`grab_regions`): one capture per zone cost 233 ms.
         wanted = {name: region for name, region in regions.regions.items() if name in self._zones_read()}
@@ -125,14 +130,13 @@ class ScreenReader:
         self._read_turn(frames, reading)
         return reading
 
-    @staticmethod
-    def _zones_read() -> set[str]:
+    def _zones_read(self) -> set[str]:
         names = {HOLE_CARDS, BOARD}
-        for seat in range(DEALER_PLAYERS):
-            names.add(dealer_region_name(DEALER_PLAYERS, seat))
-            names.add(player_region_name(DEALER_PLAYERS, seat))
-            names.add(bet_region_name(DEALER_PLAYERS, seat))
-            names.add(stack_region_name(DEALER_PLAYERS, seat))
+        for seat in range(self.players):
+            names.add(dealer_region_name(self.players, seat))
+            names.add(player_region_name(self.players, seat))
+            names.add(bet_region_name(self.players, seat))
+            names.add(stack_region_name(self.players, seat))
         names.add(POT)
         names.add(TURN_TIMER)
         return names
@@ -172,8 +176,8 @@ class ScreenReader:
         from pokerlab.vision.dealer import find_dealer
 
         seats = {
-            seat: frames[name] for seat in range(DEALER_PLAYERS)
-            if (name := dealer_region_name(DEALER_PLAYERS, seat)) in frames
+            seat: frames[name] for seat in range(self.players)
+            if (name := dealer_region_name(self.players, seat)) in frames
         }
         if not seats:
             return
@@ -185,14 +189,16 @@ class ScreenReader:
 
     def _get_sit_out_templates(self) -> list:
         """The "SIT OUT" lettering of the labelled seat crops, reloaded when
-        their number changes (the only part of the seat rules that needs one)."""
+        their number changes; the empty-seat backgrounds are reloaded with it."""
         from pokerlab.vision.labels import PLAYERS_DIR
-        from pokerlab.vision.seats import load_seats, sit_out_templates
+        from pokerlab.vision.seats import empty_backgrounds, load_seats, sit_out_templates
 
         count = len(list(PLAYERS_DIR.glob("*.png")))
         if count != self._seat_crop_count:
             self._seat_crop_count = count
-            self._sit_out_templates = sit_out_templates(load_seats(PLAYERS_DIR))
+            labelled = load_seats(PLAYERS_DIR)
+            self._sit_out_templates = sit_out_templates(labelled)
+            self._empty_backgrounds = empty_backgrounds(labelled)
         return self._sit_out_templates
 
     def _read_seats(self, frames: dict, reading: ScreenReading) -> None:
@@ -200,13 +206,16 @@ class ScreenReader:
         from pokerlab.vision.seats import read_seat
 
         seats = {
-            seat: frames[name] for seat in range(DEALER_PLAYERS)
-            if (name := player_region_name(DEALER_PLAYERS, seat)) in frames
+            seat: (name, frames[name]) for seat in range(self.players)
+            if (name := player_region_name(self.players, seat)) in frames
         }
         if not seats:
             return
         templates = self._get_sit_out_templates()
-        reading.seats = {seat: read_seat(frame, seat, templates).state for seat, frame in seats.items()}
+        reading.seats = {
+            seat: read_seat(frame, seat, templates, self._empty_backgrounds.get(name)).state
+            for seat, (name, frame) in seats.items()
+        }
 
 
     def _get_amount_reader(self):
@@ -226,8 +235,8 @@ class ScreenReader:
         """Every bet zone and the pot zone set, in big blinds."""
         from pokerlab.vision.amounts import amount_value
 
-        zones = {seat: bet_region_name(DEALER_PLAYERS, seat) for seat in range(DEALER_PLAYERS)}
-        stack_zones = {seat: stack_region_name(DEALER_PLAYERS, seat) for seat in range(DEALER_PLAYERS)}
+        zones = {seat: bet_region_name(self.players, seat) for seat in range(self.players)}
+        stack_zones = {seat: stack_region_name(self.players, seat) for seat in range(self.players)}
         if not any(name in frames for name in [*zones.values(), *stack_zones.values(), POT]):
             return
         reader = self._get_amount_reader()
@@ -323,11 +332,46 @@ def diff_reading(previous: ScreenReading | None, current: ScreenReading,
     return change
 
 
-def seated_seats(seats: dict[int, str]) -> set[int]:
+def sit_out_blinds(seats: dict[int, str], bets: dict[int, float] | None) -> set[int]:
+    """The players sitting out who have chips in front of them: a player in
+    sit-out can still be the small or the big blind, posted for them, and the
+    table only plays right with them in it -- otherwise the engine would hand
+    their blind to the next player round."""
+    from pokerlab.vision.labels import SEAT_SIT_OUT
+
+    return {
+        seat for seat, state in seats.items()
+        if state == SEAT_SIT_OUT and (bets or {}).get(seat, 0.0) > 0
+    }
+
+
+def seated_seats(seats: dict[int, str], bets: dict[int, float] | None = None, *, antes: bool = False) -> set[int]:
     """The client seats to put at the table: everyone but empty seats and
     players sitting out. A folded player is still at the table (only out of
     this hand), and from one picture "out, folded" and "out, waiting to join"
-    look the same -- so a newcomer is seated until the next hand shows better."""
+    look the same -- so a newcomer is seated until the next hand shows better.
+    A player sitting out *is* seated when a blind is in front of them
+    (`sit_out_blinds`), and with `antes` always: at a tournament table they are
+    dealt in and pay the ante like everyone else. Being out of the hand, they
+    fold when their turn comes."""
     from pokerlab.vision.labels import SEAT_EMPTY, SEAT_SIT_OUT
 
-    return {seat for seat, state in seats.items() if state not in (SEAT_EMPTY, SEAT_SIT_OUT)}
+    seated = {seat for seat, state in seats.items() if state not in (SEAT_EMPTY, SEAT_SIT_OUT)}
+    if antes:
+        seated |= {seat for seat, state in seats.items() if state == SEAT_SIT_OUT}
+    return seated | sit_out_blinds(seats, bets)
+
+
+def ante_from_pot(seats: dict[int, str], pot: float | None, board: list | None) -> float | None:
+    """The ante each player paid, in big blinds, from a preflop reading: the client's
+    pot leaves out the bets still in front of the players, so before the flop it holds
+    the antes alone, paid by every seat that is not empty. None when the reading cannot
+    tell (not preflop, no pot read, fewer than two players)."""
+    from pokerlab.vision.labels import SEAT_EMPTY
+
+    if pot is None or board is None or board:
+        return None
+    dealt = sum(1 for state in seats.values() if state != SEAT_EMPTY)
+    if dealt < 2:
+        return None
+    return pot / dealt

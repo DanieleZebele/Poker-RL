@@ -26,8 +26,9 @@ REGION_NAMES = (HOLE_CARDS, BOARD)
 # Where the dealer button can appear, one zone per seat, and the seat positions
 # depend on how many players the table seats. Seat 0 is you (the client draws
 # you at the bottom), then clockwise *as seen on screen* from your left -- the
-# same order as the chairs of the spot screen. Only 6-max is mapped so far.
-DEALER_TABLE_SIZES = (6,)
+# same order as the chairs of the spot screen. 6-max and 8-max are mapped, each
+# with zones of its own (`dealer_6_3` and `dealer_8_3` are different places).
+DEALER_TABLE_SIZES = (6, 8)
 # A dealer zone is drawn round the button alone (measured 36-41 px a side). One
 # twice that is almost certainly a player box drawn in the wrong section -- it
 # happened, seat 5 at 149x111 -- and the gold of that player's stack chip could
@@ -43,7 +44,8 @@ TURN_TIMER = "turn_timer"
 
 
 def stack_region_name(players: int, seat: int) -> str:
-    """`stack_6_3`: where seat 3's stack (chips behind) is written at 6-max."""
+    """`stack_6_3`: where seat 3's stack (chips behind) is written at 6-max
+    (`stack_8_3` at 8-max)."""
     if players not in DEALER_TABLE_SIZES or not 0 <= seat < players:
         raise ValueError(f"nessuna zona stack per il posto {seat} a {players} giocatori")
     return f"stack_{players}_{seat}"

@@ -42,7 +42,13 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 from pokerlab.cards.card import Card, Rank, Suit
-from pokerlab.engine.actions import Action, ActionType, IllegalActionError, LegalAction
+from pokerlab.engine.actions import (
+    FORCED_ACTIONS,
+    Action,
+    ActionType,
+    IllegalActionError,
+    LegalAction,
+)
 from pokerlab.engine.config import GameConfig
 from pokerlab.engine.state import ActionRecord, Street
 from pokerlab.engine.table import Table
@@ -165,6 +171,8 @@ class Spot:
     starting_stack: int = 200
     small_blind: int = 1
     big_blind: int = 2
+    # Paid by everyone before the blinds, in chips (tournaments); 0 = none.
+    ante: int = 0
     my_seat: int = 0
     hole_cards: tuple[Card, Card] | None = None
     board: tuple[Card, ...] = ()
@@ -187,6 +195,7 @@ class Spot:
             starting_stack=self.starting_stack,
             small_blind=self.small_blind,
             big_blind=self.big_blind,
+            ante=self.ante,
         )
 
     def validate(self) -> None:
@@ -275,7 +284,7 @@ class SpotState:
     # this says where the rest was dropped -- so the caller reports it instead of
     # crashing or silently ignoring actions.
     invalid_from: int | None = None
-    # The engine's own records of the hand so far: the blinds, then every scripted action.
+    # The engine's own records of the hand so far: the antes and blinds, then every scripted action.
     # What a `StatsTracker` is fed when the hand is over (`analyse_hand` reads these).
     records: list[ActionRecord] = field(default_factory=list)
 
@@ -312,14 +321,14 @@ def _table(spot: Spot, replayer: "_Replayer") -> Table:
 
 
 def _scripted_records(actions: list[ActionRecord], consumed: int) -> list[ActionRecord]:
-    """The blinds and the first `consumed` decisions: what the script made happen, without
-    the passive actions the replayer plays after it to let the hand finish."""
-    blinds = 0
+    """The antes, the blinds and the first `consumed` decisions: what the script made happen,
+    without the passive actions the replayer plays after it to let the hand finish."""
+    forced = 0
     for record in actions:
-        if record.action_type is not ActionType.POST_BLIND:
+        if record.action_type not in FORCED_ACTIONS:
             break
-        blinds += 1
-    return list(actions[: blinds + consumed])
+        forced += 1
+    return list(actions[: forced + consumed])
 
 
 class _Replayer(Player):
@@ -464,9 +473,9 @@ class ModelAdvice:
     # The bin it puts the most probability on, and that probability.
     best: BinAdvice
     bins: list[BinAdvice]
-    # The critic's estimate for the spot, in the units the model was trained in
-    # (`reward_scale`, so roughly stacks rather than big blinds -- read it as a
-    # sign and a magnitude, not as chips).
+    # The critic's value: always 0 for a model that is only playing, since the critic reads
+    # every player's equity, which exists only in training (`PokerActorCritic.forward`
+    # without `critic_extra`). Kept for the shape, no longer shown: it read "+0.00" always.
     value: float
 
 
@@ -531,7 +540,6 @@ def advise(
     models: list[tuple[str, float, PokerActorCritic]],
     *,
     big_blind: int,
-    starting_stack: int,
     device: str = "cpu",
 ) -> list[ModelAdvice]:
     """Each model's full opinion on one decision.
@@ -543,18 +551,21 @@ def advise(
 
     torch is imported inside the function, like every other torch user the GUI
     has, so opening the app still costs nothing until a model is actually loaded.
+
+    The features are normalised as each model was in training (`feature_stack_bb`, set on
+    the model by `load_advisors`), never by the stacks of the spot: that is what
+    `RLAgentPlayer` does at a table, and the advice must be what the model would play.
     """
     import torch
 
     from pokerlab.rl.action_space import action_index_to_action, legal_action_mask
     from pokerlab.rl.features import encode_observation
+    from pokerlab.rl.table_mix import DEFAULT_STACK_MAX_BB
 
     labels = bin_labels()
 
     mask = legal_action_mask(observation, legal_actions)
-    features = encode_observation(
-        observation, big_blind=big_blind, starting_stack=starting_stack, legal_mask=mask
-    )
+    by_stack: dict[int, list[float]] = {}  # features per normalisation constant
     actions = [
         action_index_to_action(index, observation, legal_actions) if legal else None
         for index, legal in enumerate(mask)
@@ -563,6 +574,12 @@ def advise(
     advice: list[ModelAdvice] = []
     for label, rating, model in models:
         model.to(device)
+        starting_stack = round(getattr(model, "feature_stack_bb", DEFAULT_STACK_MAX_BB) * big_blind)
+        if starting_stack not in by_stack:
+            by_stack[starting_stack] = encode_observation(
+                observation, big_blind=big_blind, starting_stack=starting_stack, legal_mask=mask
+            )
+        features = by_stack[starting_stack]
         with torch.no_grad():
             logits, value = model(
                 torch.tensor([features], dtype=torch.float32, device=device),
@@ -603,14 +620,16 @@ def load_advisors(
     not take the mode down.
     """
     from pokerlab.rl.ppo import build_model_from_checkpoint
+    from pokerlab.rl.table_mix import feature_stack_bb
 
     loaded: list[tuple[str, float, Any]] = []
     failed: list[tuple[str, str]] = []
     for label, rating, path in paths:
         try:
-            model, _checkpoint = build_model_from_checkpoint(path, device=device)
+            model, checkpoint = build_model_from_checkpoint(path, device=device)
         except Exception as exc:  # noqa: BLE001 - a user-owned directory
             failed.append((label, str(exc)))
             continue
+        model.feature_stack_bb = feature_stack_bb(checkpoint)  # what `advise` normalises by
         loaded.append((label, rating, model))
     return loaded, failed

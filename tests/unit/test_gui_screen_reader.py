@@ -155,7 +155,7 @@ def test_client_seats_map_to_the_nearest_chairs():
     chairs = [chair_for_client_seat(6, seat) for seat in range(6)]
     assert chairs[0] == 0 and len(set(chairs)) == 6
     for seat, chair in enumerate(chairs):  # within half a chair of the seat's angle
-        assert abs(chair * 360 / CHAIRS - seat * 60) <= 20
+        assert abs(chair * 360 / CHAIRS - seat * 60) <= 360 / CHAIRS / 2
 
 
 def test_the_button_is_moved_to_its_chair_seating_a_player_if_needed(frame):
@@ -272,9 +272,9 @@ def test_the_models_page_rebuilds_the_actions_from_the_bets(app):
         blinds = {0: 0.0, 1: 0.5, 2: 1.0, 3: 0.0, 4: 0.0, 5: 0.0}
         frame.apply_reading(full_reading(blinds, board=[]))
         assert frame.script == []
-        raised = {**blinds, 3: 3.0}  # UTG raises to 3 BB (6 chips), seat 4 folds
+        raised = {**blinds, 3: 3.0}  # UTG raises to 3 BB (300 chips), seat 4 folds
         assert frame.apply_reading(full_reading(raised, out={4}, board=[]))
-        assert [(a.action_type, a.amount) for a in frame.script] == [(ActionType.RAISE, 6), (ActionType.FOLD, 0)]
+        assert [(a.action_type, a.amount) for a in frame.script] == [(ActionType.RAISE, 300), (ActionType.FOLD, 0)]
         status = frame.screen_var.get()
         assert "+ UTG raise" in status and "tocca a" in status and "ATTENZIONE" not in status
 
@@ -365,7 +365,9 @@ def test_a_hand_read_off_the_screen_feeds_the_statistics_when_the_next_one_start
         assert frame.stats.rates(folder)["vpip"] == (0, 1)
         assert frame.stats.rates(utg)["wtsd"] == (0, 0)  # nobody saw a flop
         assert "statistiche" in frame.screen_var.get()
-        assert "VPIP 100% PFR 100% (1 mani)" in frame.chair_ui[chair(6, 3)].info.cget("text")
+        info = frame.chair_ui[chair(6, 3)].info.cget("text")
+        assert "statistiche su 1 mani" in info and "VPIP 100% (1)" in info and "PFR 100% (1)" in info
+        assert "WTSD -" in info  # no chance yet: no rate
     finally:
         frame.destroy()
         gc.collect()
@@ -401,7 +403,7 @@ def test_a_hand_built_by_hand_is_not_counted(app):
         frame._append(Action(ActionType.RAISE, 6))
         frame.set_dealer(3)  # editing the table clears the script without any hand having been seen
         frame._clear()
-        assert all(frame.stats.hands(f"chair{c}") == 0 for c in range(9))
+        assert all(frame.stats.hands(f"chair{c}") == 0 for c in range(8))
     finally:
         frame.destroy()
         gc.collect()
@@ -461,10 +463,195 @@ def test_a_hand_won_by_a_bet_on_the_flop_is_no_showdown_for_anyone(app):
     try:
         ids = _three_handed(frame)
         call, check, fold = Action(ActionType.CALL), Action(ActionType.CHECK), Action(ActionType.FOLD)
-        frame.script = [call, call, check, Action(ActionType.BET, 4), fold, fold]
+        frame.script = [call, call, check, Action(ActionType.BET, 200), fold, fold]
         frame._record_finished_hand()
         # the flop was seen by all three (the board is only implied by the flop actions)
         assert [frame.stats.rates(i)["wtsd"] for i in ids] == [(0, 1)] * 3
+    finally:
+        frame.destroy()
+        gc.collect()
+
+
+def test_at_eight_max_each_client_seat_is_its_own_chair():
+    from pokerlab.gui.spot_table import CHAIRS, chair_for_client_seat
+
+    assert [chair_for_client_seat(8, seat) for seat in range(8)] == list(range(CHAIRS))
+
+
+def test_the_reader_reads_the_zones_of_the_table_size_it_is_given(tmp_path):
+    pytest.importorskip("numpy")
+    from pokerlab.gui import screen_reader
+
+    reader = screen_reader.ScreenReader(crops_dir=tmp_path)
+    assert reader.players == 6
+    zones = reader._zones_read()
+    assert "player_6_5" in zones and not any(name.endswith("_8_0") for name in zones)
+    reader.players = 8
+    zones = reader._zones_read()
+    assert {"dealer_8_7", "player_8_7", "bet_8_7", "stack_8_7"} <= zones
+    assert not any("_6_" in name for name in zones)
+
+
+def test_the_spot_screen_can_be_switched_to_an_eight_seat_client(app):
+    from pokerlab.gui.spot_view import SpotFrame
+
+    frame = SpotFrame(app)
+    frame._consult = lambda state, spot: None
+    try:
+        assert frame.table_size == 6
+        states = {seat: "in_gioco" for seat in range(8)}
+        assert frame.set_table_size(8) and not frame.set_table_size(8)
+        assert app.spot_table_size == 8
+        frame.apply_reading(seats_reading(states, dealer=7))
+        assert frame.layout.chairs == set(range(8)) and frame.layout.dealer == 7
+        with pytest.raises(ValueError):
+            SpotFrame(app, table_size=9)
+        reopened = SpotFrame(app)  # the choice is remembered by the app
+        try:
+            assert reopened.table_size == 8
+        finally:
+            reopened.destroy()
+    finally:
+        frame.destroy()
+        if hasattr(app, "spot_table_size"):
+            del app.spot_table_size
+        gc.collect()
+
+
+def test_a_player_sitting_out_is_seated_when_a_blind_is_in_front_of_them():
+    from pokerlab.gui.screen_reader import seated_seats, sit_out_blinds
+
+    states = {0: "in_gioco", 1: "sit_out", 2: "in_gioco", 3: "sit_out", 4: "libero"}
+    bets = {0: 0.0, 1: 0.5, 2: 1.0, 3: 0.0}
+    assert sit_out_blinds(states, bets) == {1}
+    assert seated_seats(states, bets) == {0, 1, 2}
+    assert seated_seats(states) == {0, 2}  # no bets read: sitting out stays out
+
+
+def test_a_sit_out_small_blind_takes_the_blind_and_then_folds(app):
+    from pokerlab.gui.spot_table import chair_for_client_seat as chair
+    from pokerlab.gui.spot_view import SpotFrame
+
+    frame = SpotFrame(app)
+    frame._consult = lambda state, spot: None
+    try:
+        # client seat 0 (you) is the button, seat 1 sits out but posts the SB
+        states = {0: "in_gioco", 1: "sit_out", 2: "in_gioco", 3: "in_gioco", 4: "libero", 5: "libero"}
+        frame.apply_reading(ScreenReading(dealer=0, seats=states, bets={s: 0.0 for s in range(6)}, board=[]))
+        assert chair(6, 1) not in frame.layout.chairs  # no blind seen yet
+
+        blinds = {0: 0.0, 1: 0.5, 2: 1.0, 3: 0.0, 4: 0.0, 5: 0.0}
+        frame.apply_reading(ScreenReading(dealer=0, seats=states, bets=blinds, board=[]))
+        assert chair(6, 1) in frame.layout.chairs  # seated as soon as the blind shows
+        assert frame.layout.seat_of(chair(6, 1)) == 1 and frame.layout.seat_of(chair(6, 2)) == 2
+
+        called = {**blinds, 3: 1.0, 0: 1.0}  # UTG and the button call; the SB is out
+        frame.apply_reading(ScreenReading(dealer=0, seats=states, bets=called, board=[]))
+        assert [a.action_type for a in frame.script] == [ActionType.CALL, ActionType.CALL, ActionType.FOLD]
+    finally:
+        frame.destroy()
+        gc.collect()
+
+
+def test_the_ante_is_the_preflop_pot_shared_by_every_seat_dealt_in():
+    from pokerlab.gui.screen_reader import ante_from_pot
+
+    seats = {0: "in_gioco", 1: "in_gioco", 2: "sit_out", 3: "fuori", 4: "libero", 5: "in_gioco"}
+    assert ante_from_pot(seats, 0.5, []) == pytest.approx(0.1)  # five seats not empty
+    assert ante_from_pot(seats, 0.0, []) == 0.0  # no pot written: no ante
+    assert ante_from_pot(seats, 0.5, ["Ah", "Kd", "2c"]) is None  # after the flop the pot holds bets too
+    assert ante_from_pot(seats, None, []) is None and ante_from_pot(seats, 0.5, None) is None
+
+
+def test_with_an_ante_a_player_sitting_out_is_dealt_in():
+    from pokerlab.gui.screen_reader import seated_seats
+
+    states = {0: "in_gioco", 1: "sit_out", 2: "in_gioco", 3: "libero"}
+    assert seated_seats(states) == {0, 2}
+    assert seated_seats(states, antes=True) == {0, 1, 2}
+
+
+def test_the_spot_reads_the_ante_off_the_pot_and_counts_it_everywhere(app):
+    from pokerlab.gui.spot_table import chair_for_client_seat as chair
+    from pokerlab.gui.spot_view import SpotFrame
+
+    frame = SpotFrame(app)
+    frame._consult = lambda state, spot: None
+    try:
+        # six players, an ante of 0,1 BB each: 0,6 BB in the pot before anyone acts
+        blinds = {0: 0.0, 1: 0.5, 2: 1.0, 3: 0.0, 4: 0.0, 5: 0.0}
+        reading = full_reading(blinds, pot=0.6, board=[])
+        reading.stacks = {0: 99.9, 1: 59.4, 2: 12.9, 3: 87.4, 4: 40.0, 5: 24.9}
+        frame.apply_reading(reading)
+        assert frame.ante_var.get() == "0,1"
+        assert frame.build_spot().ante == 10  # chips at a big blind of 100
+        # each stack at the start of the hand: what is shown, plus what is in front, plus the ante
+        assert frame.stack_vars[chair(6, 0)].get() == "100"
+        assert frame.stack_vars[chair(6, 1)].get() == "60"
+        assert frame.stack_vars[chair(6, 2)].get() == "14"
+        assert frame.state.pot == 60 + 50 + 100  # the engine's pot holds the antes
+
+        raised = {**blinds, 3: 3.0}
+        frame.apply_reading(full_reading(raised, pot=0.6, out={4}, board=[]))
+        assert [(a.action_type, a.amount) for a in frame.script] == [(ActionType.RAISE, 300), (ActionType.FOLD, 0)]
+        assert "ATTENZIONE" not in frame.screen_var.get()  # pot read = antes + bets in front
+        assert frame.ante_var.get() == "0,1"  # mid-hand the ante is left alone
+    finally:
+        frame.destroy()
+        gc.collect()
+
+
+def test_a_player_replaced_mid_hand_leaves_nothing_to_the_newcomer(app):
+    """The seat is read empty only between two deals: the player stood up during a hand
+    and someone else sat down before the next. The newcomer starts blank -- neither the
+    old player's numbers nor the hand the old player was in are theirs."""
+    from pokerlab.gui.spot_table import chair_for_client_seat as chair
+    from pokerlab.gui.spot_view import SpotFrame
+
+    frame = SpotFrame(app)
+    frame._consult = lambda state, spot: None
+    try:
+        _play_a_hand_then_move_the_button(frame)
+        utg = f"chair{chair(6, 3)}"
+        assert frame.stats.hands(utg) == 1
+
+        # the second hand (button on seat 1: blinds on 2 and 3): seat 4 raises, then seat 3,
+        # the big blind, leaves and is replaced, all before the next deal
+        blinds = {0: 0.0, 1: 0.0, 2: 0.5, 3: 1.0, 4: 0.0, 5: 0.0}
+        raised = {**blinds, 4: 3.0}
+        frame.apply_reading(full_reading(raised, board=[], dealer=1))
+        assert frame.script  # the raise was rebuilt
+        empty = full_reading(raised, board=[], dealer=1)
+        empty.seats[3] = "libero"
+        frame.apply_reading(empty)
+        assert frame.stats.hands(utg) == 1  # one empty reading is not enough: a misread frame
+        frame.apply_reading(empty)
+        assert frame.stats.hands(utg) == 0  # two in a row: gone
+        frame.apply_reading(full_reading(raised, board=[], dealer=1))  # the newcomer
+        frame.apply_reading(full_reading(_bets(), board=[], dealer=2))  # the next deal
+        assert frame.stats.hands(utg) == 0  # the hand the old player was in is not the newcomer's
+        assert frame.stats.hands(f"chair{chair(6, 4)}") == 2  # the others count it
+    finally:
+        frame.destroy()
+        gc.collect()
+
+
+def test_a_player_who_vanishes_mid_hand_has_folded(app):
+    """Seat 4 is read empty in the middle of the hand (left the table, disconnected):
+    when its turn comes it folds, and the rebuild goes on to the next player."""
+    from pokerlab.gui.spot_table import chair_for_client_seat as chair
+    from pokerlab.gui.spot_view import SpotFrame
+
+    frame = SpotFrame(app)
+    frame._consult = lambda state, spot: None
+    try:
+        frame.apply_reading(full_reading(_bets(), board=[]))
+        raised = full_reading(_bets(s3=3.0), board=[])
+        raised.seats[4] = "libero"  # gone, after UTG raised
+        frame.apply_reading(raised)
+        assert [(a.action_type, a.amount) for a in frame.script] == [(ActionType.RAISE, 300), (ActionType.FOLD, 0)]
+        assert chair(6, 4) in frame.layout.chairs  # still seated until the next hand
+        assert "uscito" in frame.chair_ui[chair(6, 4)].info.cget("text")
     finally:
         frame.destroy()
         gc.collect()

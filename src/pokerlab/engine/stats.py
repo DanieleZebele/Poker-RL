@@ -124,6 +124,9 @@ def analyse_hand(
     dealt cards, `board_cards` how many community cards were dealt (so a flop that
     was never reached is known), `player_ids` the identity of every dealt seat.
     """
+    # An ante is no decision and no bet (its record's amount is 0): left in, it would read
+    # as a first action and open a steal or 3-bet chance for whoever paid it.
+    actions = [record for record in actions if record.action_type is not ActionType.POST_ANTE]
     events = {seat: [0] * STAT_COUNT for seat in dealt}
     chances = {seat: [0] * STAT_COUNT for seat in dealt}
     index = {name: i for i, name in enumerate(STATS)}

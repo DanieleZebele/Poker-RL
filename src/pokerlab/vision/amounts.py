@@ -52,8 +52,10 @@ DIGIT_MIN_HEIGHT = 0.35
 # Trust a match against the bets' own digits from this correlation up; below,
 # read the digit against the card ranks instead (see `AmountReader`).
 OWN_SURE = 0.8
-# A loop smaller than this (in the 32x32 glyph) is an artefact, not a loop.
-MIN_HOLE_AREA = 2
+# A loop enclosing fewer background pixels than this (in the 32x32 glyph) is an
+# artefact, not a loop: real loops measured 24-232 pixels, while a "6" whose
+# stroke closed round one stray pixel had a 1-pixel hole and was read as an "8".
+MIN_HOLE_PIXELS = 8
 
 
 @dataclass
@@ -93,6 +95,12 @@ def suffix_blobs(zone: str) -> int:
     return STACK_SUFFIX_BLOBS if is_stack_zone(zone) else 2
 
 
+# The client writes every amount -- bets, pot, stacks -- with at most one
+# decimal ("18,5 BB"): a reading with more digits after the comma is a misread
+# (a stray blob taken for a digit), and is not trusted.
+MAX_DECIMALS = 1
+
+
 def white_mask(image: np.ndarray) -> np.ndarray:
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     return (hsv[..., 1] < WHITE_MAX_SATURATION) & (hsv[..., 2] > WHITE_MIN_VALUE)
@@ -115,8 +123,9 @@ class Layout:
     ok: bool  # ended in "BB" and the rest made sense
 
 
-def layout(mask: np.ndarray, suffix: int = 2) -> Layout:
-    """`suffix` blobs at the end are the unit ("BB") and are dropped."""
+def layout(mask: np.ndarray, suffix: int = 2, decimals: int = MAX_DECIMALS) -> Layout:
+    """`suffix` blobs at the end are the unit ("BB") and are dropped; a comma
+    followed by no digit, or by more than `decimals`, makes the layout not ok."""
     found = blobs(mask)
     if len(found) < suffix + 1:
         return Layout([], None, False)
@@ -132,6 +141,10 @@ def layout(mask: np.ndarray, suffix: int = 2) -> Layout:
             comma_after = len(digits) - 1
         else:
             digits.append(blob)
+    if comma_after is not None:
+        after = len(digits) - 1 - comma_after
+        if not 1 <= after <= decimals:
+            return Layout([], None, False)
     return Layout(digits, comma_after, bool(digits))
 
 
@@ -178,14 +191,11 @@ def glyph_holes(vector: np.ndarray) -> int:
     one; 1, 2, 3, 5 and 7 none. Measured identical for every example of every
     digit, in the bets and in the card ranks alike."""
     side = round(len(vector) ** 0.5)
-    strokes = (vector.reshape(side, side) > 0).astype(np.uint8)
-    contours, hierarchy = cv2.findContours(np.pad(strokes, 1), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
-    if hierarchy is None:
-        return 0
-    return sum(
-        1 for contour, links in zip(contours, hierarchy[0], strict=True)
-        if links[3] != -1 and cv2.contourArea(contour) >= MIN_HOLE_AREA
-    )
+    background = np.pad((vector.reshape(side, side) <= 0).astype(np.uint8), 1, constant_values=1)
+    # Label 1 is the outside (the padding's corner is scanned first); every other
+    # background component is enclosed by strokes.
+    count, _labels, stats, _ = cv2.connectedComponentsWithStats(background, connectivity=4)
+    return sum(1 for label in range(2, count) if stats[label, cv2.CC_STAT_AREA] >= MIN_HOLE_PIXELS)
 
 
 class _Matcher:
@@ -226,7 +236,12 @@ class AmountReader:
 
     def __init__(self, examples: list[DigitExample], fallback: list[DigitExample] = ()) -> None:
         self._own = _Matcher(list(examples))
-        self._fallback = _Matcher(list(fallback))
+        # The card ranks lend only the digits the bets have no example of. A digit the
+        # bets do have, matched weakly, is still better read against them: a pot "0,7"
+        # whose 0 matched the bets' zeros at 0.79 went to the cards, which have no 0
+        # (a ten is one merged glyph), and came back "9,7".
+        own_digits = {e.digit for e in examples}
+        self._fallback = _Matcher([e for e in fallback if e.digit not in own_digits])
         self.examples = list(examples)
         self.covered = sorted({e.digit for e in [*examples, *fallback]})
         self._glyphs = self._own.glyphs if examples else self._fallback.glyphs

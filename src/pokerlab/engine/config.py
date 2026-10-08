@@ -10,7 +10,10 @@ class GameConfig:
     starting_stack: int
     small_blind: int
     big_blind: int
-    ante: int = 0  # reserved for future tournament-style play, unused for now
+    # Paid by every player before the blinds, straight into the pot (not into the bet to
+    # match), as in tournaments. 0 everywhere but the spot screen: training and every rated
+    # session play without one. Stays the same when a `BlindSchedule` raises the blinds.
+    ante: int = 0
 
     def __post_init__(self) -> None:
         if not (2 <= self.num_players <= 9):

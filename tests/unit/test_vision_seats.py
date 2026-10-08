@@ -58,3 +58,25 @@ def test_the_sit_out_pill_wins(templates):
 def test_your_seat_is_read_from_the_white_of_your_cards(templates):
     assert read_seat(box(my_cards="live"), 0, templates).state == "in_gioco"
     assert read_seat(box(my_cards="folded"), 0, templates).state == "fuori"
+
+
+def test_an_empty_seat_drawn_as_bare_table_is_told_by_its_own_zone(tmp_path, templates):
+    """At 8-max the client draws no chair: an empty seat is just table (here a
+    grey logo). It is recognised by matching that zone's labelled empty crop."""
+    from pokerlab.vision.labels import save_player_label
+    from pokerlab.vision.seats import empty_backgrounds, load_seats
+
+    table = np.full((110, 150, 3), (140, 140, 140), np.uint8)
+    cv2.putText(table, "888", (30, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (210, 210, 210), 4)
+    for name, image, state in (("player_8_4-a", table, "libero"), ("player_8_3-a", box(), "fuori")):
+        path = tmp_path / f"{name}.png"
+        cv2.imwrite(str(path), image)
+        save_player_label(path, name.split("-")[0], state)
+    backgrounds = empty_backgrounds(load_seats(tmp_path))
+    assert set(backgrounds) == {"player_8_4"}
+
+    assert read_seat(table, 4, templates).state == "fuori"  # without the example: no chair, "out"
+    assert read_seat(table, 4, templates, backgrounds["player_8_4"]).state == "libero"
+    # someone sitting down in that seat is no longer the empty background
+    assert read_seat(box(), 4, templates, backgrounds["player_8_4"]).state == "fuori"
+    assert read_seat(box(backs=True), 4, templates, backgrounds["player_8_4"]).state == "in_gioco"

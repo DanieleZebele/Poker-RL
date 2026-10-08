@@ -88,6 +88,18 @@ reinforcement-learning poker project. Five sections:
   can win instead of dropping it. Regression tests in `test_full_hand_flow.py` (the hand
   that lost 60 chips, and a fuzz with only random players on stacks redrawn every hand,
   which the older fuzz -- half always-call bots -- never built).
+- **Antes (`GameConfig.ante`, `betting.post_antes`), used only by the spot screen.** Every
+  player pays it before the blinds, from the small blind round, into `total_committed` but
+  **not** `current_bet`: dead money, so the big blind is still the bet to call and the pots
+  (side pots included) are built with it. A stack the ante takes is all-in for it. Each is
+  logged as `ActionType.POST_ANTE` with `amount` 0 (the street's bet after it, as for every
+  record), so its chips are `stack_before - stack_after`: `features.committed_by_seat` adds
+  them that way (still summing to `pot_size`), and `engine/stats.py` drops the records (an
+  ante left in reads as a first action and opens steal/3-bet chances). `FORCED_ACTIONS`
+  (blinds and antes) is what "not a decision" means to the readers of a hand. Training and
+  every rated session play with 0, so no `FEATURE_VERSION` bump; the models have never seen
+  a pot that starts full. It does not follow a `BlindSchedule`. Tests in
+  `tests/integration/test_antes.py` (a fuzz with stacks below the ante included).
 - **Blinds that go up (`engine/config.py::BlindSchedule`, `Table(blind_schedule=)`).** Every
   `every` hands the blinds are multiplied by `factor` and rounded up. Level `k` is
   `ceil(initial * factor ** k)` from the *initial* blinds, not from the last rounded ones:
@@ -2139,26 +2151,33 @@ dependency (Flask, etc.) — it ships with Python. Architecture:
   an unraisable exception, which pytest reports against *that* test.
 - **Spot advisor mode** (`gui/spot.py` logic, `gui/spot_table.py` seating,
   `gui/spot_view.py` Tk frame; button "Chiedi ai modelli (spot)" on the setup
-  screen). The screen is an **oval table with nine chairs** (`CHAIRS`), yours at
-  the bottom and always seated; "+" on an empty chair seats an opponent, with a
+  screen). The screen is **eight chairs round the edges of a canvas that fills the
+  screen, the felt in the middle** (`CHAIRS`), yours at the bottom and always seated; "+" on an empty chair seats an opponent, with a
   name and a stack, and every player has a "D" button for the dealer. Everything
   is buttons: the board is five card buttons in the middle, your two cards sit
   under your chair, and each card is chosen in a popup (`CardPicker`) by rank and
   then suit, with cards already used disabled. When it is someone's turn their
   action buttons appear on their chair; on yours, with both cards set, the top 5
   global-Elo models answer by themselves.
-  - **Your box hangs from under the felt and the canvas grows to fit it**
-    (`_build_chair` anchors chair 0 "n"; `refresh` ends in `_fit_canvas`, which
-    enlarges the canvas to its contents and the window with it, within the
-    screen, never shrinking). Centred on its chair like the others it would be
-    the tallest box (cards plus actions) and run past the canvas, cutting the
-    last action off.
-  - **Chairs may overlap; nothing is ever cut off, and a press brings a box to
-    the front.** A top chair grows upwards when its actions appear and would
-    leave the canvas: `_fit_canvas` slides the whole table right/down when
-    anything sticks out of the top or left, measured from each chair's
-    *requested* size (`_content_bbox` -- `canvas.bbox` lags right after the
-    buttons are rebuilt). Overlap between neighbours is accepted: a press anywhere on a box, buttons included, `lift()`s it
+  - **The chairs sit in a square, not round an oval, so they do not overlap**
+    (`spot_table.chair_slot`): bottom middle (you), the corners, the middle of the
+    left and right sides and the top middle, clockwise from you. Each box is pinned
+    by the side facing its edge (Tk anchor "s", "sw", "w", ...), so it grows
+    inwards when its actions appear and stays on the canvas. **The canvas fills the
+    screen next to the side panel** (`table_geometry`: screen minus
+    `SIDE_PANEL_WIDTH` and `RESERVED_HEIGHT`, never below 1000x620; `show_spot`
+    maximises the window when it is on screen) and the felt takes what the boxes
+    leave in the middle (`BOX_SIDE`/`BOX_TOP`/`BOX_BOTTOM`): the boxes do not scale,
+    so a bigger screen is a bigger table. Filled, not scaled from a base: a canvas
+    taller than a 1536x864 screen (Tk's logical size at 125%) cut the bottom row
+    off. Gotcha: a frame whose children are all destroyed keeps their size, so the
+    actions frame is reset to 1x1 when its buttons go, or a chair that has acted
+    stays tall and empty.
+  - **Nothing is ever cut off, and a press brings a box to the front.**
+    `refresh` ends in `_fit_canvas`, which grows the canvas (and the window) when
+    anything sticks out, measured from each chair's *requested* size
+    (`_content_bbox` -- `canvas.bbox` lags right after the buttons are rebuilt).
+    Should two boxes still meet on a small screen, a press anywhere on a box, buttons included, `lift()`s it
     (`_make_raisable`: a per-chair bindtag placed *first* on every descendant,
     so the clicked button still works; re-applied after every refresh because
     the action buttons are rebuilt), and whoever is to act is lifted
@@ -2169,14 +2188,23 @@ dependency (Flask, etc.) — it ships with Python. Architecture:
   - **Every amount on the spot screen is in big blinds**: pot, bets on the chairs, action buttons, the raise field and its
     wheel, the log, the models' advice and the status line, written as the
     client writes them ("18,5 BB", comma decimals). The engine still counts
-    chips at fixed blinds of 1/2 (`ENGINE_SMALL_BLIND`/`ENGINE_BIG_BLIND`, the
-    blinds the models trained at; one chip = 0,5 BB) and converts only at the
+    chips at fixed blinds of 50/100 (`ENGINE_SMALL_BLIND`/`ENGINE_BIG_BLIND`, the
+    blinds the models train at; one chip = 0,01 BB, which an ante of 0,1 BB needs)
+    and converts only at the
     edges: `spot.format_bb`/`bb_number` to show, `spot.parse_bb` to read input
     (comma or dot, rounded to the nearest chip). "Blind 0,5 / 1 BB" is a fixed
     label (there are no blind entries) and stacks are typed in
-    BB (default 100 = 200 chips). `describe_action` takes an optional
+    BB (default 100 = 10,000 chips). `describe_action` takes an optional
     `big_blind`; without it it still speaks chips. Gotcha: never `.capitalize()`
     a label with "BB" in it -- it lowercases the rest.
+  - **Antes (tournaments)**: an "Ante (BB)" field, filled from the screen. The client's
+    pot leaves out the bets in front, so preflop it holds the antes alone:
+    `screen_reader.ante_from_pot` divides it by the seats that are not empty, and
+    `SpotFrame._read_ante` takes it (rounded to the chip) at a new hand or while no action
+    is scripted, never mid-hand. A seat's starting stack is then the stack shown + what is
+    in front + the ante, the engine's pot holds the antes (so the pot check holds), and a
+    player in sit-out is seated (`seated_seats(antes=True)`): dealt in, they pay the ante
+    and fold. Pinned in `test_gui_screen_reader.py`.
   - **The dealer button is the order of play.** `TableLayout.order()` lists the
     occupied chairs clockwise (as seen on screen) from the dealer, and those are
     engine seats 0, 1, 2, ... — which is why no seat number is ever typed. Chairs
@@ -2203,7 +2231,14 @@ dependency (Flask, etc.) — it ships with Python. Architecture:
     chooses the position (`position_names`).
   - `advise` bypasses `RLAgentPlayer` (it samples and drops the distribution) and
     returns the full softmax; torch is imported lazily and the models are loaded on
-    the first "Chiedi", not when the screen opens.
+    the first "Chiedi", not when the screen opens. **It must stay what the model plays**:
+    the same `legal_action_mask` (so with nothing to call FOLD is masked and never
+    advised) and the same normalisation -- the stack constant the model trained with
+    (`table_mix.feature_stack_bb`, its `stack_max_bb`, set on each model by
+    `load_advisors`), never the spot's own stacks. Pinned by
+    `test_the_advice_is_what_the_model_plays_at_a_table` (equal to
+    `RLAgentPlayer.action_probabilities`). The critic's value is not shown: without every
+    player's equity a playing model's value is always 0.
 - **Spot screen statistics (`SpotFrame.stats`, a `StatsTracker` for as long as the screen is
   open).** The models advising there read their opponents' VPIP/PFR/... like at any table.
   - **Fed only by hands read off the screen, at a hand boundary** (a new deal or the button
@@ -2214,11 +2249,18 @@ dependency (Flask, etc.) — it ships with Python. Architecture:
     hand). A spot built by hand is never recorded. Readings stay every 0.5 s.
   - **Identity is the chair** (`chair<N>`, what stays put between hands); a seat the screen
     shows empty (`libero`) is forgotten (`StatsTracker.forget`), since someone else sits there
-    next. "Azzera statistiche" forgets everyone (another table).
+    next -- **at any reading, not only when the seating is applied** (`_note_players_leaving`,
+    after `EMPTY_READINGS_TO_FORGET` = 2 readings in a row, so one misread frame wipes
+    nothing): checked only at a new hand, a player who stood up mid-hand and was replaced
+    before the next deal handed their numbers to the newcomer. A chair forgotten during a
+    hand is forgotten again right after that hand is recorded (`_left_chairs`), or the hand
+    the old player was in would be the newcomer's first. "Azzera statistiche" forgets
+    everyone (another table).
   - **Into the models: `Spot.seat_stats`** (by engine seat, from `tracker.vectors`), handed to
     the replay's `Table` through `_FixedStats`, which records nothing -- the replayed hand is
     rebuilt at every edit and the real tracker must not count it. Each chair shows
-    "VPIP x% PFR y% (n mani)" once seen.
+    all nine statistics once seen, three a line, each with the chances it is
+    counted over ("VPIP 25% (87)", `STAT_LABELS`), "-" for one with none yet.
   - **Limits, accepted.** WTSD is counted like the others: a player who saw the flop and never
     folded reached the showdown unless everyone else folded, and the board is the one last read
     or what the streets of the actions imply (`_board_reached`; the screen may clear the board
@@ -2230,6 +2272,16 @@ dependency (Flask, etc.) — it ships with Python. Architecture:
     Every seated player counts as dealt in. Pinned in `test_gui_screen_reader.py` and
     `test_gui_spot.py`.
 - **The likeliest action of the top model is bold** in the advice panel (`_write(bold_lines=)`).
+  Two Tk traps made it show plain for a long time while the test (tag ranges only) passed:
+  `tkfont.Font(font=..., weight="bold")` copies the font and *ignores* `weight`, and a `Font`
+  deletes its Tk font when the Python object is collected. The bold font is built then
+  `configure`d, and kept on the widget; the test checks the tag's font exists and is bold.
+  The models are named there by their place in the global ranking, "#1", "#2", ...
+  (`_model_ranks`, from the discovery order, so a model that failed to load does not
+  renumber the rest), not by their labels.
+- **No default stack field**: a chair starts at `DEFAULT_STACK_BB` (100) and its own
+  "inizio BB" field is what counts; with screen reading on, the stacks come from the
+  screen.
 - **Cards are drawn on a `tk.Canvas`, not image files** (`gui/cards_canvas.py`):
   a plain rectangle plus rank/suit text (Unicode ♠♥♦♣, red for hearts/
   diamonds, black for spades/clubs) for a face-up card, a solid-fill
@@ -2290,8 +2342,8 @@ collected in the vision screen; the accuracies quoted are against the crops in
 - **Dealer button: zones and examples.** The "Dealer (6
   giocatori)" section sets one zone per seat (`regions.dealer_region_name`,
   `dealer_6_<seat>` in `regions.json`; seat 0 is you at the bottom, then
-  clockwise on screen from your left, the spot screen's chair order; only 6-max
-  so far, the positions differ at 9). "Salva dealer" captures every zone set and
+  clockwise on screen from your left, the spot screen's chair order; 6-max and
+  8-max, each with zones of its own, chosen by a "Tavolo" switch on both screens). "Salva dealer" captures every zone set and
   opens `DealerLabeler`: all crops side by side, each "Presente"/"Non presente",
   at most one present (none is fine, between hands). On "Conferma" *every* crop
   is written -- the absent ones are examples too -- to **`vision_data/dealer/`**
@@ -2333,10 +2385,12 @@ collected in the vision screen; the accuracies quoted are against the crops in
     hand** (button moved, new hole cards) or on the first reading -- mid-hand
     it would wipe the actions being typed every time someone stood up -- and
     only on the chairs mapped to client seats. **Folds show at once**:
-    `_mark_seat_states` tags a seated player read `fuori`/`sit_out` ("fold",
-    grey border), but never inserts a FOLD into the actions, because *when* in
-    the sequence they folded is unknown. The button is put back on its chair
-    if seating moved it.
+    `_mark_seat_states` tags a seated player read `fuori`/`sit_out`/`libero`
+    ("fold", "sit-out", "uscito"; grey border, `SEAT_MARKS`); the FOLD itself goes
+    into the actions when their turn comes (`action_sync`, `TableView.out`). A
+    player who vanishes mid-hand (the seat read `libero`: left, disconnected) is
+    one of them -- without it the rebuild waited on them for ever. The button is
+    put back on its chair if seating moved it.
   - **One screen grab per reading** (`capture.grab_regions`: the bounding
     rectangle of every zone, captured once and cut up). Fourteen
     `grab_region`s -- 2 card zones, 6 dealer, 6 player -- took 233 ms on the Tk
@@ -2373,9 +2427,10 @@ collected in the vision screen; the accuracies quoted are against the crops in
   - **Two-stage digit match.** The card ranks are the same typeface, but pooled
     with the bets' digits they can out-match the right answer, so: the bets'
     own digits first, and only when their best match is below `OWN_SURE` 0.8
-    the card ranks alone. That
+    the card ranks alone -- and only for digits the bets have no example of. That
     covers digits 2-9 never seen in a bet; 0 and 1 have no card source (a ten
-    is one merged glyph).
+    is one merged glyph). The restriction is because a pot "0,7" whose 0 matched
+    the bets' zeros at 0.79 was sent to the cards, which have no 0, and read "9,7".
   - **Loops decide 3 vs 8** (`glyph_holes`, applied in `_Matcher`): candidates
     are restricted to examples with the same number of closed loops -- 8 has
     two; 0, 4, 6, 9 one; 1, 2, 3, 5, 7 none, measured identical for every
@@ -2462,10 +2517,10 @@ collected in the vision screen; the accuracies quoted are against the crops in
   `python -m pokerlab.vision.dealer` checks it on `vision_data/dealer/`. Shown
   in the vision screen's dealer "Anteprima" (gold share per seat).
 - **The spot screen reads the dealer in the same 0.5 s scan** (`ScreenReader`
-  `._read_dealer`, `ScreenReading.dealer` = client seat). Client 6-max seats map
-  to the spot's 9 chairs by nearest angle (`spot_table.CLIENT_SEAT_CHAIRS[6]` =
-  0,2,3,4,6,7; seat 3, straight across, falls between chairs 4 and 5 and 4 was
-  picked). A move puts the button on that chair, **seating a player there if it
+  `._read_dealer`, `ScreenReading.dealer` = client seat). Client seats map to
+  the spot's 8 chairs by nearest angle (`spot_table.CLIENT_SEAT_CHAIRS`: 8-max seat k
+  is chair k; 6-max is 0,1,3,4,5,7, each 15 degrees off its chair but seat 3, straight
+  across, on chair 4). A move puts the button on that chair, **seating a player there if it
   was empty** (the button is always in front of someone), and clears the
   actions (a new hand). Compared with the *last seat it was seen on*
   (`_last_dealer`), so the button vanishing between hands and reappearing on
@@ -3091,6 +3146,10 @@ do the numbers.
   takes an optional `game: GameConfig` for this: `RLAgentPlayer` normalises its
   features by `big_blind`/`starting_stack`, which an `Observation` deliberately
   does not carry, so seating a model without it raises rather than guessing.
+  **The stack constant is the model's, not the table's**: `make_model_bot` takes
+  `feature_stack_bb(checkpoint) * big_blind` (100 bb in training), not
+  `game.starting_stack` -- a GUI table of 250 bb stacks normalised by 250 showed every
+  model stacks and pots at 40% of what it learned them as.
 - **Vision**: see the "Vision (`vision/`)" section above for what exists. The
   integration points are unchanged: an `Observation`-compatible read or a
   `HandHistory`-style record, no engine changes.

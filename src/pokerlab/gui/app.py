@@ -60,7 +60,7 @@ from pokerlab.cli.play import (
     discover_trained_models,
     validate_bot_key,
 )
-from pokerlab.engine.actions import Action, ActionType, LegalAction
+from pokerlab.engine.actions import FORCED_ACTIONS, Action, ActionType, LegalAction
 from pokerlab.engine.config import BlindSchedule, GameConfig
 from pokerlab.engine.history import HandHistoryWriter
 from pokerlab.engine.state import ActionRecord, PlayerStatus
@@ -169,7 +169,7 @@ def _last_actions(observation: Observation) -> dict[int, str]:
     on this street has none."""
     found: dict[int, str] = {}
     for record in observation.action_history:
-        if record.action_type != ActionType.POST_BLIND and record.street == observation.street:
+        if record.action_type not in FORCED_ACTIONS and record.street == observation.street:
             found[record.seat] = _describe_action(record).capitalize()
     return found
 
@@ -833,8 +833,10 @@ class TableFrame(ttk.Frame):
         bb_name = self.seat_names.get(info["bb_seat"], f"seat {info['bb_seat']}")
         if self.big_blind != info["big_blind"]:
             self._log(f"*** I bui salgono: {info['small_blind']}/{info['big_blind']} (big blind prima: {self.big_blind}) ***")
+        antes = f"  tutti postano ante {info['ante']}\n" if info.get("ante") else ""
         self._log(
             f"=== {info['hand_id']} ===\n"
+            f"{antes}"
             f"  {sb_name} posta small blind {info['small_blind']}\n"
             f"  {bb_name} posta big blind {info['big_blind']}"
         )
@@ -1272,8 +1274,18 @@ class PokerGuiApp(tk.Tk):
     def show_spot(self, read_screen: bool = True) -> None:
         from pokerlab.gui.spot_view import SpotFrame
 
-        # The table and the side panel together are wider than the default window.
+        # The table is sized to the screen (`spot_view.table_geometry`), so the window takes
+        # the whole screen. Only a window on screen: zooming the hidden root the tests share
+        # would show it.
         self.geometry("1240x760")
+        if self.winfo_viewable():
+            try:
+                self.state("zoomed")  # Windows, macOS
+            except tk.TclError:
+                try:
+                    self.attributes("-zoomed", True)  # X11
+                except tk.TclError:
+                    pass
         self._show_frame(SpotFrame(self, read_screen=read_screen))
 
     def show_vision(self) -> None:

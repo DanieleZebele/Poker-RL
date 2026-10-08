@@ -139,14 +139,17 @@ def make_model_bot(path: str | Path, player_id: str, name: str, game: GameConfig
     from pokerlab.players.rl_agent import RLAgentPlayer
     from pokerlab.rl.policy import make_policy_fn
     from pokerlab.rl.ppo import build_model_from_checkpoint
+    from pokerlab.rl.table_mix import feature_stack_bb
 
-    model, _checkpoint = build_model_from_checkpoint(path)
+    model, checkpoint = build_model_from_checkpoint(path)
     return RLAgentPlayer(
         player_id,
         name,
         policy_fn=make_policy_fn(model),
         big_blind=game.big_blind,
-        starting_stack=game.starting_stack,
+        # The constant the model was trained with, not this table's stacks: the setup
+        # screen's stack is the players' chips, not the model's unit.
+        starting_stack=round(feature_stack_bb(checkpoint) * game.big_blind),
     )
 
 

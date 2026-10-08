@@ -97,13 +97,18 @@ def committed_by_seat(observation: Observation) -> dict[int, int]:
     `SeatPublicInfo` only carries the current street's bet, but every
     `ActionRecord` stores the acting seat's running per-street total (the engine
     logs `ps.current_bet` *after* applying the action), so the max per
-    (seat, street) summed over streets recovers the hand total.
+    (seat, street) summed over streets recovers the hand total. An ante is the
+    exception: it is in the pot but not in the street's bet (its record's amount
+    is 0), so it is added from the chips it took off the stack.
     """
     per_street: dict[tuple[int, Street], int] = {}
+    totals: dict[int, int] = {}
     for record in observation.action_history:
+        if record.action_type is ActionType.POST_ANTE:
+            totals[record.seat] = totals.get(record.seat, 0) + record.stack_before - record.stack_after
+            continue
         key = (record.seat, record.street)
         per_street[key] = max(per_street.get(key, 0), record.amount)
-    totals: dict[int, int] = {}
     for (seat, _street), amount in per_street.items():
         totals[seat] = totals.get(seat, 0) + amount
     return totals

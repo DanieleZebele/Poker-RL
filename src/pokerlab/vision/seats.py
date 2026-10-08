@@ -12,11 +12,15 @@ What the client draws, measured on the labelled crops in `vision_data/players/`:
   shape: the light-grey text mask of a labelled sit-out crop is the template
   (`sit_out_templates`), so this one state does need examples.
 - **empty**: no avatar, a green outline of a chair (green share 0.026; 0 for
-  every other state).
+  every other state). At 8-max the client draws no chair at all: an empty seat
+  is bare table (felt, or the "888 poker" logo), so it is recognised by being
+  the same picture as a crop of that same zone labelled empty
+  (`empty_backgrounds`) -- one labelled example per seat is enough.
 - **out** otherwise: an avatar with nothing over it (folded, or waiting).
 
-Fixed rules plus one template, in this order: sit-out, then (seat 0) the white
-of your cards, else magenta backs, else the chair, else out. `python -m
+Fixed rules plus two kinds of example, in this order: sit-out, then (seat 0) the
+white of your cards, else magenta backs, else the chair or the zone's empty
+background, else out. `python -m
 pokerlab.vision.seats` checks them against the labels and lists every crop where
 the rule and the label disagree -- the place to look for a mislabelled example.
 """
@@ -44,6 +48,11 @@ MAGENTA_IN_HAND = 0.10  # card backs: up to 0.59 measured, 0 without them
 CHAIR_EMPTY = 0.01  # the empty-seat chair outline: 0.026 measured, 0 otherwise
 YOUR_WHITE_IN_HAND = 0.05  # your live cards: 0.08-0.09; folded: 0.00-0.02
 SIT_OUT_MATCH = 0.6  # normalised correlation with a "SIT OUT" template
+# An empty seat the client draws as bare table (no chair): the crop is compared
+# with crops of the *same zone* labelled empty, which are pixel-identical (0.0
+# measured), while an occupied seat of the same zone is >= 14.1 away.
+EMPTY_MATCH = 6.0
+EMPTY_THUMBNAIL = (32, 24)  # width, height
 
 
 def _hsv(image: np.ndarray) -> np.ndarray:
@@ -56,8 +65,11 @@ def magenta_share(image: np.ndarray) -> float:
 
 
 def chair_share(image: np.ndarray) -> float:
+    """The chair outline's green: measured H 65, S 239-242, V 158-164. Kept
+    narrow because the 8-max felt is green too (H 76-77, S 155-173) and showed
+    through a player box as a "chair" when the band was H 50-85, S > 150."""
     h, s, v = cv2.split(_hsv(image))
-    return float(((h >= 50) & (h <= 85) & (s > 150) & (v > 150)).mean())
+    return float(((h >= 58) & (h <= 72) & (s >= 195) & (v > 140)).mean())
 
 
 def white_share(image: np.ndarray) -> float:
@@ -101,6 +113,19 @@ def sit_out_score(image: np.ndarray, templates: list[np.ndarray]) -> float:
     return best
 
 
+def _thumbnail(image: np.ndarray) -> np.ndarray:
+    return cv2.resize(image, EMPTY_THUMBNAIL, interpolation=cv2.INTER_AREA).astype(np.float32)
+
+
+def empty_distance(image: np.ndarray, backgrounds: list[np.ndarray]) -> float:
+    """How far the crop is from the nearest picture of this same zone empty:
+    mean absolute difference per channel, 0-255, on a small thumbnail."""
+    if not backgrounds:
+        return float("inf")
+    thumb = _thumbnail(image)
+    return min(float(np.abs(thumb - background).mean()) for background in backgrounds)
+
+
 @dataclass
 class SeatReading:
     state: str
@@ -108,22 +133,27 @@ class SeatReading:
     chair: float
     white: float
     sit_out: float
+    empty: float = float("inf")  # distance from this zone's empty background
 
 
-def read_seat(image: np.ndarray, seat: int, templates: list[np.ndarray]) -> SeatReading:
+def read_seat(image: np.ndarray, seat: int, templates: list[np.ndarray],
+              backgrounds: list[np.ndarray] | None = None) -> SeatReading:
+    """`backgrounds`: thumbnails of this same zone labelled empty
+    (`empty_backgrounds`), for clients that draw no chair on an empty seat."""
     magenta, chair, white = magenta_share(image), chair_share(image), white_share(image)
     sit_out = sit_out_score(image, templates)
+    empty = empty_distance(image, backgrounds or [])
     if sit_out >= SIT_OUT_MATCH:
         state = SEAT_SIT_OUT
     elif seat == YOUR_SEAT:
         state = SEAT_IN_HAND if white >= YOUR_WHITE_IN_HAND else SEAT_OUT
     elif magenta >= MAGENTA_IN_HAND:
         state = SEAT_IN_HAND
-    elif chair >= CHAIR_EMPTY:
+    elif chair >= CHAIR_EMPTY or empty <= EMPTY_MATCH:
         state = SEAT_EMPTY
     else:
         state = SEAT_OUT
-    return SeatReading(state, magenta, chair, white, sit_out)
+    return SeatReading(state, magenta, chair, white, sit_out, empty)
 
 
 @dataclass
@@ -132,6 +162,7 @@ class LabelledSeat:
     image: np.ndarray
     seat: int
     state: str
+    zone: str = ""
 
 
 def load_seats(folder: Path = PLAYERS_DIR) -> list[LabelledSeat]:
@@ -143,8 +174,20 @@ def load_seats(folder: Path = PLAYERS_DIR) -> list[LabelledSeat]:
         image = cv2.imread(str(path))
         if label is None or image is None:
             continue
-        seats.append(LabelledSeat(path, image, int(label["zone"].rsplit("_", 1)[1]), label["state"]))
+        seats.append(
+            LabelledSeat(path, image, int(label["zone"].rsplit("_", 1)[1]), label["state"], label["zone"])
+        )
     return seats
+
+
+def empty_backgrounds(seats: list[LabelledSeat], exclude: Path | None = None) -> dict[str, list[np.ndarray]]:
+    """Zone -> thumbnails of that zone labelled empty. One example per seat is
+    enough, but a zone redrawn since no longer matches its old examples."""
+    backgrounds: dict[str, list[np.ndarray]] = {}
+    for seat in seats:
+        if seat.state == SEAT_EMPTY and seat.path != exclude and seat.zone:
+            backgrounds.setdefault(seat.zone, []).append(_thumbnail(seat.image))
+    return backgrounds
 
 
 def sit_out_templates(seats: list[LabelledSeat], exclude: Path | None = None) -> list[np.ndarray]:
@@ -164,14 +207,16 @@ def main(argv: list[str] | None = None) -> None:
     seats = load_seats(args.crops)
     right = 0
     for seat in seats:
-        # leave-one-out for the one data-driven part: never its own template
-        reading = read_seat(seat.image, seat.seat, sit_out_templates(seats, exclude=seat.path))
+        # leave-one-out for the data-driven parts: never its own template or background
+        backgrounds = empty_backgrounds(seats, exclude=seat.path).get(seat.zone, [])
+        reading = read_seat(seat.image, seat.seat, sit_out_templates(seats, exclude=seat.path), backgrounds)
         if reading.state == seat.state:
             right += 1
         else:
             print(f"  {seat.path.name}: etichetta {seat.state}, regola {reading.state} "
                   f"(magenta {reading.magenta:.2f}, sedia {reading.chair:.3f}, "
-                  f"bianco {reading.white:.3f}, sit-out {reading.sit_out:.2f})")
+                  f"bianco {reading.white:.3f}, sit-out {reading.sit_out:.2f}, "
+                  f"vuoto {reading.empty:.1f})")
     print(f"ritagli d'accordo con l'etichetta: {right}/{len(seats)}")
     print(json.dumps({"seats": len(seats), "right": right}))
 

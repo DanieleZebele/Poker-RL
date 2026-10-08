@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from pokerlab.gui.spot_table import CHAIRS, USER_CHAIR, TableLayout, chair_position
+from pokerlab.gui.spot_table import CHAIRS, USER_CHAIR, TableLayout, chair_slot
 
 
 def test_the_user_starts_alone_with_the_button():
@@ -48,15 +48,15 @@ def test_removing_the_dealer_gives_the_button_back_to_the_user():
 
 
 def test_chairs_run_clockwise_from_the_bottom_as_seen_on_screen():
-    center, radii = (400.0, 300.0), (300.0, 200.0)
-    bottom = chair_position(0, center, radii)
-    assert bottom == pytest.approx((400.0, 500.0))
-    left = chair_position(2, center, radii)  # a quarter-ish turn: to the left of the bottom
-    assert left[0] < center[0]
-    top = [chair_position(c, center, radii) for c in (4, 5)]
-    assert all(y < center[1] for _, y in top)
-    right = chair_position(7, center, radii)
-    assert right[0] > center[0]
+    size = (800.0, 600.0)
+    assert chair_slot(0, size) == (400.0, 600.0, "s")  # you, bottom middle
+    assert chair_slot(1, size) == (0.0, 600.0, "sw")  # then the bottom-left corner
+    assert chair_slot(2, size) == (0.0, 300.0, "w")  # up the left side
+    assert chair_slot(4, size) == (400.0, 0.0, "n")  # across the top
+    assert chair_slot(6, size) == (800.0, 300.0, "e")  # and down the right
+    assert chair_slot(3, size, margin=10)[:2] == pytest.approx((10.0, 10.0))
+    # every box pinned by the side facing its edge, so it grows inwards
+    assert {chair_slot(c, size)[2] for c in range(CHAIRS)} == {"s", "sw", "w", "nw", "n", "ne", "e", "se"}
     assert layout_free_chairs() == list(range(1, CHAIRS))
 
 

@@ -51,6 +51,17 @@ DEFAULT_BIG_BLIND = 100
 DEFAULT_STACK_MIN_BB = 1.0
 DEFAULT_STACK_MAX_BB = 100.0
 
+
+def feature_stack_bb(checkpoint: dict) -> float:
+    """The stack, in big blinds, a model's features were normalised by in training: the
+    deepest stack of the mixture it trained on (`TableMix.starting_stack`), recorded in
+    its metadata as `stack_max_bb`. Whatever plays a model outside training -- the GUI's
+    table, the spot screen -- must normalise by this, not by the stacks at its own table:
+    a table of 250 bb stacks normalised by 250 would show the model every stack and pot
+    at 40% of what it learned them as."""
+    metadata = checkpoint.get("metadata") or {}
+    return float(metadata.get("stack_max_bb", DEFAULT_STACK_MAX_BB))
+
 # A thousand hands per rated session. Elo reads only the *sign* of each pair's
 # chip delta, so the length of a session decides how often that sign is right --
 # and in a short session it very nearly is not. The spread of a short chip delta

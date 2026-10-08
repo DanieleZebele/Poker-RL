@@ -108,3 +108,35 @@ def test_a_yellow_stack_is_read_with_the_white_bets_as_examples():
     assert reader.read(yellow_stack(""), "stack_6_2").text == ""  # felt alone: no stack
     # read as a bet, the yellow lettering is not there at all
     assert reader.read(yellow_stack("47"), "bet_6_2").text == ""
+
+
+def test_a_one_pixel_hole_is_not_a_loop():
+    """A real "6" from the client closed its stroke round one stray pixel, the
+    hole was counted as a second loop and the 6 was read as an 8."""
+    from pokerlab.vision.amounts import glyph_holes
+
+    six = examples_from_crop(pill("6"), "6", "6")[0].glyph.copy()
+    side = round(len(six) ** 0.5)
+    grid = six.reshape(side, side)
+    rows, cols = np.nonzero(grid > 0)
+    row, col = rows[len(rows) // 2], cols[len(cols) // 2]  # somewhere inside the stroke
+    grid[row - 1:row + 2, col - 1:col + 2] = grid.max()
+    grid[row, col] = min(grid.min(), 0)  # a pinhole in the ink
+    assert glyph_holes(grid.ravel()) == 1
+
+
+def test_an_amount_has_at_most_one_decimal():
+    reader = reader_from("10", "23", "45", "67", "89")
+    assert reader.read(yellow_stack("47,5"), "stack_6_2").text == "47,5"
+    assert reader.read(yellow_stack("4,75"), "stack_6_2") is None  # a misread, not a stack
+    assert reader.read(pill("4,75")) is None  # bets too
+    assert reader.read(pill("4,5")).text == "4,5"
+
+
+def test_the_cards_lend_only_digits_the_bets_have_no_example_of():
+    """A pot "0,7" whose 0 matched the bets' zeros only weakly went to the card ranks,
+    which have no 0, and came back "9,7": a digit the bets have is read against them."""
+    fallback = examples_from_crop(pill("9"), "9", "card") + examples_from_crop(pill("6"), "6", "card")
+    reader = reader_from("10", "23", "45", "78", "9", fallback=fallback)
+    assert {e.digit for e in reader._fallback.examples} == {"6"}  # the bets have a 9
+    assert reader.read(pill("16")).text == "16"  # and a 6 still comes from the cards

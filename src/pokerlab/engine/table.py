@@ -11,6 +11,7 @@ from pokerlab.cards.deck import Deck
 from pokerlab.engine.betting import (
     apply_action,
     compute_legal_actions,
+    post_antes,
     post_blinds,
     seats_clockwise_from,
     start_new_street_betting,
@@ -100,8 +101,8 @@ class Table:
         blind_schedule: BlindSchedule | None = None,
     ) -> None:
         """`on_hand_started`, if given, is called once per hand right after
-        blinds are posted (before any betting), with a dict of
-        {hand_id, button_seat, sb_seat, bb_seat, small_blind, big_blind,
+        the antes and blinds are posted (before any betting), with a dict of
+        {hand_id, button_seat, sb_seat, bb_seat, small_blind, big_blind, ante,
         hole_cards}. This is an optional spectator hook only -- e.g. a GUI
         showing blind postings and a "spy on opponents' cards" debug toggle
         -- nothing in the engine or in Player depends on it.
@@ -225,6 +226,8 @@ class Table:
             sb_seat, bb_seat = order[0], order[1]
         else:
             sb_seat, bb_seat = order[1], order[2]
+        if self.config.ante > 0:
+            post_antes(hand_state, self.config.ante, order[1:] + order[:1])  # from the small blind round
         post_blinds(hand_state, sb_seat, bb_seat)
         preflop_first_actor = sb_seat if len(eligible) == 2 else order[3 % len(order)]
 
@@ -237,6 +240,7 @@ class Table:
                     "bb_seat": bb_seat,
                     "small_blind": small_blind,
                     "big_blind": big_blind,
+                    "ante": self.config.ante,
                     "hole_cards": dict(hole_cards),
                     "first_actor": (first := _first_to_act(hand_state, preflop_first_actor)),
                     "first_actor_view": _view_for(hand_state, first, self._hand_stats),

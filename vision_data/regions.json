@@ -167,6 +167,198 @@
       "top": 718,
       "width": 111,
       "height": 33
+    },
+    "dealer_8_0": {
+      "left": 841,
+      "top": 732,
+      "width": 42,
+      "height": 41
+    },
+    "player_8_0": {
+      "left": 872,
+      "top": 768,
+      "width": 172,
+      "height": 109
+    },
+    "dealer_8_1": {
+      "left": 696,
+      "top": 716,
+      "width": 41,
+      "height": 39
+    },
+    "player_8_1": {
+      "left": 543,
+      "top": 691,
+      "width": 130,
+      "height": 109
+    },
+    "player_8_2": {
+      "left": 332,
+      "top": 441,
+      "width": 136,
+      "height": 107
+    },
+    "player_8_3": {
+      "left": 441,
+      "top": 203,
+      "width": 161,
+      "height": 100
+    },
+    "player_8_4": {
+      "left": 895,
+      "top": 123,
+      "width": 134,
+      "height": 109
+    },
+    "dealer_8_3": {
+      "left": 572,
+      "top": 388,
+      "width": 38,
+      "height": 38
+    },
+    "dealer_8_4": {
+      "left": 1049,
+      "top": 293,
+      "width": 42,
+      "height": 39
+    },
+    "dealer_8_5": {
+      "left": 1317,
+      "top": 385,
+      "width": 39,
+      "height": 41
+    },
+    "player_8_5": {
+      "left": 1328,
+      "top": 194,
+      "width": 134,
+      "height": 111
+    },
+    "stack_8_1": {
+      "left": 557,
+      "top": 826,
+      "width": 101,
+      "height": 30
+    },
+    "stack_8_2": {
+      "left": 346,
+      "top": 575,
+      "width": 104,
+      "height": 32
+    },
+    "dealer_8_2": {
+      "left": 487,
+      "top": 575,
+      "width": 42,
+      "height": 41
+    },
+    "stack_8_3": {
+      "left": 466,
+      "top": 332,
+      "width": 105,
+      "height": 29
+    },
+    "stack_8_4": {
+      "left": 902,
+      "top": 259,
+      "width": 107,
+      "height": 30
+    },
+    "stack_8_5": {
+      "left": 1343,
+      "top": 334,
+      "width": 89,
+      "height": 28
+    },
+    "stack_8_0": {
+      "left": 903,
+      "top": 910,
+      "width": 108,
+      "height": 34
+    },
+    "bet_8_2": {
+      "left": 494,
+      "top": 544,
+      "width": 68,
+      "height": 32
+    },
+    "bet_8_3": {
+      "left": 601,
+      "top": 395,
+      "width": 79,
+      "height": 32
+    },
+    "bet_8_4": {
+      "left": 882,
+      "top": 321,
+      "width": 79,
+      "height": 32
+    },
+    "bet_8_6": {
+      "left": 1352,
+      "top": 547,
+      "width": 75,
+      "height": 28
+    },
+    "player_8_6": {
+      "left": 1443,
+      "top": 424,
+      "width": 150,
+      "height": 126
+    },
+    "stack_8_6": {
+      "left": 1463,
+      "top": 574,
+      "width": 102,
+      "height": 32
+    },
+    "stack_8_7": {
+      "left": 1251,
+      "top": 825,
+      "width": 105,
+      "height": 29
+    },
+    "bet_8_7": {
+      "left": 1160,
+      "top": 689,
+      "width": 80,
+      "height": 34
+    },
+    "player_8_7": {
+      "left": 1243,
+      "top": 689,
+      "width": 133,
+      "height": 109
+    },
+    "dealer_8_6": {
+      "left": 1400,
+      "top": 576,
+      "width": 38,
+      "height": 38
+    },
+    "bet_8_1": {
+      "left": 679,
+      "top": 695,
+      "width": 74,
+      "height": 26
+    },
+    "dealer_8_7": {
+      "left": 1190,
+      "top": 718,
+      "width": 41,
+      "height": 38
+    },
+    "bet_8_0": {
+      "left": 930,
+      "top": 687,
+      "width": 82,
+      "height": 30
+    },
+    "bet_8_5": {
+      "left": 1226,
+      "top": 394,
+      "width": 83,
+      "height": 33
     }
   }
 }

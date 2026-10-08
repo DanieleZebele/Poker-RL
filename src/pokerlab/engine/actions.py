@@ -12,6 +12,15 @@ class ActionType(Enum):
     RAISE = "raise"
     ALL_IN = "all_in"
     POST_BLIND = "post_blind"  # forced action, logged like any other for a complete history
+    # Forced too, by everyone before the blinds. Its record's `amount` is 0: an ante goes in
+    # the pot but not in the street's bet (`current_bet`), so the chips are
+    # `stack_before - stack_after`.
+    POST_ANTE = "post_ante"
+
+
+# The actions nobody chooses. Whatever reads a hand's records for what the players *did*
+# (statistics, the last action shown on a seat) skips these.
+FORCED_ACTIONS = frozenset({ActionType.POST_BLIND, ActionType.POST_ANTE})
 
 
 @dataclass(frozen=True)

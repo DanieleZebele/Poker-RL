@@ -22,6 +22,7 @@ from pokerlab.gui.spot import format_card
 from pokerlab.gui.spot_view import CardPicker, card_color, card_text, place_near_pointer
 from pokerlab.vision.regions import (
     BOARD,
+    DEALER_TABLE_SIZES,
     DEALER_ZONE_MAX_SIDE,
     HOLE_CARDS,
     POT,
@@ -34,7 +35,9 @@ from pokerlab.vision.regions import (
     stack_region_name,
 )
 
-# The table size whose dealer zones the screen collects (the only one mapped).
+# The table size whose per-seat zones the screen opens on; the "Tavolo" choice
+# at the top switches the seat sections between `DEALER_TABLE_SIZES` (6 and 8),
+# each with zones of its own.
 DEALER_PLAYERS = 6
 # The card zones, in the order their buttons appear.
 CARD_ZONES = ((HOLE_CARDS, "Mie carte"), (BOARD, "Board"))
@@ -424,6 +427,8 @@ class VisionFrame(ttk.Frame):
     def __init__(self, master) -> None:
         super().__init__(master, padding=12)
         self.app = master
+        self.players = DEALER_PLAYERS  # the table size the seat sections collect
+        self.players_size_var = tk.IntVar(value=self.players)
         self.regions = load_regions()
         self.vision_var = tk.StringVar()
         self.card_zone_buttons: dict[str, tuple[str, ttk.Button]] = {}
@@ -472,10 +477,19 @@ class VisionFrame(ttk.Frame):
             "<Configure>", lambda e: self.scroll_canvas.itemconfigure(body_item, width=e.width)
         )
         self._build_vision(self.body)
-        self._build_dealer(self.body)
-        self._build_players(self.body)
-        self._build_amounts(self.body)
-        self._build_stacks(self.body)
+        # The per-seat sections (dealer, players, bets, stacks) belong to one
+        # table size; choosing another rebuilds them on that size's zones.
+        size_row = ttk.Frame(self.body)
+        size_row.pack(fill="x", pady=(12, 0))
+        ttk.Label(size_row, text="Tavolo:", font=("TkDefaultFont", 10, "bold")).pack(side="left", padx=(0, 6))
+        for size in DEALER_TABLE_SIZES:
+            ttk.Radiobutton(
+                size_row, text=f"{size} giocatori", value=size, variable=self.players_size_var,
+                command=lambda: self.set_players(self.players_size_var.get()),
+            ).pack(side="left", padx=(0, 6))
+        self.seat_sections = ttk.Frame(self.body)
+        self.seat_sections.pack(fill="x")
+        self._build_seat_sections()
         self._build_turn(self.body)
         # Bound for the whole application, because the wheel event goes to the
         # widget under the pointer -- a button, a label -- not to the canvas;
@@ -483,6 +497,27 @@ class VisionFrame(ttk.Frame):
         # unbinds, so no other screen inherits it.
         for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
             self.bind_all(sequence, self._on_wheel, add="+")
+
+    def _build_seat_sections(self) -> None:
+        for child in self.seat_sections.winfo_children():
+            child.destroy()
+        self._build_dealer(self.seat_sections)
+        self._build_players(self.seat_sections)
+        self._build_amounts(self.seat_sections)
+        self._build_stacks(self.seat_sections)
+
+    def set_players(self, size: int) -> bool:
+        """Show the seat sections of a `size`-seat table (6 or 8). The zones of
+        the other size stay saved; only which ones these sections set changes.
+        False if nothing changed."""
+        if size not in DEALER_TABLE_SIZES or size == self.players:
+            self.players_size_var.set(self.players)
+            return False
+        self.players = size
+        self.players_size_var.set(size)
+        self.last_seat_states = {}  # another table: other seats
+        self._build_seat_sections()
+        return True
 
     def _on_wheel(self, event) -> str | None:
         """Scroll the sections, if the pointer is over this screen. Windows and
@@ -575,12 +610,12 @@ class VisionFrame(ttk.Frame):
     def _stack_zones(self) -> list[tuple[str, str]]:
         """`(caption, zone)` for every seat's stack."""
         return [
-            (f"Stack {seat}{' (tu)' if seat == 0 else ''}", stack_region_name(DEALER_PLAYERS, seat))
-            for seat in range(DEALER_PLAYERS)
+            (f"Stack {seat}{' (tu)' if seat == 0 else ''}", stack_region_name(self.players, seat))
+            for seat in range(self.players)
         ]
 
     def _build_stacks(self, parent: ttk.Frame) -> None:
-        box = ttk.LabelFrame(parent, text=f"Stack ({DEALER_PLAYERS} giocatori)", padding=6)
+        box = ttk.LabelFrame(parent, text=f"Stack ({self.players} giocatori)", padding=6)
         box.pack(fill="x", pady=(12, 0))
         zones = ttk.Frame(box)
         zones.pack(fill="x")
@@ -735,12 +770,12 @@ class VisionFrame(ttk.Frame):
     def _amount_zones(self) -> list[tuple[str, str]]:
         """`(caption, zone)`: the pot first, then every seat's bet."""
         return [("Piatto", POT)] + [
-            (f"Puntata {seat}{' (tu)' if seat == 0 else ''}", bet_region_name(DEALER_PLAYERS, seat))
-            for seat in range(DEALER_PLAYERS)
+            (f"Puntata {seat}{' (tu)' if seat == 0 else ''}", bet_region_name(self.players, seat))
+            for seat in range(self.players)
         ]
 
     def _build_amounts(self, parent: ttk.Frame) -> None:
-        box = ttk.LabelFrame(parent, text=f"Puntate e piatto ({DEALER_PLAYERS} giocatori)", padding=6)
+        box = ttk.LabelFrame(parent, text=f"Puntate e piatto ({self.players} giocatori)", padding=6)
         box.pack(fill="x", pady=(12, 0))
         zones = ttk.Frame(box)
         zones.pack(fill="x", pady=(4, 0))
@@ -826,11 +861,12 @@ class VisionFrame(ttk.Frame):
     # -- the players' seats -------------------------------------------------
 
     def _build_players(self, parent: ttk.Frame) -> None:
-        box = ttk.LabelFrame(parent, text=f"Giocatori ({DEALER_PLAYERS} giocatori)", padding=6)
+        box = ttk.LabelFrame(parent, text=f"Giocatori ({self.players} giocatori)", padding=6)
         box.pack(fill="x", pady=(12, 0))
         zones = ttk.Frame(box)
         zones.pack(fill="x", pady=(4, 0))
-        for seat in range(DEALER_PLAYERS):
+        self.player_zone_buttons = []
+        for seat in range(self.players):
             button = ttk.Button(zones, width=11, command=lambda s=seat: self._set_player_zone(s))
             button.pack(side="left", padx=(0, 4))
             self.player_zone_buttons.append(button)
@@ -846,7 +882,7 @@ class VisionFrame(ttk.Frame):
     def _update_players_text(self, extra: str = "") -> None:
         missing = []
         for seat, button in enumerate(self.player_zone_buttons):
-            is_set = self.regions.get(player_region_name(DEALER_PLAYERS, seat)) is not None
+            is_set = self.regions.get(player_region_name(self.players, seat)) is not None
             button.configure(text=f"{'✓ ' if is_set else ''}Giocatore {seat}{' (tu)' if seat == 0 else ''}")
             if not is_set:
                 missing.append(str(seat))
@@ -855,7 +891,7 @@ class VisionFrame(ttk.Frame):
 
     def _set_player_zone(self, seat: int) -> None:
         self._select_and_save(
-            player_region_name(DEALER_PLAYERS, seat), self._update_players_text,
+            player_region_name(self.players, seat), self._update_players_text,
             label=f"RIQUADRO GIOCATORE, posto {seat}",
         )
         self._update_players_text()
@@ -873,7 +909,7 @@ class VisionFrame(ttk.Frame):
             save_player_label,
         )
 
-        names = [player_region_name(DEALER_PLAYERS, seat) for seat in range(DEALER_PLAYERS)]
+        names = [player_region_name(self.players, seat) for seat in range(self.players)]
         frames = self._capture_zones([n for n in names if self.regions.get(n) is not None])
         if not frames:
             self._update_players_text("imposta prima almeno una zona")
@@ -906,12 +942,12 @@ class VisionFrame(ttk.Frame):
     # -- the dealer button --------------------------------------------------
 
     def _build_dealer(self, parent: ttk.Frame) -> None:
-        box = ttk.LabelFrame(parent, text=f"Dealer ({DEALER_PLAYERS} giocatori)", padding=6)
+        box = ttk.LabelFrame(parent, text=f"Dealer ({self.players} giocatori)", padding=6)
         box.pack(fill="x", pady=(12, 0))
         zones = ttk.Frame(box)
         zones.pack(fill="x", pady=(4, 0))
         self.dealer_zone_buttons = []
-        for seat in range(DEALER_PLAYERS):
+        for seat in range(self.players):
             button = ttk.Button(zones, width=11, command=lambda s=seat: self._set_dealer_zone(s))
             button.pack(side="left", padx=(0, 4))
             self.dealer_zone_buttons.append(button)
@@ -927,7 +963,7 @@ class VisionFrame(ttk.Frame):
     def _update_dealer_text(self, extra: str = "") -> None:
         missing, too_big = [], []
         for seat, button in enumerate(self.dealer_zone_buttons):
-            region = self.regions.get(dealer_region_name(DEALER_PLAYERS, seat))
+            region = self.regions.get(dealer_region_name(self.players, seat))
             button.configure(text=f"{'✓ ' if region else ''}Gettone {seat}{' (tu)' if seat == 0 else ''}")
             if region is None:
                 missing.append(str(seat))
@@ -941,7 +977,7 @@ class VisionFrame(ttk.Frame):
 
     def _set_dealer_zone(self, seat: int) -> None:
         self._select_and_save(
-            dealer_region_name(DEALER_PLAYERS, seat), self._update_dealer_text,
+            dealer_region_name(self.players, seat), self._update_dealer_text,
             label=f"GETTONE DEALER, posto {seat} (solo il gettone)",
         )
         self._update_dealer_text()
@@ -952,7 +988,7 @@ class VisionFrame(ttk.Frame):
 
         from pokerlab.vision.labels import DEALER_DIR
 
-        names = [dealer_region_name(DEALER_PLAYERS, seat) for seat in range(DEALER_PLAYERS)]
+        names = [dealer_region_name(self.players, seat) for seat in range(self.players)]
         frames = self._capture_zones([n for n in names if self.regions.get(n) is not None])
         if not frames:
             self._update_dealer_text("imposta prima almeno una zona")
@@ -1011,7 +1047,7 @@ class VisionFrame(ttk.Frame):
 
     def _preview_dealer(self) -> tk.Toplevel | None:
         """Every dealer zone set, side by side, with its share of gold now."""
-        names = [dealer_region_name(DEALER_PLAYERS, seat) for seat in range(DEALER_PLAYERS)]
+        names = [dealer_region_name(self.players, seat) for seat in range(self.players)]
         frames = self._capture_zones([n for n in names if self.regions.get(n) is not None])
         if not frames:
             self._update_dealer_text("imposta prima almeno una zona")
@@ -1029,30 +1065,37 @@ class VisionFrame(ttk.Frame):
             (f"Gettone {name.rsplit('_', 1)[1]}", frame, describe(frame))
             for name, frame in sorted(frames.items(), key=lambda kv: int(kv[0].rsplit("_", 1)[1]))
         ]
-        return self._show_preview("Anteprima: gettone dealer", items, columns=DEALER_PLAYERS)
+        return self._show_preview("Anteprima: gettone dealer", items, columns=self.players)
 
     def _preview_players(self) -> tk.Toplevel | None:
         """Every player zone set, side by side, with the state read now."""
-        names = [player_region_name(DEALER_PLAYERS, seat) for seat in range(DEALER_PLAYERS)]
+        names = [player_region_name(self.players, seat) for seat in range(self.players)]
         frames = self._capture_zones([n for n in names if self.regions.get(n) is not None])
         if not frames:
             self._update_players_text("imposta prima almeno una zona")
             return None
         try:
-            from pokerlab.vision.seats import load_seats, read_seat, sit_out_templates
+            from pokerlab.vision.seats import (
+                empty_backgrounds,
+                load_seats,
+                read_seat,
+                sit_out_templates,
+            )
         except ImportError:
-            def describe(_seat, _frame) -> str:
+            def describe(_seat, _name, _frame) -> str:
                 return ""
         else:
-            templates = sit_out_templates(load_seats())
+            labelled = load_seats()
+            templates = sit_out_templates(labelled)
+            backgrounds = empty_backgrounds(labelled)
 
-            def describe(seat, frame) -> str:
-                return SEAT_STATE_TEXT.get(read_seat(frame, seat, templates).state, "")
+            def describe(seat, name, frame) -> str:
+                return SEAT_STATE_TEXT.get(read_seat(frame, seat, templates, backgrounds.get(name)).state, "")
         items = []
         for name, frame in sorted(frames.items(), key=lambda kv: int(kv[0].rsplit("_", 1)[1])):
             seat = int(name.rsplit("_", 1)[1])
-            items.append((f"Giocatore {seat}", frame, describe(seat, frame)))
-        return self._show_preview("Anteprima: giocatori", items, columns=DEALER_PLAYERS)
+            items.append((f"Giocatore {seat}", frame, describe(seat, name, frame)))
+        return self._show_preview("Anteprima: giocatori", items, columns=self.players)
 
     def _show_preview(self, title: str, items: list, *, columns: int) -> tk.Toplevel:
         """A window of `(caption, frame, reading)` tiles, `columns` to a row.

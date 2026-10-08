@@ -81,7 +81,7 @@ def test_advice_from_an_untrained_model():
     state = replay(spot)
     out = advise(state.observation, state.legal_actions,
                  [("m", 1500.0, tiny_model(hidden=16, num_layers=1))],
-                 big_blind=2, starting_stack=200)
+                 big_blind=2)
     assert len(out) == 1
     assert abs(sum(b.probability for b in out[0].bins) - 1.0) < 1e-4
     assert all(b.legal for b in out[0].bins)
@@ -220,21 +220,6 @@ def test_both_cards_in_and_my_turn_consults_the_models(app, monkeypatch):
         gc.collect()
 
 
-def test_the_default_stack_follows_unedited_seats(app):
-    from pokerlab.gui.spot_view import SpotFrame
-
-    frame = SpotFrame(app)
-    try:
-        seat(frame, 3)
-        frame.stack_vars[3].set("500")
-        frame.stack_var.set("300")
-        frame._default_stack_changed()
-        assert frame.stack_vars[0].get() == "300" and frame.stack_vars[3].get() == "500"
-    finally:
-        frame.destroy()
-        gc.collect()
-
-
 def test_the_wheel_over_a_raise_amount_moves_it_by_a_big_blind_within_the_limits(app):
     import tkinter as tk
 
@@ -243,7 +228,7 @@ def test_the_wheel_over_a_raise_amount_moves_it_by_a_big_blind_within_the_limits
 
     frame = SpotFrame(app)
     try:
-        legal = LegalAction(ActionType.RAISE, 4, 10)  # chips: 2 to 5 big blinds
+        legal = LegalAction(ActionType.RAISE, 200, 500)  # chips: 2 to 5 big blinds
         var = tk.StringVar(value="2")  # the field is in big blinds
         frame._wheel_step(var, legal, 1)
         assert var.get() == "3"  # one big blind up
@@ -330,8 +315,8 @@ def test_no_chair_is_cut_off_whoever_is_to_act(app):
     app.deiconify()  # geometry and pointer events are only real on a mapped window
     try:
         frame.pack()
-        seat(frame, *range(1, 9))
-        for _ in range(8):  # the turn goes round every chair, top ones included
+        seat(frame, *range(1, 8))
+        for _ in range(7):  # the turn goes round every chair, top ones included
             app.update()
             holder = frame.chair_ui[frame.layout.chair_of(frame.state.to_act)].holder
             assert holder.winfo_y() >= 0 and holder.winfo_x() >= 0
@@ -393,8 +378,8 @@ def test_the_models_page_shows_every_amount_in_big_blinds(app):
     frame._consult = lambda state, spot: None
     try:
         seat(frame, 3, 6)
-        frame._append(Action(ActionType.RAISE, 7))  # 3,5 BB
-        assert frame.build_spot().starting_stack == 200  # 100 BB, the default
+        frame._append(Action(ActionType.RAISE, 350))  # 3,5 BB
+        assert frame.build_spot().starting_stack == 10000  # 100 BB, the default
         assert "piatto 5 BB" in frame.situation.cget("text")  # 0,5 + 1 + 3,5
         assert "raise a 3,5 BB" in frame.log.get("1.0", "end")
         texts = [w.cget("text") for line in frame.chair_ui[frame.layout.chair_of(frame.state.to_act)]
@@ -402,9 +387,6 @@ def test_the_models_page_shows_every_amount_in_big_blinds(app):
                  if w.winfo_class() == "Button"]
         assert any(t.startswith("Raise a (") and t.endswith(" BB)") for t in texts)
         assert any(t.startswith("Call ") and t.endswith(" BB") for t in texts)
-        frame.stack_var.set("37,5")
-        frame._default_stack_changed()
-        assert frame.build_spot().starting_stack == 75
     finally:
         frame.destroy()
         gc.collect()
@@ -455,16 +437,103 @@ def test_the_likeliest_action_of_the_top_model_is_in_bold(app, monkeypatch):
     try:
         monkeypatch.setattr(spot_view, "advise", lambda *a, **k: [opinion("primo", 1900), opinion("secondo", 1800)])
         frame.models = [object()]
+        # their places in the global ranking: the third did not load, the second is #3 there
+        frame._model_ranks = {"primo": 1, "secondo": 3}
         spot = Spot(num_players=3, starting_stack=200)
         frame._consult(replay(spot), spot)
 
         text = frame.advice.get("1.0", "end")
-        assert text.splitlines()[0].startswith("primo") and "secondo" in text
+        assert text.splitlines()[0].startswith("#1 ") and "#3 " in text
+        assert "primo" not in text and "secondo" not in text  # numbers only, no labels
         ranges = [str(r) for r in frame.advice.tag_ranges("bold")]
         assert ranges == ["2.0", "2.end"] or (len(ranges) == 2 and ranges[0].startswith("2."))
         bold = frame.advice.get(*frame.advice.tag_ranges("bold"))
+        # the tag's font must still exist once Python has collected its garbage: a font
+        # object dropped deletes the Tk font, and the line then shows plain
+        gc.collect()
+        font_name = frame.advice.tag_cget("bold", "font")
+        assert str(font_name) in app.tk.call("font", "names")
+        assert app.tk.call("font", "actual", font_name, "-weight") == "bold"
         assert bold.strip().startswith("->") and "70%" in bold
-        assert "secondo" not in bold
+        assert "#3" not in bold
     finally:
         frame.destroy()
         gc.collect()
+
+
+def test_the_table_grows_with_the_screen_and_the_felt_stays_clear_of_the_boxes():
+    from pokerlab.gui.spot_view import (
+        BOX_BOTTOM,
+        BOX_SIDE,
+        BOX_TOP,
+        CANVAS_HEIGHT,
+        CANVAS_WIDTH,
+        FELT_MIN_RADII,
+        RESERVED_HEIGHT,
+        SIDE_PANEL_WIDTH,
+        table_geometry,
+    )
+
+    for screen in ((1920, 1080), (2560, 1440), (1536, 864)):
+        geometry = table_geometry(*screen)
+        width, height = geometry.canvas
+        assert width >= CANVAS_WIDTH and height >= CANVAS_HEIGHT
+        if geometry.canvas != (CANVAS_WIDTH, CANVAS_HEIGHT):
+            assert width + SIDE_PANEL_WIDTH <= screen[0] + 1 and height + RESERVED_HEIGHT <= screen[1] + 1
+        (cx, cy), (a, b) = geometry.center, geometry.table_radii
+        assert cx - a >= BOX_SIDE and cx + a <= width - BOX_SIDE  # clear of the side boxes
+        if b > FELT_MIN_RADII[1]:  # at its minimum the board's height wins over the margin
+            assert cy - b >= BOX_TOP and cy + b <= height - BOX_BOTTOM  # of the top ones and of yours
+        assert BOX_TOP <= cy <= height - BOX_BOTTOM
+    assert table_geometry(2560, 1440).table_radii[0] > table_geometry(1920, 1080).table_radii[0]
+    assert table_geometry(1024, 600).canvas == (CANVAS_WIDTH, CANVAS_HEIGHT)
+
+
+def test_the_advice_is_what_the_model_plays_at_a_table():
+    """The spot's numbers are the policy's own: the same features, mask and normalisation
+    `RLAgentPlayer` uses when the model sits at a table -- the stack constant from training
+    (100 bb), whatever the spot's stacks are."""
+    pytest.importorskip("torch")
+    from support import tiny_model
+
+    from pokerlab.gui.spot import advise
+    from pokerlab.players.rl_agent import RLAgentPlayer
+    from pokerlab.rl.policy import make_policy_fn
+
+    model = tiny_model(hidden=16, num_layers=1)
+    model.feature_stack_bb = 100.0
+    spot = Spot(num_players=4, my_seat=3, starting_stack=25000, small_blind=50, big_blind=100,
+                hole_cards=(parse_card("Ah"), parse_card("Kh")))  # 250 bb stacks
+    state = replay(spot)
+    advice = advise(state.observation, state.legal_actions, [("m", 1500.0, model)], big_blind=100)[0]
+    player = RLAgentPlayer("m", "m", policy_fn=make_policy_fn(model), big_blind=100, starting_stack=10000)
+    played = player.action_probabilities(state.observation, state.legal_actions)
+    advised = {b.index: b.probability for b in advice.bins}  # the legal bins only
+    assert advised == pytest.approx({index: played[index] for index in advised})
+    assert sum(played[index] for index in advised) == pytest.approx(1.0)  # nothing legal left out
+
+
+def test_with_nothing_to_call_folding_is_never_advised():
+    pytest.importorskip("torch")
+    from support import tiny_model
+
+    from pokerlab.gui.spot import advise
+
+    model = tiny_model(hidden=16, num_layers=1)
+    call, check = Action(ActionType.CALL), Action(ActionType.CHECK)
+    board = (parse_card("Ks"), parse_card("8d"), parse_card("3h"))
+    for spot in (
+        Spot(num_players=6, my_seat=2, script=[call] * 5),  # the big blind after limps
+        Spot(num_players=3, my_seat=0, script=[call, call, check, check, check], board=board),  # checked to
+    ):
+        state = replay(spot)
+        assert state.to_act == spot.my_seat
+        advice = advise(state.observation, state.legal_actions, [("m", 1500.0, model)], big_blind=spot.big_blind)[0]
+        assert all(b.action.action_type is not ActionType.FOLD for b in advice.bins)
+
+
+def test_a_model_is_normalised_by_the_stack_it_was_trained_with():
+    from pokerlab.rl.table_mix import DEFAULT_STACK_MAX_BB, feature_stack_bb
+
+    assert feature_stack_bb({"metadata": {"stack_max_bb": 60.0}}) == 60.0
+    assert feature_stack_bb({"metadata": {}}) == DEFAULT_STACK_MAX_BB == feature_stack_bb({})
