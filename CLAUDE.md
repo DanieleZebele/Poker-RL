@@ -1431,7 +1431,7 @@ and run at the speed of one), organised into generations.
       `--restore <file>` puts them back (verified end to end, `games` and
       `frozen` preserved). `--dry-run` plays and reports without writing.
 - **Pruning trigger: the real on-disk population reaches
-  `--global-trigger-size` (10,000).** That is the whole rule: whenever
+  `--global-trigger-size` (1,000, lowered from 10,000 at the user's request: the store is capped at about a thousand networks).** That is the whole rule: whenever
   `len(discover_population(...))` — the number of files in `checkpoints/models/`
   (one per network) — is at or above the trigger at the end of a merge, a
   pruning pass runs; after it removes ~a quarter of the eligible models the count
@@ -1446,8 +1446,9 @@ and run at the speed of one), organised into generations.
 - **Elimination physically deletes the checkpoint file. This is deliberately
   destructive, not bookkeeping.** `_eliminate` removes `--global-eliminate-
   fraction` (~25%) of the *eligible* members: the non-frozen ones whose `games`
-  is at or above the `--global-protect-percentile` (**25th**, lowered from the
-  50th) of games played among
+  is at or above the `--global-protect-percentile` (**0 for now, temporarily** —
+  it was the 25th, lowered from the 50th; 0 makes every rated model eligible so
+  the store can come down to 1,000, restore 25.0 afterwards) of games played among
   the models rated so far — never below it, since a rating built on a handful of
   games is not evidence. Measured on the real population, that bar is still met
   with room to spare: the 25th percentile of games among the 9,588 rated

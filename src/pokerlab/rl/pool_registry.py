@@ -204,7 +204,10 @@ DEFAULT_K_SCHEDULE: tuple[tuple[int, float], ...] = (
 # on-disk population reaches `DEFAULT_POPULATION_TRIGGER`) and the minimum games
 # a network needs to count as reliably rated (the `DEFAULT_PROTECT_PERCENTILE`
 # of games played among the models rated so far).
-DEFAULT_POPULATION_TRIGGER = 10_000
+# **1,000, lowered from 10,000** at the user's request: the store is capped at
+# about a thousand networks, and every merge that ends with the population at or
+# above it runs a pruning pass.
+DEFAULT_POPULATION_TRIGGER = 1_000
 DEFAULT_ELIMINATION_FRACTION = 0.05
 # **The 25th percentile, lowered from the 50th.** The protection exists so a
 # rating built on a handful of games is never grounds for deletion, and at the
@@ -227,7 +230,14 @@ DEFAULT_ELIMINATION_FRACTION = 0.05
 # the *eligible* set, so 25% of 7,193 instead of 25% of 4,799 -- about 1,800
 # models a pass rather than 1,200. Prunes therefore fire less often and bite
 # harder.
-DEFAULT_PROTECT_PERCENTILE = 25.0
+#
+# **Set to 0 for now, temporarily, at the user's request.** With the trigger at
+# 1,000 the store has to come down from ~9,800 networks, and the protection
+# would keep every model below the 25th percentile of games out of reach. At 0
+# the threshold is the fewest games any rated model has played, so every rated,
+# non-frozen model on disk is eligible (an unrated one, `games == 0`, still is
+# not). Restore 25.0 once the population is down to size.
+DEFAULT_PROTECT_PERCENTILE = 0.0
 
 MODEL = "model"
 
