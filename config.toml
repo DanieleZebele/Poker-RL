@@ -22,7 +22,7 @@ allin_runouts = 20      # a hand all-in before the river trains on its expected 
 critic_stack_power = 1.4  # the critic's loss weighs a decision by (chips at stake in bb)^-1.4: the target's sd grows ~stake^0.7 (0: off)
 
 [styles]
-style_share = 0.3   # share of the opponent seats (pool models) that play with a random style for a table's hands; 0 = off
+style_share = 0.0   # share of the opponent seats (pool models) that play with a random style for a table's hands; 0 = off
 style_spread = 0.5               # sd of each style axis (normal around 0, cut at +-1): most styles are mild, few extreme
 style_temperature_spread = 0.2   # sd of the log of a style's temperature (cut to a factor of 2 either way)
 style_jitter = 0.1               # sd of the noise on the shape of a style's push
@@ -45,7 +45,7 @@ pool_models = 20
 parent_tiers = "10, 100, all"   # Where a worker's parent comes from.
 
 [starting-point]
-lr = 0.0002
+lr = 0.0003
 hands = 8192                # per iteration 
 opponent_probability = 0.8
 ppo_epochs = 3
@@ -55,7 +55,7 @@ gae_lambda = 0.8
 value_coef = 1.0
 policy_max_grad_norm = 0.7  # the policy's gradient clip
 critic_max_grad_norm = 0.5   # the critic's gradient clip: its own, the two networks share no weight
-entropy_coef = 0.01
+entropy_coef = 0.0
 pool_top_share = 0.9
 pool_top_n = 50
 
@@ -96,7 +96,7 @@ global_protect_percentile = 25.0
 
 [anchors]
 benchmark_games_percentile = 95.0
-benchmark_margin = 20.0
+benchmark_margin = 50.0
 
 [benchmark-arena]
 arena_min_sessions = 10000      # never declare convergence before this many rated sessions
