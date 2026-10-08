@@ -655,3 +655,28 @@ def test_a_player_who_vanishes_mid_hand_has_folded(app):
     finally:
         frame.destroy()
         gc.collect()
+
+
+def test_when_the_dealer_has_gone_the_button_passes_to_the_player_before(app):
+    from pokerlab.gui.spot_table import chair_for_client_seat as chair
+    from pokerlab.gui.spot_view import SpotFrame
+
+    frame = SpotFrame(app)
+    frame._consult = lambda state, spot: None
+    try:
+        seats = {s: "in_gioco" for s in range(6)}
+        frame.apply_reading(seats_reading(seats, dealer=3))
+        assert frame.layout.dealer == chair(6, 3)
+
+        # the dealer leaves; the next hand starts with the button still on that empty seat
+        gone = {**seats, 3: "libero"}
+        frame.apply_reading(seats_reading(gone, dealer=3, hole=["Ah", "Kd"]))
+        assert chair(6, 3) not in frame.layout.chairs  # nobody seated there for the button
+        assert frame.layout.dealer == chair(6, 2)  # the player before has it
+
+        # a reading that first sees the button on an empty seat does the same
+        frame.apply_reading(seats_reading({**gone, 4: "libero"}, dealer=4, hole=["2c", "7d"]))
+        assert chair(6, 4) not in frame.layout.chairs and frame.layout.dealer == chair(6, 2)
+    finally:
+        frame.destroy()
+        gc.collect()

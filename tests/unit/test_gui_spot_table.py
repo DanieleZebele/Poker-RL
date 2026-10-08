@@ -39,12 +39,21 @@ def test_occupied_or_missing_chairs_are_refused():
     assert not layout.set_dealer(4)
 
 
-def test_removing_the_dealer_gives_the_button_back_to_the_user():
+def test_removing_the_dealer_passes_the_button_to_the_player_before():
     layout = TableLayout()
-    layout.add(3)
+    for chair in (2, 3, 6):
+        layout.add(chair)
     layout.set_dealer(3)
+    sb, bb = layout.order()[1:3]
     layout.remove(3)
-    assert layout.dealer == USER_CHAIR
+    assert layout.dealer == 2  # the first occupied chair counter-clockwise
+    assert layout.order()[1:3] == [sb, bb]  # the blinds stay on the same two players
+    layout.set_dealer(6)
+    layout.remove(6)
+    assert layout.dealer == 2  # 5 and 4 are empty, 3 has gone
+    layout.set_dealer(2)
+    layout.remove(2)
+    assert layout.dealer == USER_CHAIR  # wrapping round: yours is always occupied
 
 
 def test_chairs_run_clockwise_from_the_bottom_as_seen_on_screen():

@@ -2522,7 +2522,13 @@ collected in the vision screen; the accuracies quoted are against the crops in
   is chair k; 6-max is 0,1,3,4,5,7, each 15 degrees off its chair but seat 3, straight
   across, on chair 4). A move puts the button on that chair, **seating a player there if it
   was empty** (the button is always in front of someone), and clears the
-  actions (a new hand). Compared with the *last seat it was seen on*
+  actions (a new hand) -- unless the screen reads that seat empty (`libero`): its
+  player has gone (a dead button), nobody is seated for it and the button passes to
+  the player before (`TableLayout.previous_occupied`), which keeps the blinds on the
+  same two players. `TableLayout.remove` does the same when the dealer's chair is
+  emptied (it used to hand the button to you). A dealer who vanishes mid-hand stays
+  seated, folded, until the next hand: moving the button mid-hand would change the
+  blinds of a hand already rebuilt. Compared with the *last seat it was seen on*
   (`_last_dealer`), so the button vanishing between hands and reappearing on
   the same seat is not a move, and a manual dealer correction sticks. An
   ambiguous reading is not applied. The dealer is read even when no card crop

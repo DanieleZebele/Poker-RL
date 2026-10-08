@@ -1018,6 +1018,7 @@ class SpotFrame(ttk.Frame):
         import time
 
         from pokerlab.gui.screen_reader import diff_reading
+        from pokerlab.vision.labels import SEAT_EMPTY
 
         change = diff_reading(self._last_reading, reading, self._last_hand, self._last_dealer)
         self._last_reading = reading
@@ -1046,10 +1047,15 @@ class SpotFrame(ttk.Frame):
         if change.dealer is not None:
             self._last_dealer = change.dealer
             chair = chair_for_client_seat(self.table_size, change.dealer)
-            if self.layout.add(chair):
-                self.stack_vars[chair].set(DEFAULT_STACK_BB)
-                self.name_vars[chair].set(f"Avv. {chair}")
-            self.layout.set_dealer(chair)
+            if (reading.seats or {}).get(change.dealer) == SEAT_EMPTY and chair not in self.layout.chairs:
+                # The button on an empty seat: its player has gone (a dead button). Nobody
+                # is seated there for it; it passes to the player before.
+                self.layout.set_dealer(self.layout.previous_occupied(chair))
+            else:
+                if self.layout.add(chair):
+                    self.stack_vars[chair].set(DEFAULT_STACK_BB)
+                    self.name_vars[chair].set(f"Avv. {chair}")
+                self.layout.set_dealer(chair)
             self.script.clear()
         if change.hole is not None:
             cards = [parse_card(c) for c in change.hole]
@@ -1212,8 +1218,8 @@ class SpotFrame(ttk.Frame):
             elif seat not in seated and self.layout.remove(chair):
                 moved = True
         if self._last_dealer is not None:
-            # `remove` hands the button back to you if its chair emptied; put it
-            # back where it was last seen, if that chair is still occupied.
+            # `remove` passes the button to the player before if its chair emptied;
+            # put it back where it was last seen, if that chair is still occupied.
             self.layout.set_dealer(chair_for_client_seat(self.table_size, self._last_dealer))
         if moved:
             self.script.clear()

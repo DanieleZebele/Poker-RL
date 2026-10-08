@@ -78,13 +78,25 @@ class TableLayout:
 
     def remove(self, chair: int) -> bool:
         """Empty a chair. The user's chair cannot be emptied; if the button was
-        on the one removed it goes back to the user."""
+        on the one removed it passes to the player before it (`previous_occupied`)."""
         if chair == USER_CHAIR or chair not in self.chairs:
             return False
         self.chairs.discard(chair)
         if self.dealer == chair:
-            self.dealer = USER_CHAIR
+            self.dealer = self.previous_occupied(chair)
         return True
+
+    def previous_occupied(self, chair: int) -> int:
+        """The first occupied chair counter-clockwise from `chair` (not `chair` itself):
+        where the button goes when its player has gone. The blinds then stay on the
+        same two players -- the first occupied chairs after the empty one -- which is
+        what a client's dead button does too. Your chair is always occupied, so
+        there is always one."""
+        for step in range(1, CHAIRS):
+            candidate = (chair - step) % CHAIRS
+            if candidate in self.chairs:
+                return candidate
+        return USER_CHAIR
 
     def set_dealer(self, chair: int) -> bool:
         if chair not in self.chairs:
