@@ -12,7 +12,7 @@ from pokerlab.cards.deck import Deck
 from pokerlab.engine.actions import Action, LegalAction
 from pokerlab.engine.betting import compute_legal_actions, post_blinds
 from pokerlab.engine.config import GameConfig
-from pokerlab.engine.state import HandState, PlayerState, Street
+from pokerlab.engine.state import HandState, PlayerState, PlayerStatus, Street
 from pokerlab.engine.stats import STAT_SLOTS
 from pokerlab.engine.table import Table
 from pokerlab.players.base import Observation, Player, build_observation
@@ -30,6 +30,7 @@ from pokerlab.rl.features import (
     SEATS_DIM,
     STREET_DIM,
     _card_index,
+    chips_at_stake,
     committed_by_seat,
     encode_observation,
 )
@@ -128,6 +129,31 @@ def test_committed_by_seat_reconstructs_the_pot(num_players):
 
     for observation, _ in sink:
         assert sum(committed_by_seat(observation).values()) == observation.pot_size
+
+
+@pytest.mark.parametrize("num_players", [2, 3, 6, 9])
+def test_chips_at_stake_is_mine_against_the_deepest_opponent_still_in(num_players):
+    """Counted on the stacks each seat started the hand with, so a chip already put in
+    still counts and an all-in opponent is not a stake of zero; a folded one is out."""
+    rng = random.Random(7 + num_players)
+    sink: list[tuple[Observation, list[float]]] = []
+    config = GameConfig(
+        num_players=num_players, starting_stack=STARTING_STACK, small_blind=1, big_blind=BIG_BLIND
+    )
+    players = [FeatureProbe(f"p{i}", f"P{i}", rng, sink) for i in range(num_players)]
+    table = Table(config, players, rng=rng)
+    for _ in range(40):
+        start = [rng.randint(BIG_BLIND, 3 * STARTING_STACK) for _ in range(num_players)]
+        table.stacks = list(start)
+        sink.clear()
+        table.play_hand()
+        for observation, _ in sink:
+            live = [
+                start[seat.seat]
+                for seat in observation.seats
+                if seat.seat != observation.my_seat and seat.status is not PlayerStatus.FOLDED
+            ]
+            assert chips_at_stake(observation) == min(start[observation.my_seat], max(live))
 
 
 def test_board_planes_are_empty_before_the_flop():
@@ -248,10 +274,10 @@ def seat_block(vector: list[float], slot: int) -> list[float]:
     return vector[start : start + SEAT_FEATURES]
 
 
-def test_every_seat_has_room_for_a_hundred_statistics_after_its_nine_features():
-    assert STAT_SLOTS == 100
-    assert SEAT_FEATURES == SEAT_BASE_FEATURES + STAT_SLOTS == 109
-    assert OBS_DIM == 1380
+def test_every_seat_has_its_twenty_statistics_after_its_nine_features():
+    assert STAT_SLOTS == 20
+    assert SEAT_FEATURES == SEAT_BASE_FEATURES + STAT_SLOTS == 29
+    assert OBS_DIM == 660
 
 
 def test_without_statistics_every_stat_slot_is_zero():

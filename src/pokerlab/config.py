@@ -56,7 +56,6 @@ LOCAL_ONLY = frozenset(
     {
         "machine",
         "workers",
-        "device",
         "seed",
         "seed_base",
         "resume",

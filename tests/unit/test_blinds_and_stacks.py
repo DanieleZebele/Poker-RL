@@ -1,5 +1,6 @@
 import random
 
+import pytest
 from support import make_always_call_bot
 
 from pokerlab.engine.actions import ActionType
@@ -115,9 +116,6 @@ class ShoveBot:
                 return Action(ActionType.ALL_IN)
         return Action(legal_actions[0].action_type)
 
-    def notify(self, event, **data):
-        pass
-
 
 def test_on_street_dealt_hook_reports_each_board_as_it_is_dealt():
     calls = []
@@ -154,3 +152,106 @@ def test_a_table_without_the_street_hook_still_plays_normally():
     table = make_table(3, seed=3)
     result = table.play_hand()
     assert sum(result.final_stacks.values()) == 600
+
+
+# ---- blinds that go up -------------------------------------------------------------
+
+
+def _blind_table(schedule, *, small=50, big=100, players=3, seed=1):
+    from pokerlab.engine.config import GameConfig
+    from pokerlab.engine.table import Table
+
+    bots = [make_always_call_bot(f"p{i}", f"B{i}") for i in range(players)]
+    config = GameConfig(num_players=players, starting_stack=100_000, small_blind=small, big_blind=big)
+    return Table(config, bots, rng=random.Random(seed), blind_schedule=schedule)
+
+
+def test_the_blinds_go_up_by_the_factor_every_n_hands_rounded_up():
+    from pokerlab.engine.config import BlindSchedule
+
+    table = _blind_table(BlindSchedule(every=5, factor=1.2))
+    seen, next_up = [], []
+    for _ in range(16):
+        table.stacks = [100_000] * 3
+        seen.append(table.play_hand().hand_history.small_blind)
+        next_up.append(table.current_blinds())
+    assert seen[:5] == [50] * 5 and seen[5:10] == [60] * 5 and seen[10:15] == [72] * 5 and seen[15] == 87
+    # 50 * 1.2 ** 3 = 86.4 -> 87; after the fifth hand the next one is already at the new level
+    assert next_up[4] == (60, 120) and next_up[3] == (50, 100)
+
+
+def test_each_level_is_computed_from_the_initial_blinds_not_from_the_last_rounded_ones():
+    from pokerlab.engine.config import BlindSchedule
+
+    schedule = BlindSchedule(every=1, factor=1.2)
+    assert [schedule.blinds(1, 2, hands) for hands in range(5)] == [(1, 2), (2, 3), (2, 3), (2, 4), (3, 5)]
+    # floating point: 100 * 1.2 is 120.00000000000001, which must not round up to 121
+    assert BlindSchedule(every=1, factor=1.2).blinds(50, 100, 1) == (60, 120)
+
+
+def test_the_blinds_stay_in_order_at_every_level():
+    from pokerlab.engine.config import BlindSchedule
+
+    for factor in (1.0, 1.05, 1.2, 1.5, 2.0):
+        schedule = BlindSchedule(every=1, factor=factor)
+        for small, big in ((1, 2), (50, 100), (3, 4)):
+            for hands in range(40):
+                low, high = schedule.blinds(small, big, hands)
+                assert 0 < low < high
+
+
+def test_a_schedule_refuses_nonsense():
+    from pokerlab.engine.config import BlindSchedule
+
+    for every, factor in ((0, 1.2), (5, 0.9), (5, float("nan"))):
+        with pytest.raises(ValueError):
+            BlindSchedule(every=every, factor=factor)
+    assert BlindSchedule(every=5, factor=1.0).blinds(50, 100, 1000) == (50, 100)
+
+
+def test_every_hand_records_the_blinds_it_was_played_at_and_the_observation_carries_them():
+    from pokerlab.engine.config import BlindSchedule
+
+    table = _blind_table(BlindSchedule(every=2, factor=2.0), players=2)
+    started = []
+    table._on_hand_started = started.append
+    seen_by_bots = []
+    for bot in table.players:
+        inner = bot.act
+
+        def act(observation, legal, inner=inner):
+            seen_by_bots.append(observation.big_blind)
+            return inner(observation, legal)
+
+        bot.act = act
+    histories = []
+    for _ in range(5):
+        table.stacks = [100_000] * 2
+        histories.append(table.play_hand().hand_history)
+    assert [h.big_blind for h in histories] == [100, 100, 200, 200, 400]
+    assert [info["big_blind"] for info in started] == [100, 100, 200, 200, 400]
+    assert set(seen_by_bots) == {100, 200, 400}
+    # the blinds were really posted at the level of the hand, not just recorded
+    for h in histories:
+        posted = [r.amount for r in h.actions if r.action_type.value == "post_blind"]
+        assert sorted(posted) == [h.small_blind, h.big_blind]
+
+
+def test_chips_are_conserved_while_the_blinds_go_up_even_when_stacks_run_short():
+    from pokerlab.engine.config import BlindSchedule
+
+    table = _blind_table(BlindSchedule(every=3, factor=1.5), small=10, big=20, players=5, seed=4)
+    table.stacks = [400, 250, 90, 700, 160]
+    total = sum(table.stacks)
+    for _ in range(40):
+        if sum(1 for stack in table.stacks if stack > 0) < 2:
+            break
+        table.play_hand()
+        assert sum(table.stacks) == total
+
+
+def test_without_a_schedule_the_blinds_never_move():
+    table = _blind_table(None)
+    for _ in range(12):
+        table.stacks = [100_000] * 3
+        assert table.play_hand().hand_history.big_blind == 100

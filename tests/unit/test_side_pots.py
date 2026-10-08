@@ -1,3 +1,5 @@
+import pytest
+
 from pokerlab.cards.card import Card
 from pokerlab.engine.pots import compute_pots, distribute_pots
 from pokerlab.engine.state import PlayerState, PlayerStatus
@@ -86,3 +88,17 @@ def test_no_refund_when_top_commitment_is_shared_by_multiple_players():
 
     assert a.total_committed == 200
     assert b.total_committed == 200
+
+
+def test_a_layer_nobody_can_win_is_an_error_not_chips_that_vanish():
+    """Two all-in players and a layer above them paid only by two who folded: the betting
+    can no longer produce it (see `test_full_hand_flow`), and if it ever does the chips must
+    not disappear silently."""
+    seats = [
+        seat(0, stack=0, total_committed=58, status=PlayerStatus.ALL_IN),
+        seat(1, stack=0, total_committed=71, status=PlayerStatus.ALL_IN),
+        seat(2, stack=55, total_committed=101, status=PlayerStatus.FOLDED),
+        seat(3, stack=17, total_committed=101, status=PlayerStatus.FOLDED),
+    ]
+    with pytest.raises(ValueError, match="nobody can win it"):
+        compute_pots(seats)

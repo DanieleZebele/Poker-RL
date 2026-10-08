@@ -6,6 +6,7 @@ import random
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 
@@ -60,9 +61,10 @@ from pokerlab.cli.play import (
     validate_bot_key,
 )
 from pokerlab.engine.actions import Action, ActionType, LegalAction
-from pokerlab.engine.config import GameConfig
+from pokerlab.engine.config import BlindSchedule, GameConfig
 from pokerlab.engine.history import HandHistoryWriter
 from pokerlab.engine.state import ActionRecord, PlayerStatus
+from pokerlab.engine.stats import StatsTracker
 from pokerlab.engine.table import HandResult, Table
 from pokerlab.evaluator.evaluator import HandCategory, evaluate
 from pokerlab.gui.cards_canvas import (
@@ -71,24 +73,17 @@ from pokerlab.gui.cards_canvas import (
     draw_empty_slot,
     new_card_canvas,
 )
+from pokerlab.gui.spot import bin_labels
 from pokerlab.players.base import Observation, Player
 from pokerlab.players.gui import GuiEvent, GuiPlayer
+from pokerlab.players.rl_agent import RLAgentPlayer
+from pokerlab.rl.action_space import action_index_to_action, legal_action_mask
 
 # How long a bot's action stays on the table before the next one fires.
 # Without it a whole hand's actions land between two of the GUI's 100ms
 # polls and render as one instant jump -- this is what makes an unattended
 # bot-only session watchable at all, not just step mode.
 BOT_ACTION_DELAY_SECONDS = 1.0
-
-# Gives the human time to read the previous hand's showdown/final stacks
-# before the next hand's cards start appearing.
-NEW_HAND_DELAY_SECONDS = 3.0
-
-# How long every participant's hole cards stay face-up on the table once a
-# hand is over, before the table is cleared for the next deal. The hand is
-# finished by then, so nothing is leaked that could affect play -- and
-# seeing what the bots actually held is the whole point of a testing GUI.
-SHOWDOWN_REVEAL_SECONDS = 1.0
 
 # Beat after a new community card lands, before the street's first action.
 # The engine deals the street and the next player acts microseconds later,
@@ -120,6 +115,10 @@ WHEEL_STEP_BIG_BLINDS = 1
 # The dealer's seat box is tinted whole (frame, labels and card
 # backgrounds), not just tagged with a "D" above it.
 DEALER_BACKGROUND = "#f6d55c"
+TURN_BACKGROUND = "#9be39b"  # the seat whose turn it is
+FOLDED_BACKGROUND = "#4a4a4a"  # a seat that has folded
+FOLDED_FOREGROUND = "#d0d0d0"
+PROBABILITY_HINT = "Attiva la modalita' passo-passo e \"Spia carte avversari\" per vedere le probabilita' dei bot."
 
 _STATUS_LABELS = {
     PlayerStatus.ACTIVE: "",
@@ -161,6 +160,18 @@ def _describe_action(record: ActionRecord) -> str:
     if record.action_type == ActionType.RAISE:
         return f"raise to {record.amount}"
     return record.action_type.value
+
+
+def _last_actions(observation: Observation) -> dict[int, str]:
+    """Each seat's most recent voluntary action on the current street, as the log writes it
+    ("Call 2", "Raise to 6"), for the line under its bet. The blinds are not an action a player
+    chose, and an action of an earlier street is no longer shown, so a seat that has not acted
+    on this street has none."""
+    found: dict[int, str] = {}
+    for record in observation.action_history:
+        if record.action_type != ActionType.POST_BLIND and record.street == observation.street:
+            found[record.seat] = _describe_action(record).capitalize()
+    return found
 
 
 _CATEGORY_NAMES_IT = {
@@ -301,17 +312,39 @@ class ActionReporter:
             time.sleep(self._delay_seconds)
 
 
-def _run_session(table: Table, num_hands: int, event_queue: queue.Queue[GuiEvent], writer: HandHistoryWriter) -> None:
+def wait_for_first_bot(
+    info: dict, human_seat: int | None, step_mode_state: dict[str, bool], step_gate: queue.Queue[None]
+) -> None:
+    """Hold the game before a hand's or a street's first action, if that action is a bot's.
+
+    Only in step mode with the opponents' cards shown: that is when the table shows the
+    bot's action probabilities, and an action that follows another one gets its pause from the
+    action before it (`ActionReporter`), but the first of a hand or a street follows no action,
+    so without this there would be no moment to look at its probabilities. Runs on the session
+    thread, like the reporter."""
+    seat = info.get("first_actor")
+    if seat is None or seat == human_seat:
+        return
+    if step_mode_state["on"] and step_mode_state.get("spy"):
+        step_gate.get()
+
+
+def _run_session(
+    table: Table,
+    num_hands: int,
+    event_queue: queue.Queue[GuiEvent],
+    writer: HandHistoryWriter,
+    next_hand_gate: queue.Queue[None],
+) -> None:
     """Runs on a background thread: drives the actual game loop. This
     thread can be blocked by a GuiPlayer.act() call waiting on the human's
     next click, or (in step mode) by start_session's on_action_applied
     callback waiting on the "Avanti" button -- there is no separate
     "pause"/"stop mid-hand"
     mechanism beyond that; closing the window (a daemon thread) is how a
-    session gets abandoned. Also blocked, deliberately, by
-    `NEW_HAND_DELAY_SECONDS` between hands (not before the first), so the
-    table does not race straight into the next deal before anyone has had
-    a chance to read the previous hand's showdown.
+    session gets abandoned. Also blocked, deliberately, between hands (not
+    before the first) until "Mano successiva" is pressed: the table keeps
+    showing what happened in the hand until then, however long it is read.
     """
     try:
         for i in range(num_hands):
@@ -319,7 +352,8 @@ def _run_session(table: Table, num_hands: int, event_queue: queue.Queue[GuiEvent
                 event_queue.put(GuiEvent("session_ended_early", i))
                 return
             if i > 0:
-                time.sleep(NEW_HAND_DELAY_SECONDS)
+                event_queue.put(GuiEvent("awaiting_next_hand"))
+                next_hand_gate.get()
             result = table.play_hand()
             event_queue.put(GuiEvent("hand_complete", result))
         event_queue.put(GuiEvent("session_complete"))
@@ -418,6 +452,8 @@ class SetupFrame(ttk.Frame):
         self.sb_var = tk.StringVar(value="1")
         self.bb_var = tk.StringVar(value="2")
         self.hands_var = tk.StringVar(value="20")
+        self.blind_every_var = tk.StringVar(value="")
+        self.blind_factor_var = tk.StringVar(value="1.2")
         self.seed_var = tk.StringVar(value="")
 
         ttk.Label(self, text="pokerlab -- test dal vivo", font=("TkDefaultFont", 14, "bold")).grid(
@@ -429,6 +465,8 @@ class SetupFrame(ttk.Frame):
             ("Small blind", self.sb_var),
             ("Big blind", self.bb_var),
             ("Numero di mani", self.hands_var),
+            ("Aumenta i bui ogni N mani (vuoto = mai)", self.blind_every_var),
+            ("Fattore di aumento (arrotonda per eccesso)", self.blind_factor_var),
             ("Seed (vuoto = casuale)", self.seed_var),
         ]
         for row, (label, var) in enumerate(fields, start=1):
@@ -511,11 +549,25 @@ class SetupFrame(ttk.Frame):
                 validate_bot_key(key)
             num_players = human_seats + len(bot_keys)
             config = GameConfig(num_players=num_players, starting_stack=stack, small_blind=sb, big_blind=bb)
+            blind_schedule = self._blind_schedule()
         except ValueError as e:
             messagebox.showerror("Configurazione non valida", str(e))
             return
 
-        self.app.start_session(config, human_seats, bot_keys, hands, seed, self.step_mode_var.get())
+        self.app.start_session(
+            config, human_seats, bot_keys, hands, seed, self.step_mode_var.get(), blind_schedule
+        )
+
+    def _blind_schedule(self) -> BlindSchedule | None:
+        """The blinds' increase from the two fields, or None when the first is empty.
+
+        The factor is accepted with a comma (1,2) as well as a dot, as it is written here."""
+        every_text = self.blind_every_var.get().strip()
+        if not every_text:
+            return None
+        every = int(every_text)
+        factor = float(self.blind_factor_var.get().strip().replace(",", "."))
+        return BlindSchedule(every=every, factor=factor)
 
 
 class TableFrame(ttk.Frame):
@@ -530,6 +582,8 @@ class TableFrame(ttk.Frame):
         step_gate: queue.Queue[None],
         step_mode_state: dict[str, bool],
         big_blind: int = 2,
+        advisors: dict[int, Callable[[Observation, list[LegalAction]], list[float] | None]] | None = None,
+        next_hand_gate: queue.Queue[None] | None = None,
     ) -> None:
         super().__init__(master, padding=12)
         self.app = master
@@ -537,12 +591,20 @@ class TableFrame(ttk.Frame):
         self.human_player = human_player
         self.seat_names = seat_names
         self.step_gate = step_gate
+        self.next_hand_gate = next_hand_gate if next_hand_gate is not None else queue.Queue()
         self.step_mode_state = step_mode_state
         self.big_blind = big_blind
+        # seat -> what gives the probability of each action bin in a decision, for the seats a
+        # model plays (a human has none).
+        self.advisors = advisors or {}
+        self._last_view: tuple | None = None
+        self.step_mode_state.setdefault("spy", False)
         self._all_hole_cards: dict[int, tuple] = {}
         self._last_observation: Observation | None = None
         self._busted_seats: set[int] = set()
-        self._pending_clear: str | None = None
+        # The hand that just ended, still on the table until the next one starts.
+        self._last_result: HandResult | None = None
+        self.next_hand_button: ttk.Button | None = None
         # Per build_players' convention, a human always sits at seat 0.
         self._human_seat: int | None = 0 if human_player is not None else None
         self._seat_background = self._configure_seat_styles()
@@ -584,9 +646,10 @@ class TableFrame(ttk.Frame):
             name_var = tk.StringVar(value="-")
             stack_var = tk.StringVar(value="-")
             bet_var = tk.StringVar(value="")
+            last_action_var = tk.StringVar(value="")
             status_var = tk.StringVar(value="")
             labels = []
-            for var in (name_var, stack_var, bet_var, status_var):
+            for var in (name_var, stack_var, bet_var, last_action_var, status_var):
                 label = ttk.Label(box, textvariable=var, width=16, style="Seat.TLabel")
                 label.pack(anchor="w")
                 labels.append(label)
@@ -602,12 +665,22 @@ class TableFrame(ttk.Frame):
                 "name": name_var,
                 "stack": stack_var,
                 "bet": bet_var,
+                "last_action": last_action_var,
                 "status": status_var,
                 "cards": back_canvases,
                 "labels": labels,
                 "cards_frame": cards_frame,
                 "is_dealer": False,
+                "is_turn": False,
+                "is_folded": False,
             }
+
+        self.probability_frame = ttk.LabelFrame(self, text="Probabilita' delle azioni del bot di turno")
+        self.probability_frame.pack(fill="x", pady=(0, 6))
+        self.probability_hint = tk.StringVar(value=PROBABILITY_HINT)
+        ttk.Label(self.probability_frame, textvariable=self.probability_hint).pack(anchor="w")
+        self.probability_rows = ttk.Frame(self.probability_frame)
+        self.probability_rows.pack(fill="x")
 
         hole_frame = ttk.Frame(self)
         hole_frame.pack(anchor="w")
@@ -639,7 +712,7 @@ class TableFrame(ttk.Frame):
         self.after(100, self._poll_events)
 
     def _configure_seat_styles(self) -> str:
-        """Two parallel sets of ttk styles, "Seat.*" and "Dealer.*", so a
+        """Three parallel sets of ttk styles, "Seat.*", "Dealer.*" and "Turn.*", so a
         seat's whole box can be tinted by swapping styles rather than by
         recolouring each widget by hand.
 
@@ -654,12 +727,36 @@ class TableFrame(ttk.Frame):
         """
         style = ttk.Style(self)
         background = style.lookup("TLabelframe", "background") or style.lookup("TFrame", "background")
-        for prefix, colour in (("Seat", background), ("Dealer", DEALER_BACKGROUND)):
+        for prefix, colour in (
+            ("Seat", background),
+            ("Dealer", DEALER_BACKGROUND),
+            ("Turn", TURN_BACKGROUND),
+            ("Folded", FOLDED_BACKGROUND),
+        ):
             style.configure(f"{prefix}.TLabelframe", background=colour)
             style.configure(f"{prefix}.TLabelframe.Label", background=colour)
             style.configure(f"{prefix}.TLabel", background=colour)
             style.configure(f"{prefix}.TFrame", background=colour)
+        style.configure("Folded.TLabel", foreground=FOLDED_FOREGROUND)
+        style.configure("Folded.TLabelframe.Label", foreground=FOLDED_FOREGROUND)
         return background
+
+    def _apply_tint(self, widgets: dict) -> None:
+        """Paint a seat's whole box: green when it is the seat's turn, dark grey if it has
+        folded, else yellow if it is the dealer, else the ordinary background. The turn and the
+        fold win over the dealer -- the "D" above the box still says who has the button."""
+        prefix = (
+            "Turn" if widgets["is_turn"] else "Folded" if widgets["is_folded"] else "Dealer" if widgets["is_dealer"] else "Seat"
+        )
+        colour = {"Turn": TURN_BACKGROUND, "Dealer": DEALER_BACKGROUND, "Folded": FOLDED_BACKGROUND}.get(
+            prefix, self._seat_background
+        )
+        widgets["frame"].configure(style=f"{prefix}.TLabelframe")
+        widgets["cards_frame"].configure(style=f"{prefix}.TFrame")
+        for label in widgets["labels"]:
+            label.configure(style=f"{prefix}.TLabel")
+        for canvas in widgets["cards"]:
+            canvas.configure(background=colour)
 
     def _set_dealer_seat(self, dealer_seat: int | None) -> None:
         """Tint the dealer's entire seat box and un-tint everyone else's."""
@@ -668,14 +765,62 @@ class TableFrame(ttk.Frame):
             if widgets["is_dealer"] == is_dealer:
                 continue
             widgets["is_dealer"] = is_dealer
-            prefix = "Dealer" if is_dealer else "Seat"
-            colour = DEALER_BACKGROUND if is_dealer else self._seat_background
-            widgets["frame"].configure(style=f"{prefix}.TLabelframe")
-            widgets["cards_frame"].configure(style=f"{prefix}.TFrame")
-            for label in widgets["labels"]:
-                label.configure(style=f"{prefix}.TLabel")
-            for canvas in widgets["cards"]:
-                canvas.configure(background=colour)
+            self._apply_tint(widgets)
+
+    def _set_folded(self, seat: int, is_folded: bool) -> None:
+        widgets = self.seat_widgets[seat]
+        if widgets["is_folded"] != is_folded:
+            widgets["is_folded"] = is_folded
+            self._apply_tint(widgets)
+
+    def _set_turn_seat(self, turn_seat: int | None) -> None:
+        """Paint the seat whose turn it is green and clear everyone else's (None: nobody's)."""
+        for seat, widgets in self.seat_widgets.items():
+            is_turn = seat == turn_seat
+            if widgets["is_turn"] == is_turn:
+                continue
+            widgets["is_turn"] = is_turn
+            self._apply_tint(widgets)
+
+    def _show_probabilities(self, view: tuple | None) -> None:
+        """The probability of each legal action for the bot about to act (`view` is its
+        decision, `(observation, legal actions)`, as the engine announced it), while the game
+        is held in step mode with the opponents' cards shown; otherwise a hint."""
+        self._last_view = view
+        for widget in self.probability_rows.winfo_children():
+            widget.destroy()
+        if not (self.step_mode_state["on"] and self.step_mode_state.get("spy")):
+            self.probability_hint.set(PROBABILITY_HINT)
+            return
+        if view is None:
+            self.probability_hint.set("Nessun bot deve agire ora.")
+            return
+        observation, legal_actions = view
+        name = self.seat_names.get(observation.my_seat, f"seat {observation.my_seat}")
+        advisor = self.advisors.get(observation.my_seat)
+        probabilities = advisor(observation, legal_actions) if advisor is not None else None
+        if probabilities is None:
+            self.probability_hint.set(f"Tocca a {name}: non e' un bot, nessuna probabilita'.")
+            return
+        cards = " ".join(str(card) for card in observation.hole_cards)
+        self.probability_hint.set(f"Tocca a {name}  [{cards}]")
+        mask = legal_action_mask(observation, legal_actions)
+        labels = bin_labels()
+        best = max((p, i) for i, p in enumerate(probabilities) if mask[i])[1]
+        for index, legal in enumerate(mask):
+            if not legal:
+                continue
+            action = action_index_to_action(index, observation, legal_actions)
+            amount = f" -> {action.amount}" if action.action_type in (ActionType.BET, ActionType.RAISE) else ""
+            row = ttk.Frame(self.probability_rows)
+            row.pack(fill="x")
+            text = labels[index] + amount
+            ttk.Label(row, text=text, width=22, font=("TkDefaultFont", 9, "bold" if index == best else "normal")).pack(
+                side="left"
+            )
+            bar = ttk.Progressbar(row, maximum=100.0, value=100.0 * probabilities[index], length=220)
+            bar.pack(side="left", padx=4)
+            ttk.Label(row, text=f"{100.0 * probabilities[index]:5.1f}%").pack(side="left")
 
     def _log(self, text: str) -> None:
         self.log.configure(state="normal")
@@ -686,6 +831,8 @@ class TableFrame(ttk.Frame):
     def _log_hand_start(self, info: dict) -> None:
         sb_name = self.seat_names.get(info["sb_seat"], f"seat {info['sb_seat']}")
         bb_name = self.seat_names.get(info["bb_seat"], f"seat {info['bb_seat']}")
+        if self.big_blind != info["big_blind"]:
+            self._log(f"*** I bui salgono: {info['small_blind']}/{info['big_blind']} (big blind prima: {self.big_blind}) ***")
         self._log(
             f"=== {info['hand_id']} ===\n"
             f"  {sb_name} posta small blind {info['small_blind']}\n"
@@ -696,12 +843,15 @@ class TableFrame(ttk.Frame):
         self._log(f"[{record.street.value.upper()}] {name}: {_describe_action(record)}")
 
     def _on_spy_toggled(self) -> None:
+        self.step_mode_state["spy"] = self.spy_var.get()
+        self._show_probabilities(self._last_view)
         if self._last_observation is not None:
             for seat_info in self._last_observation.seats:
                 self._draw_seat_cards(seat_info, is_me=(seat_info.seat == self._human_seat))
 
     def _on_step_mode_toggled(self) -> None:
         self.step_mode_state["on"] = self.step_mode_var.get()
+        self._show_probabilities(self._last_view)
         if self.step_mode_state["on"]:
             # Drain any stale release left over from turning step mode off
             # below, so re-enabling it doesn't silently skip the very next pause.
@@ -730,33 +880,70 @@ class TableFrame(ttk.Frame):
 
     def _handle_event(self, event: GuiEvent) -> None:
         if event.kind == "hand_started":
-            self._cancel_pending_clear()
+            if self._last_result is not None:
+                self._clear_table(self._last_result)
+                self._last_result = None
             self._all_hole_cards = event.payload["hole_cards"]
             self._last_observation = None
             self._reset_seats_for_new_hand(self._all_hole_cards.keys())
             self._set_dealer_seat(event.payload["button_seat"])
             self._log_hand_start(event.payload)
+            self._set_turn_seat(event.payload.get("first_actor"))
+            self._show_probabilities(event.payload.get("first_actor_view"))
+            # The blinds may have gone up since the last hand: the wheel's step is in big blinds.
+            self.big_blind = event.payload["big_blind"]
         elif event.kind == "your_turn":
             observation, legal_actions = event.payload
             self.waiting_var.set("")
+            self._set_turn_seat(observation.my_seat)
+            self._show_probabilities(None)
             self._render_observation(observation)
             self._render_actions(observation, legal_actions)
         elif event.kind == "action_taken":
             info = event.payload
             self._render_observation(info["observation"])
             self._log_action(info["name"], info["record"])
+            # Who is asked next, known before they are: the pause that follows this action
+            # then holds the finished action *and* the player about to answer it.
+            self._set_turn_seat(info.get("next_seat"))
+            self._show_probabilities(info.get("next_view"))
         elif event.kind == "street_dealt":
             self._render_street_dealt(event.payload)
+            self._set_turn_seat(event.payload.get("first_actor"))
+            self._show_probabilities(event.payload.get("first_actor_view"))
         elif event.kind == "hand_complete":
+            self._set_turn_seat(None)
+            self._show_probabilities(None)
             self._log(_format_hand_summary(event.payload))
             self._reveal_hand_end(event.payload)
-            self.waiting_var.set("I bot stanno giocando..." if self.human_player else "Modalita' spettatore.")
+            self._last_result = event.payload
+        elif event.kind == "awaiting_next_hand":
+            self._show_next_hand_button()
         elif event.kind == "session_ended_early":
             self._log(f"Sessione terminata dopo {event.payload} mani: meno di 2 giocatori con chip.")
             self._session_over()
         elif event.kind == "session_complete":
             self._log("Sessione completata.")
             self._session_over()
+
+    def _show_waiting(self) -> None:
+        for widget in self.actions_frame.winfo_children():
+            widget.destroy()
+        self.next_hand_button = None
+        self.waiting_var.set("I bot stanno giocando..." if self.human_player else "Modalita' spettatore.")
+        ttk.Label(self.actions_frame, textvariable=self.waiting_var).pack(side="left")
+
+    def _show_next_hand_button(self) -> None:
+        """The hand is over and stays on the table: the next one starts only on this button."""
+        for widget in self.actions_frame.winfo_children():
+            widget.destroy()
+        ttk.Label(self.actions_frame, text="Mano finita.").pack(side="left", padx=(0, 8))
+        self.next_hand_button = ttk.Button(self.actions_frame, text="Mano successiva", command=self._on_next_hand)
+        self.next_hand_button.pack(side="left", padx=4)
+
+    def _on_next_hand(self) -> None:
+        self.next_hand_gate.put(None)
+        self._show_waiting()
 
     def _session_over(self) -> None:
         self.waiting_var.set("Sessione finita.")
@@ -788,10 +975,12 @@ class TableFrame(ttk.Frame):
             if seat not in participants:
                 self._hide_seat(seat)
                 continue
+            self._set_folded(seat, False)
             widgets["dealer"].set("")
             widgets["name"].set(self.seat_names.get(seat, f"seat {seat}"))
             widgets["stack"].set("-")
             widgets["bet"].set("")
+            widgets["last_action"].set("")
             widgets["status"].set("")
             if seat == self._human_seat:
                 for canvas in widgets["cards"]:
@@ -840,6 +1029,7 @@ class TableFrame(ttk.Frame):
         for seat in self.seat_widgets:
             if seat not in present_seats:
                 self._hide_seat(seat)
+        last_actions = _last_actions(observation)
         for seat_info in observation.seats:
             widgets = self.seat_widgets[seat_info.seat]
             widgets["dealer"].set("D" if seat_info.is_button else "")
@@ -852,7 +1042,9 @@ class TableFrame(ttk.Frame):
             widgets["name"].set(seat_info.name + (" (tu)" if is_me else ""))
             widgets["stack"].set(f"Stack: {seat_info.stack}")
             widgets["bet"].set(f"Bet: {seat_info.current_bet}")
+            widgets["last_action"].set(last_actions.get(seat_info.seat, ""))
             widgets["status"].set(_STATUS_LABELS.get(seat_info.status, ""))
+            self._set_folded(seat_info.seat, seat_info.status == PlayerStatus.FOLDED)
             self._draw_seat_cards(seat_info, is_me=is_me)
 
     def _render_street_dealt(self, info: dict) -> None:
@@ -870,6 +1062,9 @@ class TableFrame(ttk.Frame):
         """
         self.street_var.set(info["street"].value.upper())
         self._draw_board(info["community_cards"])
+        # Nobody has acted on the new street yet: the last actions shown were the old one's.
+        for widgets in self.seat_widgets.values():
+            widgets["last_action"].set("")
         if info["betting_closed"]:
             self.waiting_var.set("All-in: si va a vedere il board...")
             self._reveal_live_hole_cards()
@@ -908,13 +1103,13 @@ class TableFrame(ttk.Frame):
                 draw_card_face(canvas, card)
 
     def _reveal_hand_end(self, result: HandResult) -> None:
-        """Everyone's cards face-up on the finished board, held for
-        SHOWDOWN_REVEAL_SECONDS before the table is cleared.
+        """Everyone's cards face-up on the finished board, held until the
+        next hand starts (`_clear_table`).
 
         Nothing is hidden yet, not even a seat that just busted: a player
         who went all-in and lost is precisely the one whose cards are worth
         seeing, and hiding the seat here would delete them the instant they
-        became showable. _clear_after_showdown does the hiding.
+        became showable. _clear_table does the hiding.
         """
         hh = result.hand_history
         self._draw_board(hh.community_cards)
@@ -937,26 +1132,11 @@ class TableFrame(ttk.Frame):
         if own:
             for canvas, card in zip(self.hole_canvases, own):
                 draw_card_face(canvas, card)
-        self._cancel_pending_clear()
-        self._pending_clear = self.after(
-            int(SHOWDOWN_REVEAL_SECONDS * 1000), lambda: self._clear_after_showdown(result)
-        )
 
-    def _cancel_pending_clear(self) -> None:
-        if self._pending_clear is not None:
-            self.after_cancel(self._pending_clear)
-            self._pending_clear = None
-
-    def _clear_after_showdown(self, result: HandResult) -> None:
-        """Runs SHOWDOWN_REVEAL_SECONDS after a hand ends. Guarded because
-        it is a timer callback: leaving the table for the menu destroys
-        this frame while the timer is still armed."""
-        self._pending_clear = None
-        try:
-            if not self.winfo_exists():
-                return
-        except tk.TclError:
-            return
+    def _clear_table(self, result: HandResult) -> None:
+        """Runs when the next hand starts: empties the cards and hides the seats that busted."""
+        self.street_var.set("")
+        self.pot_var.set("Pot: 0")
         for widgets in self.seat_widgets.values():
             for canvas in widgets["cards"]:
                 draw_empty_slot(canvas)
@@ -1109,11 +1289,13 @@ class PokerGuiApp(tk.Tk):
         hands: int,
         seed: int | None,
         step_mode: bool = False,
+        blind_schedule: BlindSchedule | None = None,
     ) -> None:
         rng = random.Random(seed)
         event_queue: queue.Queue[GuiEvent] = queue.Queue()
         step_gate: queue.Queue[None] = queue.Queue()
-        step_mode_state: dict[str, bool] = {"on": step_mode}
+        next_hand_gate: queue.Queue[None] = queue.Queue()
+        step_mode_state: dict[str, bool] = {"on": step_mode, "spy": False}
         holder: dict[str, GuiPlayer] = {}
 
         def human_factory(player_id: str, name: str) -> GuiPlayer:
@@ -1143,6 +1325,7 @@ class PokerGuiApp(tk.Tk):
 
         def on_hand_started(info: dict) -> None:
             event_queue.put(GuiEvent("hand_started", info))
+            wait_for_first_bot(info, human_seat, step_mode_state, step_gate)
 
         def on_street_dealt(info: dict) -> None:
             # Both sleeps run on the session thread, deliberately: pacing
@@ -1154,6 +1337,7 @@ class PokerGuiApp(tk.Tk):
             # the street's first action land in the same poll.
             event_queue.put(GuiEvent("street_dealt", info))
             time.sleep(ALL_IN_STREET_DELAY_SECONDS if info["betting_closed"] else NEW_STREET_DELAY_SECONDS)
+            wait_for_first_bot(info, human_seat, step_mode_state, step_gate)
 
         table = Table(
             config,
@@ -1163,6 +1347,13 @@ class PokerGuiApp(tk.Tk):
             on_hand_started=on_hand_started,
             on_street_dealt=on_street_dealt,
             on_action_applied=ActionReporter(event_queue, step_gate, step_mode_state, human_seat),
+            # The models read their opponents' statistics (VPIP, PFR...), as at every table
+            # they were trained and rated on: a fresh tracker for the session, which also
+            # follows the human. Without one every opponent is "unknown" all session, which
+            # is how a model sees only a table's first hand and plays tighter and more
+            # passively than it is measured to.
+            stats_tracker=StatsTracker(),
+            blind_schedule=blind_schedule,
         )
 
         table_frame = TableFrame(
@@ -1175,10 +1366,16 @@ class PokerGuiApp(tk.Tk):
             step_gate,
             step_mode_state,
             big_blind=config.big_blind,
+            advisors={
+                seat: player.action_probabilities
+                for seat, player in enumerate(players)
+                if isinstance(player, RLAgentPlayer)
+            },
+            next_hand_gate=next_hand_gate,
         )
         self._show_frame(table_frame)
 
-        thread = threading.Thread(target=_run_session, args=(table, hands, event_queue, writer), daemon=True)
+        thread = threading.Thread(target=_run_session, args=(table, hands, event_queue, writer, next_hand_gate), daemon=True)
         thread.start()
 
 

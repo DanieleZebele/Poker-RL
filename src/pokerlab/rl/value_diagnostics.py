@@ -1,4 +1,4 @@
-"""Is the critic's target balanced across table sizes and stack depths?
+"""Is the critic's target balanced across table sizes and stack depths, and where does it learn?
 
 The reward is one constant for every hand (`SelfPlayCollector.reward_scale`), but
 what a hand can win or lose is bounded by the stacks, so the spread of the value
@@ -16,6 +16,12 @@ negative is worse). Groups are by table size (2-9) and by effective stack
 (`STACK_EDGES_BB`). The spread across groups is the largest target sd over the
 smallest; around 2x or more is the threshold the TODO sets for needing a scale per
 group (or PopArt).
+
+**By street, too** (`STREET_LABELS`, read off the one-hot that follows the card planes in
+the features). Not about the scale: it separates what the critic cannot know from what it
+fails to learn. On the river it is given every player's exact equity and only the betting
+is still to come, so a working critic explains much of the target there; on the preflop
+most of the target is the cards still to be dealt, and a low explained variance is normal.
 
 **What it is not.** The values are the ones the policy saw while *collecting*, so
 this describes the critic that acted, before the update that follows. Every
@@ -42,6 +48,7 @@ if TYPE_CHECKING:
 # mostly push-or-fold; 30 bb is where postflop play starts to have room.
 STACK_EDGES_BB = (10.0, 30.0)
 STACK_LABELS = ("<10", "10-30", "30+")
+STREET_LABELS = ("preflop", "flop", "turn", "river")
 # A group with fewer decisions than this has too noisy a standard deviation to be
 # compared with the others (it is shown, but left out of the spread).
 MIN_DECISIONS = 100
@@ -65,6 +72,7 @@ class GroupStats:
 class ValueDiagnostics:
     by_size: dict[int, GroupStats]
     by_stack: dict[str, GroupStats]
+    by_street: dict[str, GroupStats]
 
     @staticmethod
     def spread(groups: Iterable[GroupStats]) -> float | None:
@@ -84,6 +92,10 @@ class ValueDiagnostics:
     @property
     def stack_spread(self) -> float | None:
         return self.spread(self.by_stack.values())
+
+    @property
+    def street_spread(self) -> float | None:
+        return self.spread(self.by_street.values())
 
 
 class _Accumulator:
@@ -113,19 +125,32 @@ class _Accumulator:
         return GroupStats(self.n, math.sqrt(variance), 1.0 - error_variance / variance)
 
 
+def street_label(features: list[float]) -> str:
+    """The street of a decision, from the one-hot right after the card planes."""
+    # Here and not at the top: the monitor and the dashboard import this module for its
+    # parser alone and have no use for the encoder.
+    from pokerlab.rl.features import CARDS_DIM, STREET_DIM
+
+    one_hot = features[CARDS_DIM : CARDS_DIM + STREET_DIM]
+    return STREET_LABELS[max(range(STREET_DIM), key=one_hot.__getitem__)]
+
+
 def value_diagnostics(trajectories: Iterable[HandTrajectory]) -> ValueDiagnostics:
-    """Group every decision's `(value, return)` by table size and effective stack."""
+    """Group every decision's `(value, return)` by table size, effective stack and street."""
     sizes: dict[int, _Accumulator] = {}
     stacks: dict[str, _Accumulator] = {}
+    streets: dict[str, _Accumulator] = {}
     for trajectory in trajectories:
         size_group = sizes.setdefault(trajectory.num_players, _Accumulator())
         stack_group = stacks.setdefault(stack_label(trajectory.effective_stack_bb), _Accumulator())
         for decision, target in zip(trajectory.decisions, trajectory.returns):
             size_group.add(decision.value, target)
             stack_group.add(decision.value, target)
+            streets.setdefault(street_label(decision.features), _Accumulator()).add(decision.value, target)
     return ValueDiagnostics(
         by_size={size: group.stats() for size, group in sorted(sizes.items())},
         by_stack={label: stacks[label].stats() for label in STACK_LABELS if label in stacks},
+        by_street={label: streets[label].stats() for label in STREET_LABELS if label in streets},
     )
 
 
@@ -139,13 +164,15 @@ def _spread_text(spread: float | None) -> str:
 
 
 def format_value_diagnostics(diagnostics: ValueDiagnostics) -> list[str]:
-    """Two lines, both starting with `valore` so nothing that parses the `iter`
+    """Three lines, all starting with `valore` so nothing that parses the `iter`
     lines of a worker's log can mistake them for one."""
     sizes = " | ".join(_cell(str(size), group) for size, group in diagnostics.by_size.items())
     stacks = " | ".join(_cell(label, group) for label, group in diagnostics.by_stack.items())
+    streets = " | ".join(_cell(label, group) for label, group in diagnostics.by_street.items())
     return [
         f"valore per tavolo: {sizes}  (spread {_spread_text(diagnostics.size_spread)})",
         f"valore per stack (bb): {stacks}  (spread {_spread_text(diagnostics.stack_spread)})",
+        f"valore per strada: {streets}  (spread {_spread_text(diagnostics.street_spread)})",
     ]
 
 
@@ -157,14 +184,17 @@ def format_value_diagnostics(diagnostics: ValueDiagnostics) -> list[str]:
 
 SIZE_KIND = "size"
 STACK_KIND = "stack"
-_KINDS = {"tavolo": SIZE_KIND, "stack (bb)": STACK_KIND}
-_LINE = re.compile(r"^valore per (tavolo|stack \(bb\)): (.*?)\s+\(spread (-|\d+(?:\.\d+)?)x?\)\s*$")
+STREET_KIND = "street"
+_KINDS = {"tavolo": SIZE_KIND, "stack (bb)": STACK_KIND, "strada": STREET_KIND}
+_LINE = re.compile(
+    r"^valore per (tavolo|stack \(bb\)|strada): (.*?)\s+\(spread (-|\d+(?:\.\d+)?)x?\)\s*$"
+)
 _CELL = re.compile(r"^(\S+) sd (\d+(?:\.\d+)?) ev (n/a|[+-]\d+(?:\.\d+)?) n (\d+)$")
 
 
 @dataclass(frozen=True)
 class ParsedValueLine:
-    kind: str  # SIZE_KIND or STACK_KIND
+    kind: str  # SIZE_KIND, STACK_KIND or STREET_KIND
     groups: dict[str, GroupStats]
     spread: float | None
 

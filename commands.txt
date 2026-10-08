@@ -22,7 +22,7 @@ OMP_NUM_THREADS=1 .venv/bin/poker-dashboard --host 0.0.0.0 --iterations 1000
 
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
-cd /mnt/shared_volume/POKER/Poker-RL
+cd /mnt/shared_volume/POKER/Poker-RL-v2
 DISPLAY=:1 .venv/bin/poker-gui
 
 # da Windows (PowerShell):
@@ -40,7 +40,7 @@ cd C:\Users\zeppo\Desktop\POKER
 
 cd /mnt/shared_volume/POKER/Poker-RL
 OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1 .venv/bin/python -m pokerlab.rl.benchmark_arena \
-    --workers 10 \
+    --workers 30 \
     2>&1 | tee checkpoints/logs/arena-$(date +%Y%m%d-%H%M%S).log
 
 # solo snapshot, senza rigiocare:
@@ -63,13 +63,34 @@ OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1 .venv/bin/poker-elo \
 # benchmark_arena e poker-dashboard: poker-<cli> --print-config mostra cosa risolve
 
 
+# ── COME GIOCA UN AGENTE (contro se stesso: preflop per mano, bluff, slowplay, esempi) ──
+# --model: etichetta, percorso o #N; --players 6 --stack-bb 100 per un tavolo fisso;
+# --save mani.jsonl e poi --load mani.jsonl per rileggere il report senza rigiocare;
+# --by giocatori (o stack) aggiunge il report completo per ogni gruppo
+cd /mnt/shared_volume/POKER/Poker-RL-v2
+OMP_NUM_THREADS=1 PYTHONPATH=src:studies/agents .venv/bin/python studies/agents/agent_study.py \
+    --model '#1' --hands 20000 --jobs 10
+
+
+# ── L'HUD DEGLI AVVERSARI CAMBIA LE SUE AZIONI? (stessi stati, cambia solo l'HUD) ──
+cd /mnt/shared_volume/POKER/Poker-RL-v2
+OMP_NUM_THREADS=1 PYTHONPATH=src:studies/agents .venv/bin/python studies/agents/hud_study.py \
+    --model '#1' --decisions 20000 --jobs 16
+
+
+# ── CONTRO ARCHETIPI VERI (il modello con una spinta sui logit): legge l'HUD? gli conviene? ──
+cd /mnt/shared_volume/POKER/Poker-RL-v2
+OMP_NUM_THREADS=1 PYTHONPATH=src:studies/agents .venv/bin/python studies/agents/archetype_study.py \
+    --model '#1' --strength 2 --hands 60000 --jobs 16    # --archetypes nit maniaco "calling station"
+
+
 # ── QUANTE MANI SERVONO PER SAPERE CHI E' PIU' FORTE ──────────────────────────
 cd /mnt/shared_volume/POKER/Poker-RL
-OMP_NUM_THREADS=1 .venv/bin/python -m pokerlab.rl.duel_power \
+OMP_NUM_THREADS=1 PYTHONPATH=src:studies/agents .venv/bin/python studies/agents/duel_power.py \
     --model-a '#1' --model-b '#100' --streams 16 --hands 10000 --jobs 6 \
     --save /tmp/duel.json
 # rianalizza senza rigiocare, ad altre lunghezze di partita:
-.venv/bin/python -m pokerlab.rl.duel_power --load /tmp/duel.json --lengths 100,1000,50000
+PYTHONPATH=src:studies/agents .venv/bin/python studies/agents/duel_power.py --load /tmp/duel.json --lengths 100,1000,50000
 #   --mode field   un seggio a testa e 4 riempitivi, come una passata di popolazione
 
 
@@ -87,7 +108,7 @@ OMP_NUM_THREADS=1 .venv/bin/python -m pytest -q
 # riprende da solo se rilanciato con lo stesso --out; --max-models N per un assaggio;
 # il CSV si riscrive ogni --csv-every secondi (300 = 5 minuti)
 cd /mnt/shared_volume/POKER/Poker-RL
-OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1 .venv/bin/python -m pokerlab.rl.elo_bb_grid \
+OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1 PYTHONPATH=src:studies/agents .venv/bin/python studies/agents/elo_bb_grid.py \
     --hands 10000 --jobs 20 --csv checkpoints/studies/elo_bb_grid.csv --csv-every 300 \
     2>&1 | tee checkpoints/logs/elo-bb-grid-$(date +%Y%m%d-%H%M%S).log
 
@@ -96,3 +117,19 @@ OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1 .venv/bin/python -m pokerlab.rl.elo_bb_grid
 cd /mnt/shared_volume/POKER/Poker-RL
 .venv/bin/python -m pokerlab.rl.push_top_models --dry-run
 .venv/bin/python -m pokerlab.rl.push_top_models
+
+
+
+
+# EQUITY CALCULATION 
+PYTHONPATH=src:studies/equity_net python studies/equity_net/train.py 2>&1 | tee studies/equity_net/runs/train.log
+
+distillation:
+PYTHONUNBUFFERED=1 OMP_NUM_THREADS=1 PYTHONPATH=src:studies/equity_net   .venv/bin/python studies/equity_net/distill.py   --teacher studies/equity_net/runs/attn-l-lat512_h512_b4_l4_h8.pt   --out studies/equity_net/runs/distill-lat32_h256_h1_l2_b2.pt --steps 500000 --resume
+
+analysis:
+PYTHONPATH=src:studies/equity_net .venv/bin/python studies/equity_net/analyze.py \
+  --model studies/equity_net/runs/attn-l-lat256.pt
+
+PYTHONPATH=src:studies/equity_net .venv/bin/python studies/equity_net/analyze.py \
+  --model studies/equity_net/runs/distill-lat64_h128_h16.pt 

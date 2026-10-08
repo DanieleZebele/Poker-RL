@@ -3,15 +3,18 @@ from __future__ import annotations
 import random
 
 import pytest
+from support import fake_collector
 
 from pokerlab.players.rl_agent import DecisionRecord, PolicyDecision
-from pokerlab.rl.rollout import HandTrajectory, SelfPlayCollector
+from pokerlab.rl.features import CARDS_DIM, OBS_DIM
+from pokerlab.rl.rollout import HandTrajectory
 from pokerlab.rl.table_mix import TableMix
 from pokerlab.rl.value_diagnostics import (
     MIN_DECISIONS,
     SIZE_KIND,
     STACK_KIND,
     STACK_LABELS,
+    STREET_KIND,
     GroupStats,
     ValueDiagnostics,
     format_value_diagnostics,
@@ -21,14 +24,28 @@ from pokerlab.rl.value_diagnostics import (
 )
 
 
+def features_at(street: int) -> list[float]:
+    """An observation whose only nonzero feature is the street's one-hot."""
+    features = [0.0] * OBS_DIM
+    features[CARDS_DIM + street] = 1.0
+    return features
+
+
 def trajectory(
-    values: list[float], returns: list[float], *, num_players: int = 6, effective_bb: float = 50.0
+    values: list[float],
+    returns: list[float],
+    *,
+    num_players: int = 6,
+    effective_bb: float = 50.0,
+    streets: list[int] | None = None,
 ) -> HandTrajectory:
+    streets = streets if streets is not None else [0] * len(values)
     decisions = [
         DecisionRecord(
-            player_id="p0", seat=0, features=[], legal_mask=[], action_index=0, log_prob=0.0, value=v
+            player_id="p0", seat=0, features=features_at(street), legal_mask=[], action_index=0,
+            log_prob=0.0, value=v, stake_bb=50.0,
         )
-        for v in values
+        for v, street in zip(values, streets, strict=True)
     ]
     t = HandTrajectory(
         seat=0,
@@ -57,6 +74,17 @@ def test_decisions_are_grouped_by_table_size_and_by_stack():
     d = value_diagnostics(trajectories)
     assert {size: g.decisions for size, g in d.by_size.items()} == {2: 3, 9: 1}
     assert {label: g.decisions for label, g in d.by_stack.items()} == {"<10": 2, "30+": 2}
+
+
+def test_decisions_are_grouped_by_the_street_they_were_taken_on():
+    """One hand spans streets, so the street is the decision's, read off its features."""
+    d = value_diagnostics([
+        trajectory([0.0, 0.0, 0.0], [1.0, 2.0, 3.0], streets=[0, 1, 3]),
+        trajectory([0.0, 0.0], [4.0, 6.0], streets=[0, 3]),
+    ])
+    assert list(d.by_street) == ["preflop", "flop", "river"]  # in street order, no empty turn
+    assert {label: g.decisions for label, g in d.by_street.items()} == {"preflop": 2, "flop": 1, "river": 2}
+    assert d.by_street["river"].target_sd == pytest.approx(1.5)
 
 
 def test_target_sd_is_the_population_sd_of_the_returns():
@@ -106,9 +134,9 @@ def test_spread_needs_two_groups_and_a_nonzero_minimum():
 def test_the_log_lines_start_with_valore_so_the_monitor_cannot_mistake_them_for_iter():
     d = value_diagnostics([trajectory([0.0, 0.0], [1.0, 2.0], num_players=3, effective_bb=5.0)])
     lines = format_value_diagnostics(d)
-    assert len(lines) == 2
+    assert len(lines) == 3
     assert all(line.startswith("valore ") for line in lines)
-    assert "3 sd" in lines[0] and "<10 sd" in lines[1]
+    assert "3 sd" in lines[0] and "<10 sd" in lines[1] and "preflop sd" in lines[2]
 
 
 def test_the_collector_records_the_effective_stack_of_every_hand():
@@ -119,7 +147,7 @@ def test_the_collector_records_the_effective_stack_of_every_hand():
     def policy(features, mask):
         return PolicyDecision(action_index=rng.choice([i for i, ok in enumerate(mask) if ok]))
 
-    trajectories = SelfPlayCollector(mix, policy, rng=random.Random(3)).collect(40)
+    trajectories = fake_collector(mix, policy, rng=random.Random(3)).collect(40)
     assert trajectories
     for t in trajectories:
         assert t.num_players == 4
@@ -134,14 +162,19 @@ def test_what_the_worker_prints_is_what_the_monitor_reads_back():
     d = value_diagnostics(
         [
             trajectory([0.0] * 150, [1.0, 3.0] * 75, num_players=2, effective_bb=5.0),
-            trajectory([0.1] * 120, [2.0, 6.0] * 60, num_players=9, effective_bb=60.0),
+            trajectory([0.1] * 120, [2.0, 6.0] * 60, num_players=9, effective_bb=60.0, streets=[3] * 120),
             trajectory([0.0, 0.0], [2.0, 2.0], num_players=5, effective_bb=20.0),
         ]
     )
-    size_line, stack_line = format_value_diagnostics(d)
+    size_line, stack_line, street_line = format_value_diagnostics(d)
     size = parse_value_line(size_line)
     stack = parse_value_line(stack_line)
-    assert (size.kind, stack.kind) == (SIZE_KIND, STACK_KIND)
+    street = parse_value_line(street_line)
+    assert (size.kind, stack.kind, street.kind) == (SIZE_KIND, STACK_KIND, STREET_KIND)
+    assert set(street.groups) == {"preflop", "river"}
+    assert street.groups["river"].explained_variance == pytest.approx(
+        d.by_street["river"].explained_variance, abs=5e-3
+    )
     assert set(size.groups) == {"2", "5", "9"}
     assert set(stack.groups) == {"<10", "10-30", "30+"}
     for name, group in d.by_size.items():

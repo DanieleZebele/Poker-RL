@@ -57,6 +57,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from pokerlab.config import add_config_arguments, resolve_cli
+from pokerlab.rl.device import resolve_device
 from pokerlab.rl.global_arena import (
     DEFAULT_GLOBAL_DIR,
     Candidate,
@@ -75,7 +76,6 @@ from pokerlab.rl.global_store import (
 from pokerlab.rl.pool_registry import (
     DEFAULT_K_SCHEDULE,
     DEFAULT_RATING,
-    MODEL,
     PoolMember,
     format_k_schedule,
     k_for_games,
@@ -267,14 +267,20 @@ def write_ratings(
     machine: str,
     lock_ttl: float,
     on_skip=None,
+    games: bool = True,
 ) -> int:
     """Persist the new ratings, one member at a time under its own lock.
 
     One lock per member rather than all of them at once: `acquire_locks` is
     all-or-nothing, and asking for 150 at a time would fail whenever any single
     merge held any one of them. Each member is re-read inside its lock so that
-    whatever an ordinary pass changed meanwhile -- `games`, `ref` -- is kept,
-    and only `rating` is overwritten.
+    whatever an ordinary pass changed meanwhile -- `ref`, `style` -- is kept, and
+    only `rating` and `games` are overwritten: this is the one program that moves
+    either for an anchor (an ordinary pass seats an anchor as a fixed yardstick and
+    counts nothing for it, `PoolRegistry.record_session_with_ratings`), so the
+    games written are the ones this run started from plus the sessions it played.
+    `games=False` writes the ratings alone (what `--restore` puts back: a backup
+    records ratings, and the games an anchor has played stay played).
 
     A member that is not registered yet is created, frozen, exactly as a
     population pass would have bootstrapped it.
@@ -292,13 +298,15 @@ def write_ratings(
             if member is None:
                 member = PoolMember(
                     label=anchor.label,
-                    kind=MODEL,
                     ref=str(anchor.path),
                     rating=anchor.rating,
+                    games=anchor.games if games else 0,
                     frozen=True,
                 )
             else:
                 member.rating = anchor.rating
+                if games:
+                    member.games = anchor.games
                 member.frozen = True  # stays an anchor: nothing else may move it
             write_member(global_dir, member)
             written += 1
@@ -314,7 +322,7 @@ def restore(global_dir: Path, backup: Path, *, machine: str, lock_ttl: float) ->
         Anchor(label=label, path=Path(""), series="", start=rating, rating=rating)
         for label, rating in saved.items()
     ]
-    return write_ratings(global_dir, anchors, machine=machine, lock_ttl=lock_ttl)
+    return write_ratings(global_dir, anchors, machine=machine, lock_ttl=lock_ttl, games=False)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -352,7 +360,9 @@ def build_parser() -> argparse.ArgumentParser:
         "core count. Shards are launched with OMP_NUM_THREADS=1",
     )
     add_table_arguments(parser)
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--device", default="auto", help="cpu, cuda or auto (the default): the GPU if there is one"
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--dry-run", action="store_true",
                         help="play and report, write nothing")
@@ -466,7 +476,7 @@ def main(argv: list[str] | None = None) -> int:
                 mix,
                 sessions=batch,
                 session_hands=args.session_hands,
-                device=args.device,
+                device=resolve_device(args.device),
                 rng=rng,
                 workers=min(args.workers, batch),
                 on_skip=lambda path, why: print(f"  shard saltato {path}: {why}"),
@@ -477,7 +487,7 @@ def main(argv: list[str] | None = None) -> int:
                 mix,
                 sessions=batch,
                 session_hands=args.session_hands,
-                device=args.device,
+                device=resolve_device(args.device),
                 seed=rng.randrange(2**31),
                 on_skip=lambda path, why: print(f"  saltato {path}: {why}"),
             )

@@ -3,10 +3,10 @@ from __future__ import annotations
 import random
 
 import pytest
-from support import fixed_mix, make_random_legal_bot
+from support import fake_collector, fixed_mix, make_random_legal_bot
 
 from pokerlab.players.rl_agent import PolicyDecision
-from pokerlab.rl.rollout import Opponent, OpponentPool, SelfPlayCollector
+from pokerlab.rl.rollout import Opponent, OpponentPool
 
 BIG_BLIND = 2
 STARTING_STACK = 200
@@ -21,7 +21,7 @@ def uniform_policy(rng: random.Random):
 
 
 def make_collector(pool: OpponentPool | None, opponent_probability: float = 1.0, seed: int = 5):
-    return SelfPlayCollector(
+    return fake_collector(
         CONFIG,
         uniform_policy(random.Random(seed)),
         rng=random.Random(seed),

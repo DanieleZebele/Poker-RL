@@ -47,7 +47,16 @@ def compute_pots(seats: list[PlayerState]) -> list[Pot]:
         contributors = [seat for seat, committed in contributions.items() if committed >= level]
         layer_total = per_player * len(contributors)
         eligible = frozenset(seat for seat in contributors if seat in non_folded)
-        if layer_total > 0 and eligible:
+        if layer_total > 0:
+            # Everyone who paid into a layer folded: nobody can win it. The betting never
+            # gets here (the last player with chips is not asked to act with nothing to
+            # call, `table._nobody_left_to_bet_against`), so this is a bug, and dropping the
+            # layer would silently break chip conservation.
+            if not eligible:
+                raise ValueError(
+                    f"a layer of {layer_total} chips was paid only by players who folded "
+                    f"(seats {sorted(contributors)}): nobody can win it"
+                )
             pots.append(Pot(amount=layer_total, eligible_seats=eligible))
         prev_level = level
     return pots

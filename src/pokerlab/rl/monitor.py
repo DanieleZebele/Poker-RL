@@ -20,6 +20,7 @@ from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from pokerlab.rl.grad_log import GradientReading, parse_gradient_line
 from pokerlab.rl.phases import (
     DONE,
     ELO_FILL,
@@ -36,7 +37,7 @@ from pokerlab.rl.phases import (
     parse_progress,
 )
 from pokerlab.rl.style_log import parse_style_line
-from pokerlab.rl.value_diagnostics import SIZE_KIND, STACK_KIND, parse_value_line
+from pokerlab.rl.value_diagnostics import SIZE_KIND, STACK_KIND, STREET_KIND, parse_value_line
 
 STATE_FILENAME = "loop_state.json"
 STOP_FILENAME = "STOP"
@@ -668,16 +669,30 @@ class WorkerHistory:
     clip: list[float] = field(default_factory=list)
     eval_bb100: list[list[float]] = field(default_factory=list)
     eval_rating: list[list[float]] = field(default_factory=list)
-    # The critic's target by table size and by effective stack (`rl/value_diagnostics`),
+    # The critic's target by table size, by effective stack and by street (`rl/value_diagnostics`),
     # one `[iteration, value]` pair per reading -- the first iteration and every
     # tenth -- like the two readings above, and for the same reason. The sd and
-    # explained variance are keyed by group (`"2"`..`"9"`, `"<10"`...), the spread
+    # explained variance are keyed by group (`"2"`..`"9"`, `"<10"`..., `"preflop"`...), the spread
     # is the widest sd over the narrowest. Empty for a log that predates the lines.
     value_sd_size: dict[str, list[list[float]]] = field(default_factory=dict)
     value_sd_stack: dict[str, list[list[float]]] = field(default_factory=dict)
     value_ev_stack: dict[str, list[list[float]]] = field(default_factory=dict)
+    value_sd_street: dict[str, list[list[float]]] = field(default_factory=dict)
+    value_ev_street: dict[str, list[list[float]]] = field(default_factory=dict)
     value_spread_size: list[list[float]] = field(default_factory=list)
     value_spread_stack: list[list[float]] = field(default_factory=list)
+    # The gradient-norm clips (`rl/grad_log.py`), one per network: the mean and sd of the
+    # norm before the cut and the share of steps cut, one `[iteration, value]` pair per
+    # kept iteration (thinned with the `iter` columns), and each threshold as of the
+    # latest reading. Empty, and None, for a log without the line.
+    grad_policy_mean: list[list[float]] = field(default_factory=list)
+    grad_policy_sd: list[list[float]] = field(default_factory=list)
+    grad_policy_clipped: list[list[float]] = field(default_factory=list)
+    grad_policy_threshold: float | None = None
+    grad_critic_mean: list[list[float]] = field(default_factory=list)
+    grad_critic_sd: list[list[float]] = field(default_factory=list)
+    grad_critic_clipped: list[list[float]] = field(default_factory=list)
+    grad_critic_threshold: float | None = None
     # How the model plays (`rl/style_log.py`): each statistic's rate over its recent
     # training hands, one `[iteration, rate]` pair per reading (the first iteration
     # and every tenth), and the last reading's raw `[events, opportunities]` with the
@@ -685,6 +700,10 @@ class WorkerHistory:
     style_rate: dict[str, list[list[float]]] = field(default_factory=dict)
     style_latest: dict[str, list[int]] = field(default_factory=dict)
     style_hands: int = 0
+    # The same per group of table sizes (`style_log.SIZE_GROUPS`):
+    # `{"4-6": {"rate": {...}, "latest": {...}, "hands": n}}`. Empty for a log that
+    # predates the per-size lines.
+    style_by_size: dict[str, dict] = field(default_factory=dict)
     total_iterations: int = 0
 
 
@@ -735,13 +754,16 @@ def parse_worker_history(
     rows: list[tuple[float, ...]] = []
     eval_bb: list[list[float]] = []
     eval_rating: list[list[float]] = []
-    value_sd: dict[str, dict[str, list[list[float]]]] = {SIZE_KIND: {}, STACK_KIND: {}}
-    value_ev: dict[str, list[list[float]]] = {}
+    value_sd: dict[str, dict[str, list[list[float]]]] = {SIZE_KIND: {}, STACK_KIND: {}, STREET_KIND: {}}
+    # Explained variance by stack and by street; by table size it is not drawn.
+    value_ev: dict[str, dict[str, list[list[float]]]] = {STACK_KIND: {}, STREET_KIND: {}}
     value_spread: dict[str, list[list[float]]] = {SIZE_KIND: [], STACK_KIND: []}
     style_rate: dict[str, list[list[float]]] = {}
     style_latest: dict[str, list[int]] = {}
     style_hands = 0
+    style_by_size: dict[str, dict] = {}
     hands_per_iteration = 0
+    gradients: dict[int, GradientReading] = {}
     for line in text.splitlines():
         if line.startswith("device "):
             header = _HANDS_PER_ITERATION.search(line)
@@ -755,14 +777,24 @@ def parse_worker_history(
         elif line.startswith("stile "):
             parsed_style = parse_style_line(line)
             if parsed_style is not None and steps:
-                style_hands = parsed_style.hands
-                style_latest = {
+                latest = {
                     stat: [events, chances]
                     for stat, (events, chances) in parsed_style.rates.items()
                 }
+                if parsed_style.group is None:
+                    style_hands, style_latest, rates = parsed_style.hands, latest, style_rate
+                else:
+                    entry = style_by_size.setdefault(parsed_style.group, {"rate": {}})
+                    entry["hands"], entry["latest"] = parsed_style.hands, latest
+                    rates = entry["rate"]
                 for stat, (events, chances) in parsed_style.rates.items():
                     if chances > 0:
-                        style_rate.setdefault(stat, []).append([steps[-1], events / chances])
+                        rates.setdefault(stat, []).append([steps[-1], events / chances])
+        elif line.startswith("gradienti:"):
+            # Printed right after the `iter` line it belongs to.
+            reading = parse_gradient_line(line)
+            if reading is not None and steps:
+                gradients[steps[-1]] = reading
         elif line.startswith("valore "):
             # Printed right after the `iter` line it describes, so it belongs to
             # the last iteration read.
@@ -772,11 +804,11 @@ def parse_worker_history(
                     value_sd[parsed.kind].setdefault(group, []).append(
                         [steps[-1], stats.target_sd]
                     )
-                    if parsed.kind == STACK_KIND and stats.explained_variance is not None:
-                        value_ev.setdefault(group, []).append(
+                    if parsed.kind in value_ev and stats.explained_variance is not None:
+                        value_ev[parsed.kind].setdefault(group, []).append(
                             [steps[-1], stats.explained_variance]
                         )
-                if parsed.spread is not None:
+                if parsed.spread is not None and parsed.kind in value_spread:
                     value_spread[parsed.kind].append([steps[-1], parsed.spread])
         elif "eval vs pool:" in line:
             matched = _EVAL.search(line)
@@ -788,6 +820,7 @@ def parse_worker_history(
     def column(index: int) -> list[float]:
         return [rows[k][index] for k in keep]
 
+    kept_gradients = [(steps[k], gradients[steps[k]]) for k in keep if steps[k] in gradients]
     return WorkerHistory(
         name=name,
         iterations=[steps[k] for k in keep],
@@ -802,12 +835,23 @@ def parse_worker_history(
         eval_rating=eval_rating,
         value_sd_size=value_sd[SIZE_KIND],
         value_sd_stack=value_sd[STACK_KIND],
-        value_ev_stack=value_ev,
+        value_ev_stack=value_ev[STACK_KIND],
+        value_sd_street=value_sd[STREET_KIND],
+        value_ev_street=value_ev[STREET_KIND],
         value_spread_size=value_spread[SIZE_KIND],
         value_spread_stack=value_spread[STACK_KIND],
+        grad_policy_mean=[[it, g.policy.mean] for it, g in kept_gradients],
+        grad_policy_sd=[[it, g.policy.sd] for it, g in kept_gradients],
+        grad_policy_clipped=[[it, g.policy.clipped] for it, g in kept_gradients],
+        grad_policy_threshold=kept_gradients[-1][1].policy.threshold if kept_gradients else None,
+        grad_critic_mean=[[it, g.critic.mean] for it, g in kept_gradients],
+        grad_critic_sd=[[it, g.critic.sd] for it, g in kept_gradients],
+        grad_critic_clipped=[[it, g.critic.clipped] for it, g in kept_gradients],
+        grad_critic_threshold=kept_gradients[-1][1].critic.threshold if kept_gradients else None,
         style_rate=style_rate,
         style_latest=style_latest,
         style_hands=style_hands,
+        style_by_size=style_by_size,
         total_iterations=len(rows),
     )
 

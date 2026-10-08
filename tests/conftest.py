@@ -4,18 +4,28 @@
 # (which would change how pytest names and collects every test module).
 
 import gc
+import sys
+from pathlib import Path
 
 import pytest
+
+# The studies are scripts, not part of the package (`src/` never imports them), run with
+# their own folder on the path: the tests import them the same way.
+STUDY_DIRS = (Path(__file__).resolve().parents[1] / "studies" / "agents",)
+for _folder in STUDY_DIRS:
+    if str(_folder) not in sys.path:
+        sys.path.insert(0, str(_folder))
 
 # Every test file belongs to one area, named by its file name, so a change can be
 # checked by running only its area (`pytest -m rl`, or `tests/affected.py`).
 # Applied here rather than decorated by hand so a new file is covered by default:
-# anything that is not gui/vision/rl/config is the engine.
+# anything that is not gui/vision/rl/config/study is the engine.
 AREA_PREFIXES = (
     ("test_gui_", "gui"),
     ("test_vision_", "vision"),
     ("test_rl_", "rl"),
     ("test_config", "config"),
+    ("test_study_", "study"),
 )
 # The one test that launches real `poker-loop` and `poker-train` subprocesses.
 SLOW_FILES = {"test_rl_loop_e2e.py"}

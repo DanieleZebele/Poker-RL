@@ -77,3 +77,51 @@ def fixed_mix(
         small_blind=small_blind,
         big_blind=big_blind,
     )
+
+
+# The smallest equity encoder the tests build every network on: a model cannot exist without
+# one. Torch is imported inside the helpers, so the torch-free tests can still import this file.
+TINY_EQUITY = {"hidden": 8, "latent": 4, "blocks": 1}
+
+
+def tiny_model(**shape):
+    """A `PokerActorCritic` of the given shape on a randomly initialised `TINY_EQUITY` encoder."""
+    from pokerlab.rl.policy import PokerActorCritic
+
+    return PokerActorCritic(**shape, equity=TINY_EQUITY)
+
+
+def tiny_critic(model):
+    """The critic callables of `model`: an equity network whose encoder is the model's own."""
+    from pokerlab.rl.equity_net import EquityNet
+    from pokerlab.rl.policy import make_critic_fns
+
+    net = EquityNet(**TINY_EQUITY, arch="sets")
+    net.phi.load_state_dict(model.equity_encoder.phi.state_dict())
+    return make_critic_fns(model, net.requires_grad_(False).eval())
+
+
+def tiny_parts(**shape) -> dict:
+    """`model=` and `critic=` for a `SelfPlayTrainer`."""
+    model = tiny_model(**shape)
+    return {"model": model, "critic": tiny_critic(model)}
+
+
+def fake_critic():
+    """A critic with no network behind it, for tests of the collector that need no torch: every
+    seat's equity is a quarter and a decision's value is their sum."""
+    from pokerlab.players.rl_agent import DealView  # noqa: F401  (documents what the views are)
+    from pokerlab.rl.rollout import CriticFns
+
+    return CriticFns(
+        equity=lambda views: [[0.25] * 9 for _ in views],
+        value=lambda features, extras: [float(sum(extra)) for extra in extras],
+    )
+
+
+def fake_collector(*args, **kwargs):
+    """A `SelfPlayCollector` with `fake_critic()` unless the test brings its own critic."""
+    from pokerlab.rl.rollout import SelfPlayCollector
+
+    kwargs.setdefault("critic", fake_critic())
+    return SelfPlayCollector(*args, **kwargs)

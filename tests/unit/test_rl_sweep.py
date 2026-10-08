@@ -327,7 +327,7 @@ def test_the_plan_with_a_policy_still_has_every_axis_and_every_worker():
         Namespace(
             lr=3e-4, hands=512, opponent_probability=0.5, ppo_epochs=4, clip_epsilon=0.2,
             pool_top_share=0.5, pool_top_n=100, minibatch_size=1024, gae_lambda=0.95,
-            value_coef=0.5, max_grad_norm=0.5, entropy_coef=0.0,
+            value_coef=0.5, policy_max_grad_norm=0.5, critic_max_grad_norm=1.0, entropy_coef=0.0,
         )
     )
     plan = hyperparameter_plan(5, [None] * 5, start, rng=random.Random(1), policy=policy)

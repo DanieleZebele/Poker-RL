@@ -23,8 +23,10 @@ import time
 import uuid
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
 
+from pokerlab.rl.device import resolve_device
 from pokerlab.rl.global_store import (
     DEFAULT_LOCK_SECONDS,
     PRUNE_LOCK,
@@ -45,11 +47,11 @@ from pokerlab.rl.pool_registry import (
     DEFAULT_K_SCHEDULE,
     DEFAULT_POPULATION_TRIGGER,
     DEFAULT_PROTECT_PERCENTILE,
-    MODEL,
     PoolMember,
     PoolRegistry,
     interpolated_percentile,
 )
+from pokerlab.rl.style_log import StyleTally, merge_style
 from pokerlab.rl.table_mix import DEFAULT_SESSION_HANDS, table_arguments
 from pokerlab.rl.training_pool import parent_tiers_text
 
@@ -209,6 +211,62 @@ def prune_ghost_members(
         finally:
             release_locks(global_dir, [label])
     return dropped
+
+
+def backfill_member_styles(
+    global_dir: str | Path,
+    root: str | Path = Path("checkpoints"),
+    *,
+    machine: str,
+    read_metadata: Callable[[Path], dict | None],
+    skip: set[str],
+    limit: int = 50,
+    ttl: float = DEFAULT_LOCK_SECONDS,
+) -> int:
+    """Give a member that has no style the one its checkpoint was published with.
+
+    A model published before members carried a style still holds it in its own
+    metadata (`style`, `style_hands`) when the run that trained it measured one; this
+    copies it across. A member that has played a pass already has a style and is left
+    alone. `read_metadata` opens a checkpoint (the caller owns torch), `skip` is every
+    label already tried, added to as it goes so a model whose checkpoint has none is not
+    opened again, and `limit` bounds the checkpoints opened in one call (a store is
+    thousands of files on a network mount). Returns how many members were filled.
+    """
+    root = Path(root)
+    path_by_label = {
+        c.label: c.path
+        for c in [*discover_population(root), *discover_benchmark_population(root)]
+    }
+    filled = tried = 0
+    for label in sorted(list_member_labels(global_dir)):
+        if tried >= limit:
+            break
+        member = read_member(global_dir, label)
+        if member is None or member.style_hands > 0 or label in skip or label not in path_by_label:
+            continue
+        skip.add(label)
+        tried += 1
+        metadata = read_metadata(path_by_label[label]) or {}
+        style, hands = metadata.get("style"), metadata.get("style_hands")
+        if not isinstance(style, dict) or not isinstance(hands, int) or hands <= 0:
+            continue
+        counts = {
+            name: [int(pair[0]), int(pair[1])]
+            for name, pair in style.items()
+            if isinstance(pair, list | tuple) and len(pair) == 2
+        }
+        if not counts or not acquire_locks(global_dir, [label], machine=machine, ttl=ttl):
+            continue
+        try:
+            member = read_member(global_dir, label)
+            if member is not None and member.style_hands == 0:
+                member.style, member.style_hands = counts, hands
+                write_member(global_dir, member)
+                filled += 1
+        finally:
+            release_locks(global_dir, [label])
+    return filled
 
 
 def repair_member_refs(
@@ -421,6 +479,7 @@ def play_global_sessions(
     seed: int = 0,
     on_skip=None,
     on_progress: Callable[[int, int, str], None] | None = None,
+    styles: list[dict[str, dict]] | None = None,
 ) -> list[dict[str, float]]:
     """Play `sessions` sessions, each seating candidates drawn at random.
 
@@ -437,6 +496,11 @@ def play_global_sessions(
     `on_progress(done, total, detail)` fires after every session, counting
     sessions: the total is exactly `sessions`, known up front, so the bar ends at
     100% and never overshoots.
+
+    `styles`, when given, gets one entry per session, aligned with the returned list:
+    how each model played in it (`StyleTally.export`). It is a list to fill rather
+    than a second return value so the many callers that want only the chip deltas
+    are untouched, and it costs nothing when left out.
     """
     from pokerlab.rl.policy import make_policy_fn
     from pokerlab.rl.ppo import build_model_from_checkpoint
@@ -478,7 +542,16 @@ def play_global_sessions(
             proxy.inner = opponent.factory(proxy.player_id, label, bot_rng)
             proxy.name = label
 
-        deltas = bank.play_session(num_players, session_hands)
+        tally = StyleTally() if styles is not None else None
+        deltas = bank.play_session(
+            num_players,
+            session_hands,
+            on_hand=None
+            if tally is None
+            else partial(tally.add_hand, labels=dict(enumerate(seat_labels))),
+        )
+        if tally is not None:
+            styles.append(tally.export())
 
         results: dict[str, float] = {}
         for label, delta in zip(seat_labels, deltas):
@@ -508,7 +581,9 @@ def _shard_main() -> None:
     parser.add_argument("--sessions", type=int, default=DEFAULT_GLOBAL_SESSIONS)
     add_table_arguments(parser)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--device", default="auto", help="cpu, cuda or auto (the default): the GPU if there is one"
+    )
     args = parser.parse_args()
 
     mix = table_mix_from_args(args)
@@ -518,16 +593,45 @@ def _shard_main() -> None:
         for entry in raw
     ]
 
+    styles: list[dict[str, dict]] = []
     sessions = play_global_sessions(
         candidates,
         mix,
         sessions=args.sessions,
         session_hands=args.session_hands,
-        device=args.device,
+        device=resolve_device(args.device),
         seed=args.seed,
+        styles=styles,
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps(sessions), encoding="utf-8")
+    args.out.write_text(json.dumps({"sessions": sessions, "styles": styles}), encoding="utf-8")
+
+
+def spread_pick(
+    candidates: Sequence[PoolMember], fixed: Sequence[float], count: int
+) -> list[PoolMember]:
+    """Up to `count` of `candidates` whose ratings are as far apart as possible.
+
+    Farthest-point selection: with nothing fixed yet it starts from the strongest and
+    the weakest, then repeatedly takes the candidate whose rating is furthest from every
+    one already chosen (`fixed` are ratings that are taken anyway, such as the existing
+    anchors). More candidates than needed are therefore thinned to an even ladder, and
+    ties go to the stronger model, then to the label, so the choice is reproducible.
+    The result is in the order they were picked, which a caller that can only seat some
+    of them reads as the order of preference.
+    """
+    pool = sorted(candidates, key=lambda m: (-m.rating, m.label))
+    chosen: list[PoolMember] = []
+    taken = list(fixed)
+    while pool and len(chosen) < count:
+        if not taken:
+            pick = pool[0]  # the strongest first, then the weakest by distance
+        else:
+            pick = max(pool, key=lambda m: min(abs(m.rating - r) for r in taken))
+        pool.remove(pick)
+        chosen.append(pick)
+        taken.append(pick.rating)
+    return chosen
 
 
 def add_benchmark_candidates(
@@ -537,6 +641,7 @@ def add_benchmark_candidates(
     machine: str,
     games_percentile: float = BENCHMARK_GAMES_PERCENTILE,
     margin: float = BENCHMARK_MARGIN,
+    minimum_anchors: int = 0,
     lock_ttl: float = DEFAULT_LOCK_SECONDS,
     on_skip: Callable[[Path, str], None] | None = None,
 ) -> list[PoolMember]:
@@ -549,8 +654,20 @@ def add_benchmark_candidates(
     lowest rating upwards and each must clear the previously added one by more
     than `margin` too, so the anchors stay at least `margin` apart rather than a
     whole cluster of near-identical models joining at once. Returns the models
-    added (empty when there are no anchors yet, nothing qualifies, or the
-    percentile is undefined).
+    added (empty when nothing qualifies or the percentile is undefined).
+
+    **With fewer than `minimum_anchors` anchors it bootstraps instead.** The benchmark
+    cannot start itself otherwise: no model can be stronger than a best anchor that
+    does not exist, and the pass against the anchors cannot seat a table until it has
+    one fewer than the largest table. So it fills the missing places with the models
+    whose ratings are **as far apart as possible** (`spread_pick`), from the strongest
+    to the weakest that have played, with no percentile and no margin: an anchor is a
+    reference point, and a ladder with both ends and an even spread in between measures
+    a new model better than eight near-identical strong ones. A rating from few
+    sessions is a weak reason to freeze a model, but an empty benchmark is worse, and
+    `benchmark_arena` settles the new anchors against one another. Models that have not
+    played at all are used only if the ones that have run out. Once the count is met,
+    the ordinary rule above applies.
 
     The population is the non-frozen members whose checkpoint is in the store.
     Each added model is *moved* into `checkpoints/benchmark/` (every other copy
@@ -563,57 +680,71 @@ def add_benchmark_candidates(
     if not acquire_locks(global_dir, [PRUNE_LOCK], machine=machine, ttl=PRUNE_LOCK_SECONDS):
         return []
     added: list[PoolMember] = []
+    copies = discover_all_copies(root)
+    target_dir = root / BENCHMARK_DIRNAME
+
+    def promote(candidate: PoolMember) -> bool:
+        """Move one model into the benchmark and freeze it. False if it was skipped."""
+        if not acquire_locks(global_dir, [candidate.label], machine=machine, ttl=lock_ttl):
+            return False  # being rated right now: the next run will look again
+        try:
+            member = read_member(global_dir, candidate.label)
+            sources = sorted(copies.get(candidate.label, []))
+            if member is None or member.frozen or not sources:
+                return False
+            primary, *extra_copies = sources
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / primary.name
+            try:
+                if not target.exists():
+                    staging = target_dir / f".{primary.name}.partial"
+                    shutil.copy2(primary, staging)
+                    staging.replace(target)
+                primary.unlink()
+            except OSError as exc:
+                if on_skip is not None:
+                    on_skip(primary, str(exc))
+                return False
+            for duplicate in extra_copies:
+                try:
+                    duplicate.unlink()
+                except OSError:
+                    pass  # best-effort: the primary copy already landed safely
+            member.ref = str(target)
+            member.frozen = True
+            write_member(global_dir, member)
+            added.append(member)
+            return True
+        finally:
+            release_locks(global_dir, [candidate.label])
+
     try:
         registry = load_global_registry(global_dir)
-        anchors = [m for m in registry.models() if m.frozen]
+        anchors = [m for m in registry.ranked() if m.frozen]
         on_disk = {c.label for c in discover_population(root)}
-        population = [m for m in registry.models() if not m.frozen and m.label in on_disk]
-        rated_games = [m.games for m in population if m.games > 0]
-        if not anchors or not rated_games:
-            return []
-        threshold = interpolated_percentile(rated_games, games_percentile)
-        floor = max(m.rating for m in anchors)
-        candidates = sorted(
-            (m for m in population if m.games > threshold),
-            key=lambda m: (m.rating, m.label),
-        )
-        copies = discover_all_copies(root)
-        target_dir = root / BENCHMARK_DIRNAME
-        for candidate in candidates:
-            if candidate.rating - floor <= margin:
-                continue
-            if not acquire_locks(global_dir, [candidate.label], machine=machine, ttl=lock_ttl):
-                continue  # being rated right now: the next run will look again
-            try:
-                member = read_member(global_dir, candidate.label)
-                sources = sorted(copies.get(candidate.label, []))
-                if member is None or member.frozen or not sources:
+        population = [m for m in registry.ranked() if not m.frozen and m.label in on_disk]
+        rated = [m for m in population if m.games > 0]
+        if len(anchors) < minimum_anchors:
+            missing = minimum_anchors - len(anchors)
+            unplayed = [m for m in population if m.games == 0]
+            for pool in (rated, unplayed):
+                # Picked again whenever one could not be moved (it was being rated).
+                for candidate in spread_pick(
+                    pool, [m.rating for m in anchors + added], missing - len(added)
+                ):
+                    promote(candidate)
+        elif anchors and rated:
+            threshold = interpolated_percentile([m.games for m in rated], games_percentile)
+            floor = max(m.rating for m in anchors)
+            candidates = sorted(
+                (m for m in population if m.games > threshold),
+                key=lambda m: (m.rating, m.label),
+            )
+            for candidate in candidates:
+                if candidate.rating - floor <= margin:
                     continue
-                primary, *extra_copies = sources
-                target_dir.mkdir(parents=True, exist_ok=True)
-                target = target_dir / primary.name
-                try:
-                    if not target.exists():
-                        staging = target_dir / f".{primary.name}.partial"
-                        shutil.copy2(primary, staging)
-                        staging.replace(target)
-                    primary.unlink()
-                except OSError as exc:
-                    if on_skip is not None:
-                        on_skip(primary, str(exc))
-                    continue
-                for duplicate in extra_copies:
-                    try:
-                        duplicate.unlink()
-                    except OSError:
-                        pass  # best-effort: the primary copy already landed safely
-                member.ref = str(target)
-                member.frozen = True
-                write_member(global_dir, member)
-                added.append(member)
-                floor = member.rating
-            finally:
-                release_locks(global_dir, [candidate.label])
+                if promote(candidate):
+                    floor = candidate.rating
     finally:
         release_locks(global_dir, [PRUNE_LOCK])
     if added:
@@ -779,6 +910,7 @@ def play_population_sessions_sharded(
     if len(combined) < mix.max_players:
         return PlayedSessions()
 
+    styles: list[dict[str, dict]] = []
     if workers <= 1:
         played = play_global_sessions(
             combined,
@@ -789,6 +921,7 @@ def play_population_sessions_sharded(
             seed=rng.randrange(2**31),
             on_skip=on_skip,
             on_progress=on_progress,
+            styles=styles,
         )
     else:
         played = play_sharded(
@@ -800,6 +933,7 @@ def play_population_sessions_sharded(
             rng=rng,
             workers=workers,
             on_skip=on_skip,
+            styles=styles,
         )
     if not played:
         return PlayedSessions()
@@ -807,6 +941,7 @@ def play_population_sessions_sharded(
     write_pending_sessions(
         global_dir,
         played,
+        styles=styles,
         machine=machine,
         population={c.label: str(c.path) for c in population_draw},
         benchmark={c.label: str(c.path) for c in benchmark_draw},
@@ -821,6 +956,7 @@ def write_pending_sessions(
     machine: str,
     population: Mapping[str, str],
     benchmark: Mapping[str, str],
+    styles: Sequence[dict[str, dict]] | None = None,
 ) -> Path | None:
     """Queue played sessions for a later merge, and return the file written.
 
@@ -835,6 +971,9 @@ def write_pending_sessions(
     `population` and `benchmark` map each participant's label to where its
     checkpoint was when it played; a label listed under `benchmark` is
     bootstrapped into the registry as a frozen anchor.
+
+    `styles` is how each participant played, one entry per session in the same order
+    (`StyleTally.export`); the merge folds it into the members' `style`.
     """
     if not sessions:
         return None
@@ -844,6 +983,7 @@ def write_pending_sessions(
         "population_draw": [{"label": k, "path": v} for k, v in population.items()],
         "benchmark_draw": [{"label": k, "path": v} for k, v in benchmark.items()],
         "sessions": list(sessions),
+        "styles": list(styles) if styles else [],
     }
     name = f"{machine}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}.json"
     partial = pending_dir / f".{name}.partial"
@@ -877,6 +1017,7 @@ def play_sharded(
     rng: random.Random,
     workers: int,
     on_skip: Callable[[Path, str], None] | None,
+    styles: list[dict[str, dict]] | None = None,
 ) -> list[dict[str, float]]:
     """Fan `combined` out to `workers` local subprocesses via `_shard_main` and
     collect their sessions.
@@ -939,8 +1080,11 @@ def play_sharded(
                     on_skip(out, "shard di valutazione globale fallito")
                 continue
             try:
-                sessions.extend(json.loads(out.read_text(encoding="utf-8")))
-            except (OSError, ValueError) as exc:
+                shard = json.loads(out.read_text(encoding="utf-8"))
+                sessions.extend(shard["sessions"])
+                if styles is not None:
+                    styles.extend(shard["styles"])
+            except (OSError, ValueError, KeyError, TypeError) as exc:
                 if on_skip is not None:
                     on_skip(out, str(exc))
         return sessions
@@ -988,6 +1132,7 @@ def _apply_session(
     lock_ttl: float,
     lock_wait: float,
     k_schedule: Sequence[tuple[int, float]] = DEFAULT_K_SCHEDULE,
+    style: Mapping[str, dict] | None = None,
 ) -> bool:
     """Fold one session into the ratings under the locks of its participants.
 
@@ -1010,7 +1155,7 @@ def _apply_session(
                 # resurrected as a ghost.
                 if label not in path_by_label:
                     continue
-                member = PoolMember(label=label, kind=MODEL, ref=path, frozen=benchmark)
+                member = PoolMember(label=label, ref=path, frozen=benchmark)
             elif benchmark and not member.frozen:
                 # First time seen under benchmark/: pinned from here on.
                 member.frozen = True
@@ -1025,7 +1170,12 @@ def _apply_session(
                 members=members,
                 k_schedule=tuple(k_schedule),
             ).record_session(known)
-            for member in members.values():
+            for label, member in members.items():
+                seen = (style or {}).get(label)
+                if seen:
+                    member.style, member.style_hands = merge_style(
+                        member.style, member.style_hands, seen["style"], seen["hands"]
+                    )
                 write_member(global_dir, member)
         return True
     finally:
@@ -1070,7 +1220,7 @@ def _eliminate(
         registry = load_global_registry(global_dir)
         rated_games = [
             m.games
-            for m in registry.models()
+            for m in registry.ranked()
             if not m.frozen and m.games > 0 and m.label in population_labels
         ]
         if not rated_games:
@@ -1078,7 +1228,7 @@ def _eliminate(
         games_threshold = interpolated_percentile(rated_games, protect_percentile)
         eligible_count = sum(
             1
-            for m in registry.models()
+            for m in registry.ranked()
             if not m.frozen and m.games >= games_threshold and m.label in population_labels
         )
         doomed = registry.eliminate_lowest_rated(
@@ -1189,7 +1339,10 @@ def apply_pending_population_sessions(
             for entry in payload.get(key, [])
         }
         leftover: list[dict[str, float]] = []
-        for results in payload.get("sessions", []):
+        leftover_styles: list[dict[str, dict]] = []
+        styles = payload.get("styles", [])
+        for index, results in enumerate(payload.get("sessions", [])):
+            style = styles[index] if index < len(styles) else None
             if _apply_session(
                 global_dir,
                 results,
@@ -1199,13 +1352,16 @@ def apply_pending_population_sessions(
                 lock_ttl=lock_ttl,
                 lock_wait=lock_wait,
                 k_schedule=k_schedule,
+                style=style,
             ):
                 sessions_applied += 1
                 participants.update(results)
             else:
                 leftover.append(results)
+                leftover_styles.append(style or {})
         if leftover:
             payload["sessions"] = leftover
+            payload["styles"] = leftover_styles
             name = f"{machine}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}.json"
             partial = pending_dir / f".{name}.partial"
             partial.write_text(json.dumps(payload), encoding="utf-8")

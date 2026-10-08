@@ -15,7 +15,7 @@ from pokerlab.engine.betting import (
     seats_clockwise_from,
     start_new_street_betting,
 )
-from pokerlab.engine.config import GameConfig
+from pokerlab.engine.config import BlindSchedule, GameConfig
 from pokerlab.engine.history import SCHEMA_VERSION, HandHistory, HandHistoryWriter
 from pokerlab.engine.pots import compute_pots, distribute_pots
 from pokerlab.engine.state import HandState, PlayerState, PlayerStatus, Street
@@ -23,6 +23,55 @@ from pokerlab.engine.stats import StatsTracker
 
 if TYPE_CHECKING:
     from pokerlab.players.base import Player
+
+
+def _nobody_left_to_bet_against(hand_state: HandState) -> bool:
+    """The betting is over: at most one player still has chips, and it has nothing to call.
+
+    The same test `_run_betting_round` makes before a round starts, made again after every
+    action, because a fold can leave one player with chips in the middle of a round. Asking
+    that player to act anyway let it fold for free, and then a layer of the pot that only
+    folded players had paid into had nobody left to win it (`compute_pots`): chips vanished.
+    One facing a bet (an all-in bigger than its own) still has to call or fold."""
+    actionable = hand_state.actionable_seats()
+    if len(actionable) > 1:
+        return False
+    return not actionable or actionable[0].current_bet >= hand_state.current_bet_to_match
+
+
+def _next_to_act(hand_state: HandState, order: list[int], after: int) -> int | None:
+    """The seat `_run_betting_round` will ask next, given the seat order of the round and the
+    position in it of the last seat asked (-1 before anyone has been): the first seat after
+    it, wrapping round, that still has a decision to make and chips to make it with. None when
+    the round is over. The round's own loop uses the same test, which is why a spectator can be
+    told who is next *before* that player is asked."""
+    if not hand_state.to_act:
+        return None
+    for step in range(1, len(order) + 1):
+        seat = order[(after + step) % len(order)]
+        ps = hand_state.seat_state(seat)
+        if seat in hand_state.to_act and ps.status == PlayerStatus.ACTIVE and ps.stack > 0:
+            return seat
+    return None
+
+
+def _view_for(hand_state: HandState, seat: int | None, hand_stats) -> tuple | None:
+    """What `seat` will be shown when it is asked -- `(Observation, legal actions)` -- built
+    ahead of the question, for a spectator that wants to look at the decision while the game is
+    held (a GUI showing a bot's action probabilities). None when nobody is due."""
+    if seat is None:
+        return None
+    from pokerlab.players.base import build_observation  # local import: avoid a module cycle
+
+    return (build_observation(hand_state, seat, hand_stats), compute_legal_actions(hand_state, seat))
+
+
+def _first_to_act(hand_state: HandState, first_actor_seat: int) -> int | None:
+    """Who a betting round started from `first_actor_seat` asks first (None: nobody, because at
+    most one player has chips, so the round is skipped)."""
+    if len(hand_state.actionable_seats()) <= 1:
+        return None
+    return _next_to_act(hand_state, seats_clockwise_from(hand_state, first_actor_seat), -1)
 
 
 @dataclass
@@ -35,7 +84,7 @@ class HandResult:
 
 class Table:
     """Drives full hands over a fixed list of Players, uniformly -- it never
-    branches on whether a seat is a ManualPlayer, a GuiPlayer, or an RL agent.
+    branches on whether a seat is a GuiPlayer or an RL agent.
     Persists chip stacks and the button across hands."""
 
     def __init__(
@@ -48,6 +97,7 @@ class Table:
         on_street_dealt: Callable[[dict[str, Any]], None] | None = None,
         on_action_applied: Callable[[dict[str, Any]], None] | None = None,
         stats_tracker: StatsTracker | None = None,
+        blind_schedule: BlindSchedule | None = None,
     ) -> None:
         """`on_hand_started`, if given, is called once per hand right after
         blinds are posted (before any betting), with a dict of
@@ -76,6 +126,13 @@ class Table:
         `record` is the engine's own ActionRecord, so the chips actually
         committed are read off it rather than re-derived.
 
+        **Who acts next is announced before they are asked**: `on_hand_started` and
+        `on_street_dealt` carry `first_actor` and `on_action_applied` carries `next_seat`
+        (None when nobody will be asked: the round is over, or at most one player has chips).
+        A spectator that holds an action for a pause can show whose turn it is during it, and
+        the same hooks carry the decision they will face: `first_actor_view` / `next_view`,
+        `(Observation, legal actions)`, exactly what that player is then handed.
+
         Building the Observation costs something, so it only happens when a
         hook is installed -- training never pays for it.
 
@@ -84,6 +141,10 @@ class Table:
         `Observation`s of the hands that follow, for the seats whose player it has
         seen. Optional by design: with none, or for a player it has not seen, the
         statistics are simply absent.
+
+        `blind_schedule`, if given, raises the blinds every N hands (`BlindSchedule`):
+        `config` holds the blinds the session starts with, `current_blinds()` the ones
+        the next hand will be played at, and every hand records its own.
         """
         if len(players) != config.num_players:
             raise ValueError(
@@ -96,11 +157,18 @@ class Table:
         self._on_hand_started = on_hand_started
         self._on_street_dealt = on_street_dealt
         self._on_action_applied = on_action_applied
-        self._stats_tracker = stats_tracker
+        self.stats_tracker = stats_tracker
+        self.blind_schedule = blind_schedule
         self._hand_stats: dict[int, tuple[float, ...]] = {}
         self.stacks: list[int] = [config.starting_stack] * config.num_players
         self._button_seat: int | None = None
         self._hand_counter = 0
+
+    def current_blinds(self) -> tuple[int, int]:
+        """`(small, big)` the next hand is played at."""
+        if self.blind_schedule is None:
+            return (self.config.small_blind, self.config.big_blind)
+        return self.blind_schedule.blinds(self.config.small_blind, self.config.big_blind, self._hand_counter)
 
     def _eligible_seats(self) -> list[int]:
         return [seat for seat, stack in enumerate(self.stacks) if stack > 0]
@@ -118,6 +186,7 @@ class Table:
 
         button_seat = self._advance_button(eligible)
         self._button_seat = button_seat
+        small_blind, big_blind = self.current_blinds()  # before the counter moves: hand 1 is level 0
         self._hand_counter += 1
         hand_id = f"hand-{self._hand_counter}-{uuid.uuid4().hex[:8]}"
 
@@ -140,15 +209,15 @@ class Table:
             button_seat=button_seat,
             seats=seats,
             deck=deck,
-            small_blind=self.config.small_blind,
-            big_blind=self.config.big_blind,
+            small_blind=small_blind,
+            big_blind=big_blind,
         )
         starting_stacks = {ps.seat: ps.stack for ps in seats}
         hole_cards = {ps.seat: ps.hole_cards for ps in seats}
         player_ids = {ps.seat: ps.player_id for ps in seats}
         # Read once per hand: nothing it describes changes until the hand ends.
         self._hand_stats = (
-            self._stats_tracker.vectors(player_ids) if self._stats_tracker is not None else {}
+            self.stats_tracker.vectors(player_ids) if self.stats_tracker is not None else {}
         )
 
         order = seats_clockwise_from(hand_state, button_seat)
@@ -157,6 +226,7 @@ class Table:
         else:
             sb_seat, bb_seat = order[1], order[2]
         post_blinds(hand_state, sb_seat, bb_seat)
+        preflop_first_actor = sb_seat if len(eligible) == 2 else order[3 % len(order)]
 
         if self._on_hand_started is not None:
             self._on_hand_started(
@@ -165,13 +235,14 @@ class Table:
                     "button_seat": button_seat,
                     "sb_seat": sb_seat,
                     "bb_seat": bb_seat,
-                    "small_blind": self.config.small_blind,
-                    "big_blind": self.config.big_blind,
+                    "small_blind": small_blind,
+                    "big_blind": big_blind,
                     "hole_cards": dict(hole_cards),
+                    "first_actor": (first := _first_to_act(hand_state, preflop_first_actor)),
+                    "first_actor_view": _view_for(hand_state, first, self._hand_stats),
                 }
             )
 
-        preflop_first_actor = sb_seat if len(eligible) == 2 else order[3 % len(order)]
         self._run_betting_round(hand_state, preflop_first_actor)
 
         streets: list[tuple[Street, int]] = [(Street.FLOP, 3), (Street.TURN, 1), (Street.RIVER, 1)]
@@ -183,6 +254,11 @@ class Table:
             # can act, this street and every later one are a pure runout,
             # and no Player.act() call will ever report them to a spectator.
             betting_closed = len(hand_state.actionable_seats()) <= 1
+            # The street's betting is set up *before* the spectator hook (which a GUI may hold
+            # for a second), so the hook can say who acts first; nothing is asked of any player
+            # until it returns.
+            start_new_street_betting(hand_state, street)
+            postflop_first_actor = seats_clockwise_from(hand_state, button_seat + 1)[0]
             if self._on_street_dealt is not None:
                 self._on_street_dealt(
                     {
@@ -190,10 +266,10 @@ class Table:
                         "street": street,
                         "community_cards": list(hand_state.community_cards),
                         "betting_closed": betting_closed,
+                        "first_actor": (first := _first_to_act(hand_state, postflop_first_actor)),
+                        "first_actor_view": _view_for(hand_state, first, self._hand_stats),
                     }
                 )
-            start_new_street_betting(hand_state, street)
-            postflop_first_actor = seats_clockwise_from(hand_state, button_seat + 1)[0]
             self._run_betting_round(hand_state, postflop_first_actor)
 
         hand_state.street = Street.SHOWDOWN
@@ -208,8 +284,8 @@ class Table:
             hand_id=hand_id,
             started_at=time.time(),
             num_players=len(eligible),
-            small_blind=self.config.small_blind,
-            big_blind=self.config.big_blind,
+            small_blind=small_blind,
+            big_blind=big_blind,
             button_seat=button_seat,
             starting_stacks=starting_stacks,
             seat_names={ps.seat: ps.name for ps in seats},
@@ -221,8 +297,8 @@ class Table:
         )
         if self._history_writer is not None:
             self._history_writer.append(hand_history)
-        if self._stats_tracker is not None:
-            self._stats_tracker.record_hand(
+        if self.stats_tracker is not None:
+            self.stats_tracker.record_hand(
                 hand_history.actions,
                 dealt=[ps.seat for ps in seats],
                 button_seat=button_seat,
@@ -257,7 +333,7 @@ class Table:
         iterations = 0
         while hand_state.to_act:
             progressed = False
-            for seat in order:
+            for position, seat in enumerate(order):
                 if seat not in hand_state.to_act:
                     continue
                 ps = hand_state.seat_state(seat)
@@ -268,6 +344,7 @@ class Table:
                 observation = build_observation(hand_state, seat, self._hand_stats)
                 action = self.players[seat].act(observation, legal)
                 apply_action(hand_state, seat, action)
+                finished = len(hand_state.hand_active_seats()) <= 1 or _nobody_left_to_bet_against(hand_state)
                 if self._on_action_applied is not None:
                     self._on_action_applied(
                         {
@@ -278,10 +355,14 @@ class Table:
                             "action": action,
                             "record": hand_state.action_log[-1],
                             "observation": build_observation(hand_state, seat, self._hand_stats),
+                            # Who will be asked next (None: this betting round is over), so a
+                            # spectator can show it while it is still holding this action.
+                            "next_seat": (upcoming := None if finished else _next_to_act(hand_state, order, position)),
+                            "next_view": _view_for(hand_state, upcoming, self._hand_stats),
                         }
                     )
                 progressed = True
-                if len(hand_state.hand_active_seats()) <= 1:
+                if finished:
                     hand_state.to_act = set()
                     return
             iterations += 1

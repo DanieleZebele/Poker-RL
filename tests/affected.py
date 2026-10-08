@@ -23,11 +23,12 @@ ROOT = Path(__file__).resolve().parents[1]
 AREAS = (
     ("src/pokerlab/gui/", {"gui"}),
     ("src/pokerlab/vision/", {"vision", "gui"}),  # the spot screen reads the screen
-    ("src/pokerlab/rl/", {"rl"}),
+    ("src/pokerlab/rl/", {"rl", "study"}),
     ("src/pokerlab/config.py", {"config", "rl"}),
     ("src/pokerlab/cli/", {"engine", "gui"}),
     # The engine, cards, evaluator and players are what everything else runs on.
-    ("src/pokerlab/", {"engine", "rl", "gui"}),
+    ("src/pokerlab/", {"engine", "rl", "gui", "study"}),
+    ("studies/agents/", {"study"}),
     ("run.sh", {"rl"}),
     ("config.toml", {"rl", "config"}),
 )

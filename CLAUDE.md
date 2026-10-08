@@ -9,17 +9,19 @@ reinforcement-learning poker project. Five sections:
    Configurable players (2-9), stacks, blinds; full betting logic including
    side pots and the min-raise/short-all-in edge case; JSONL hand history.
 2. **Players** (`src/pokerlab/players/`) — **implemented and tested.**
-   `ManualPlayer` (terminal input). Every non-human seat, in the CLI and the
-   GUI alike, is a trained model given by `model:<path>`
-   (`cli/play.py::build_players`, `discover_trained_models`). With no
-   `--bots` given they cycle through the best-rated models found across every
-   machine's pool; with no trained model on disk, seating a non-human seat
-   raises a clear error. `--list-bots` prints the discovered models.
+   `GuiPlayer` (the human at the GUI) and `RLAgentPlayer`. Every non-human seat
+   is a trained model given by `model:<path>` (`cli/play.py::build_players`,
+   `discover_trained_models`); with no spec given they cycle through the
+   best-rated models found across every machine's pool, and with no trained
+   model on disk seating a non-human seat raises a clear error. There is no
+   terminal player and no `poker-play` command any more (both removed, with
+   `rl/env.py`, as unused); `cli/play.py` is what is left: the model discovery
+   and seat building the GUI uses.
 3. **RL training** (`src/pokerlab/rl/`, `players/rl_agent.py`) —
    **implemented and tested.** Observation encoding, discrete action space +
    legal-action mask, `RLAgentPlayer`, trajectory collection with GAE, a
    PyTorch actor-critic, self-play PPO with an opponent pool, checkpointing,
-   evaluation in bb/100, a Gym-shaped `TablePokerEnv`, and the `poker-train`
+   evaluation in bb/100, and the `poker-train`
    CLI. Requires the `rl` extra. See "RL" below.
 4. **Live table vision** (`src/pokerlab/vision/`) — **implemented.** Screen
    capture (`mss`), a mouse-drag region selector, zones saved to
@@ -61,7 +63,7 @@ reinforcement-learning poker project. Five sections:
   `engine/` at all — the engine only ever calls `act()`.
 - **`Observation` (in `players/base.py`) is a plain, JSON-friendly dataclass,
   not a tensor.** Encoding it into a model-ready array is deliberately left
-  to the future `rl/env.py`, not baked into the engine.
+  to `rl/features.py`, not baked into the engine.
 - **The min-raise / short-all-in-doesn't-reopen-betting rule** is
   implemented via two pieces of `HandState`: `to_act` (who still needs to
   respond to the current bet level) and `raise_barred` (who has already
@@ -76,6 +78,28 @@ reinforcement-learning poker project. Five sections:
   `current_bet_to_match > 0`, and the BB must still be able to raise. Regression
   test: `test_big_blind_option_can_raise_when_everyone_just_called`. If a "why
   can't seat X raise here" report comes up, check this exact branch first.
+- **The betting ends as soon as nobody is left to bet against**
+  (`table._nobody_left_to_bet_against`, checked after every action, not only when a round
+  starts): at most one player with chips, and it has nothing to call. A fold can leave one
+  player with chips mid-round; asking it to act anyway let it fold for free (FOLD is always
+  legal, only the models mask it), and a layer of the pot that only folded players had paid
+  into had nobody left to win it -- `compute_pots` dropped it and chips vanished. Now that
+  player goes to showdown and wins that layer, and `compute_pots` raises on a layer nobody
+  can win instead of dropping it. Regression tests in `test_full_hand_flow.py` (the hand
+  that lost 60 chips, and a fuzz with only random players on stacks redrawn every hand,
+  which the older fuzz -- half always-call bots -- never built).
+- **Blinds that go up (`engine/config.py::BlindSchedule`, `Table(blind_schedule=)`).** Every
+  `every` hands the blinds are multiplied by `factor` and rounded up. Level `k` is
+  `ceil(initial * factor ** k)` from the *initial* blinds, not from the last rounded ones:
+  rounding up at every step would compound and 1/2 at 1.2 would race ahead (the float noise in
+  `100 * 1.2 = 120.00000000000001` is rounded off first, or it would become 121). With
+  `factor >= 1` the two blinds stay in order. `Table.config` keeps the session's first blinds,
+  `current_blinds()` the next hand's, and each hand's `HandHistory`, `on_hand_started` info and
+  `Observation.big_blind` carry its own. **A player that normalises by the blind must read it
+  from the observation**: `RLAgentPlayer._normalisers` divides by the hand's big blind and keeps
+  the starting-stack constant in proportion (so the model still reads stacks and bets in big
+  blinds, its unit), pinned by `test_a_model_keeps_reading_in_big_blinds_when_the_blinds_go_up`.
+  Used by the GUI's setup screen; training and every rated session play at constant blinds.
 - **Engine code never imports from `players/`** (one lazy, function-local
   import in `table.py` is the deliberate exception, to avoid a real import
   cycle) — keeps `engine/` reusable by RL/vision/GUI without dragging in
@@ -96,16 +120,17 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
 - **The network's shape is four numbers, set from `config.toml`'s `[network]`**
   (`hidden`, `num_layers`, `head_hidden`, `head_layers`; flags of the same names in
   `poker-train` and `poker-loop`, which forwards them to every worker, resolved when
-  the generation starts). The trunk is `num_layers` blocks of `Linear -> LayerNorm ->
-  ReLU`, `hidden` wide; **each head is `head_layers` such blocks, `head_hidden` wide,
-  then its output `Linear`** (11 logits; 1 value), with separate weights for the two
-  heads, so the critic's gradient reaches the trunk and its own layers and not the
-  policy's. `head_layers = 0` is the original network (1,241,612 parameters at 1380
-  inputs); the shipped file asks for 1 layer of 256, which is 1,502,220 parameters and
-  a batch-1 forward ~41% slower (446 -> 630 us; `head_layers = 2` is 769 us).
-  Checkpoints record all four, `build_model_from_checkpoint` rebuilds at the recorded
-  shape (so models of different shapes coexist at a table), and a checkpoint without
-  the head keys is refused by `check_compatible` with a clear message. **A worker whose
+  the generation starts). Policy and critic each have a trunk of `num_layers` blocks of
+  `Linear -> LayerNorm -> ReLU`, `hidden` wide; **each head is `head_layers` such blocks,
+  `head_hidden` wide, then its output `Linear`** (11 logits; 1 value). Every network is
+  built on an equity encoder (see "The equity network" below), so the policy and the
+  critic share nothing trainable. A batch-1 forward runs only the policy's half: measured
+  at 1024/5/256/3 (the shipped file) it is ~1580 us and 5.7M parameters, against ~395 us at
+  the code's default 512/3/256/0, so read the cost before raising the shape.
+  Checkpoints record all four and the encoder's shape, `build_model_from_checkpoint`
+  rebuilds at the recorded shape (so models of different shapes coexist at a table), and
+  a checkpoint without the head keys or the encoder is refused by `check_compatible`
+  with a clear message. **A worker whose
   parent has another shape starts from scratch** (`train.parent_shape_mismatch`, the
   message "parent has a different network ... starting from scratch", `args.resume`
   turned off, so no sweep observation is written either): `pick_parents` draws by
@@ -114,8 +139,7 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
   shape's models are pruned, every worker that draws one as a parent throws its weights
   away. The sweep does not touch the shape.
 - **One policy network, not one per street.** The street arrives as a one-hot
-  input feature; there is a single shared trunk, one policy head and one value
-  head. Four independent per-street networks were explicitly rejected: preflop
+  input feature; there is a single policy trunk and head, and a single critic. Four independent per-street networks were explicitly rejected: preflop
   sees ~100% of decisions and the river 10-15%, so splitting the data four ways
   starves the street where mistakes cost most, and — the decisive argument for
   PPO — the reward is terminal-only, so GAE bootstraps `V(s_{t+1})` *across*
@@ -132,8 +156,9 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
   `players/__init__.py` without dragging torch into the core install. **torch is
   imported in exactly one module, `rl/policy.py`.** A regression here is easy to
   catch: `import pokerlab.players` must leave `torch` out of `sys.modules`.
-- **`OBS_DIM` is 1380** (`FEATURE_VERSION` 2; it was 480 before each seat got 100 optional
-  statistics slots, see "Opponent statistics" below), defined as the sum of named per-section constants so it
+- **`OBS_DIM` is 660** (`FEATURE_VERSION` 3; it was 1380 while each seat had 100 statistics
+  slots, 80 of them reserved and always zero, and 480 before the statistics, see "Opponent
+  statistics" below, its own section), defined as the sum of named per-section constants so it
   cannot silently drift. Cards are **6 binary 4x13 planes** (hole, flop, turn,
   river, whole board, hole∪board): a street not yet dealt is an all-zero plane,
   which solves the 0/3/4/5-board-cards problem for free and keeps the door open
@@ -141,9 +166,9 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
   Seats are indexed **relative to me** (slot 0 is always me), so the encoding is
   invariant to absolute seat numbering. Action history is aggregated per street,
   **not sequenced**, which loses the order, who did each action, and the
-  individual bet sizes — the planned replacement (for version 3) is a flat
+  individual bet sizes — the planned replacement (the next feature version) is a flat
   positional encoding of the last 20 actions behind a versioned encoder, not a
-  GRU; see "Observation v3" in the TODO section.
+  GRU; see the action-sequence entry in the TODO section.
 - **`encode_observation` takes `big_blind` and `starting_stack` as keyword
   arguments** because `Observation` deliberately carries no table config. Do
   *not* try to recover the blind from the `POST_BLIND` records: a short blind
@@ -152,7 +177,7 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
   different features at training and inference time.
 - **Field size is encoded twice, on purpose**: as aggregate counts (live,
   still-actionable, and all-in opponents, plus the static table size) and as the
-  per-seat slots (9 base features each; plus 100 optional statistics slots), which say *which* seats folded and where they sit relative
+  per-seat slots (9 base features each; plus 20 optional statistics slots), which say *which* seats folded and where they sit relative
   to me. Both are recomputed from the live `Observation` at every decision, so a
   hand naturally tightens and loosens as players fold.
 - **Positional value does not follow the seating order from the button**, and
@@ -184,13 +209,6 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
   reports each decision as it happens. Zero threads, zero duplicated betting
   logic. For throughput the answer is N `Table` instances in N worker processes,
   not control-flow trickery.
-- **`TablePokerEnv` (`rl/env.py`) is for debugging/eval, not training.** It runs
-  `Table` on a daemon thread and hands control back through two queues — the
-  same pattern as `GuiPlayer`. `close()` is mandatory between episodes (it
-  pushes an abort sentinel that unwinds `_QueuePlayer.act()`, then joins), or
-  every `reset()` strands a parked thread; there is a test asserting
-  `threading.active_count()` is unchanged after repeated resets. Queues are
-  drained only *after* the join, so a dying worker cannot write into them.
 - **Reward is terminal-only, in big blinds**, `γ = 1.0`, `λ ≈ 0.95`. No potential-
   based shaping: rewarding "won the pot" teaches nit play and rewarding
   hand-strength EV leaks information the agent must not condition on. Chips stay
@@ -220,9 +238,91 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
   blinds, the same unit as the bb/100 every result is measured in, and a
   per-hand scale (dividing by the seat's own stack, say) would re-weight deep and
   short hands in the gradient away from that objective. Whether the spread of the
-  target is balanced across sizes is *measured, not assumed* — see the TODO
-  entry on the value scale. If you ever change the stack range or the blinds and
+  target is balanced across sizes is *measured, not assumed* — see "Value
+  diagnostics" below (1.7x across table sizes on the first v2 run). If you ever change the stack range or the blinds and
   training stalls, check this first.
+- **A hand whose betting closed before the river is trained on its expected result**
+  (`rl/allin_reward.py`, `--allin-runouts`, `allin_runouts` in `config.toml` `[training]`,
+  20; 0 = the chips that moved). Once nobody can bet, the rest of the board is luck and
+  no decision follows, so the mean result over `allin_runouts` boards (every dealt hole
+  card out of the deck, settled by the engine's own `compute_pots`/`distribute_pots`,
+  side pots included) is an unbiased stand-in for the one board that came. Measured on
+  80,000 hands of the gen-3 models: 31% of hands close before the river (23.5% preflop,
+  20% heads-up up to 50% at 8-9 seats); on the learner's preflop decisions those hands
+  carry 96% of the value target's variance and the expectation removes 74% of it (sd 19.2
+  -> 9.7 bb; flop 43%, turn 26%) -- the luck no critic can predict, which is why the
+  explained variance on the preflop sat near 0. **Training only**: `HandTrajectory.reward`,
+  train/100 and every rated result are the real chips. Cost: the evaluator, +12% CPU on
+  collection at 20 runouts (+5% at 10, +31% at 50). The `valore` diagnostics read the
+  new target, so their explained variance jumps when it is switched on: do not compare
+  readings across the change. Pinned in `tests/unit/test_rl_allin_reward.py`.
+- **The critic's loss weighs each decision by its stake** (`ppo.critic_weights`,
+  `--critic-stack-power`, `critic_stack_power` in `config.toml` `[training]`, 1.4; 0 = off,
+  forwarded by `poker-loop`): the squared error is multiplied by `stake_bb ** -power`,
+  rescaled to mean 1 over the batch, where the stake (`features.chips_at_stake`,
+  `DecisionRecord.stake_bb`) is my chips for the hand (stack plus what I put in) against
+  the deepest opponent still in it, floored at `MIN_STAKE_BB` 1. Why: the target's sd
+  grows with the stake (production `valore per stack` lines: ~0.045 / 0.125 / 0.26 for
+  `<10` / `10-30` / `30+` bb, sd ~ stake^0.7, so 1.4 is inverse-variance), and unweighted
+  the `<10` group was ~0.4% of the value loss with an explained variance often negative.
+  **Critic only, never the policy**: a weight that is a function of the state leaves the
+  minimiser at E[G | s] for every state (only capacity moves) and any state-only critic
+  is an unbiased baseline, so the policy's objective is untouched; weighing the policy's
+  loss would change what bb/100 means to it. Two rules for whoever touches it: the weight
+  must be computed from what the critic sees at the decision (hence the stake at the
+  decision, not `HandTrajectory.effective_stack_bb` at the hand's start) and never from
+  the outcome (|reward|, the final pot), or the target is biased. The logged `value` stays
+  the *unweighted* error, so it reads the same with the weight on or off. Pinned by
+  `test_weighing_the_critic_by_the_stake_leaves_the_policy_untouched` and
+  `test_chips_at_stake_is_mine_against_the_deepest_opponent_still_in`.
+- **Value diagnostics** (`rl/value_diagnostics.py`, pure Python):
+  `poker-train` prints three `valore per tavolo:` / `valore per stack (bb):` /
+  `valore per strada:` lines
+  on the first iteration and every `VALUE_DIAGNOSTICS_EVERY` (10), each group with
+  the sd of its target (the GAE return, in the critic's unit), the explained
+  variance of the values the policy collected with, and its decisions, plus the
+  spread (widest sd over the narrowest, groups under `MIN_DECISIONS` left out).
+  Stack groups are by *effective* stack (`HandTrajectory.effective_stack_bb`: own
+  stack or deepest opponent, whichever is smaller) at `<10`/`10-30`/`30+` bb. Street
+  groups are the decision's own street, read off the one-hot after the card planes
+  (`street_label`): they are there for the explained variance, not the scale -- on the
+  river the critic is given every player's exact equity and should explain much of
+  the target, on the preflop most of it is cards still to come, so a low explained
+  variance overall with a high one on the river is the problem's nature, and a low
+  one on the river is the critic failing to learn. The
+  lines start with `valore` so the status parsers, which read only `iter ` lines,
+  are unaffected. The format and its parser (`parse_value_line`) live in the same
+  module, so they cannot drift.
+  - **Read off the first v2 run** (565 worker logs, generations 4-8, the last reading of
+    each, medians with quartiles): by table size the target's spread is **1.7x**
+    (1.4-2.1x), under the ~2x that would call for a scale per size, so the single
+    `reward_scale` stays; by stack it is **5.7x** (5.1-6.5x), which is what the stake
+    weighting is for. Explained variance by street: preflop 0.09, flop 0.36, turn 0.50,
+    river 0.73, so the critic learns where it is given the cards. The weak spot is the
+    `<10` bb group (0.03, a quarter of the workers negative): see the TODO.
+  - **Why the reward scale is one constant and not per hand.** A from-scratch self-play
+    study (4 constants x 3 seeds, 300 iterations, duplicate-deck league, scratch script
+    not kept) found no variant stronger than the rest: the spread between seeds of one
+    variant (up to ~12 bb/100) was larger than between variants, and a constant 25x apart
+    did not move strength. A per-hand scale (`reward / effective stack`) was the only one
+    whose critic had non-negative explained variance on every stack group, and it changes
+    what the objective weighs, so it was not adopted; the stake weighting balances the
+    critic's loss across stacks without touching the policy's objective.
+  - **No chart in a worker's panel has more than three lines** (`MAX_LINES` in the
+    dashboard page): a larger set is split over several charts, each titled with what it
+    holds (the target by table size is three charts, 2-4, 5-7, 8-9), and the legend is a
+    wrapping row of its own under the title with `min-width: 0` on the grid items, so
+    nothing runs out of its box at any width. **The panel sits in a table cell, and the
+    worker table's `td` is `white-space: nowrap; text-align: right`, which the panel
+    inherits unless `tr.panelrow td` resets it** -- a test page that puts the charts
+    outside a table does not show this, so check any layout change inside one.
+  - **The dashboard shows it** in a worker's expanded panel, after the training curves:
+    explained variance by street and target sd by street (two charts each, preflop/flop
+    and turn/river, every street keeping its shade), target sd by stack, target sd by
+    table size, explained variance by stack, and the two spreads against a 2x line. `monitor.WorkerHistory` carries
+    them as sparse `[iteration, value]` pairs (a reading every 10 iterations, anchored
+    to the `iter` line printed just before it), empty for a log that predates the
+    lines. `--status` does not show it.
 - **PPO reuses the mask stored at rollout time** (`DecisionRecord.legal_mask`),
   it does not recompute it. Recomputing or omitting it would measure
   `pi_new/pi_old` against a different distribution than the one that acted, and
@@ -403,6 +503,24 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
   iteration, a moderate `clip` fraction, and `entropy` drifting slowly down
   (ln 11 ≈ 2.4 is the uniform-over-all-bins ceiling). A climbing value loss or a
   `kl` above ~0.05 per iteration means the step size is too large.
+- **Two gradient-norm clips, one per network** (`ppo.py`): `policy_max_grad_norm` (the old
+  `max_grad_norm`) on the policy's trunk and head, `critic_max_grad_norm` on the critic's;
+  both are axes of the sweep, starting from `config.toml` `[starting-point]`. A parent
+  published before an axis existed has no value for it, so its child starts from the file
+  (`sampled-fallback`) and an old sweep observation is left out of the optimizer's fit. The two networks share no weight, and their gradients live on
+  different scales -- the policy's loss is of order 1 on normalised advantages, the
+  critic's a squared error in the reward's unit -- so one clip over both cut each by a
+  factor the other decided. Measured before the split, on a real worker: policy norm
+  ~0.6-0.8, critic ~0.13-0.23, so the old shared clip was in practice the policy's.
+- **The clips are measured, not assumed** (`rl/grad_log.py`): every iteration
+  `poker-train` prints `gradienti: policy media … sd … tagliati …% soglia … | critico …
+  [N passi]` -- per network, the norm before the cut over the iteration's minibatch
+  steps, its sd and the share of steps above its threshold. The dashboard draws them.
+  **Read them against Adam, not SGD**: Adam divides each parameter's step by a running
+  RMS of its own gradient, so a cut by a factor that is about the same on every step
+  cancels out and does not lower the effective learning rate; what a cut changes is the
+  steps whose factor differs from the usual one (an outlier minibatch is shrunk
+  relative to the rest), which is why the sd is drawn next to the mean.
 - Tests: `tests/unit/test_rl_action_space.py`, `test_rl_features.py`,
   `test_rl_rollout.py`, `test_rl_opponent_pool.py` need no extra dependencies;
   `test_rl_policy.py` and `test_rl_ppo.py` open with
@@ -414,6 +532,53 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
   seat an `RLAgentPlayer` on a uniform-over-unmasked policy, asserting no
   `IllegalActionError` ever (the action-mapping analogue of chip conservation),
   chip conservation, and zero-sum rewards.
+
+- **The equity network is mandatory (`[network] equity_model`, `--equity-model PATH`).** There is
+  no network without it and no compatibility path: `PokerActorCritic(equity=...)` is a required
+  argument, `poker-train` and `poker-loop` refuse to start with `equity_model` empty or missing
+  (the supervisor at startup, through `check_network_arguments`, so it never launches workers that
+  would die), `SelfPlayTrainer` and `SelfPlayCollector` require a critic, and a checkpoint saved
+  without an encoder is refused. The path is relative to the project root, which is where
+  `run.sh` runs from. The policy reads an equity network's per-player encoder in place of the
+  card planes, and the critic, a network of its own, reads every player's equity in place of them. The equity network
+  (`studies/equity_net`; the checkpoint lives in `equity_evaluator/`) is copied into
+  `rl/equity_net.py`, because `src/` cannot import from `studies/`. It imports torch but is only
+  imported from `rl/policy.py`, `rl/ppo.py` and `rl/train.py`, so `import pokerlab.players` still
+  leaves torch out.
+  - **The observation does not change** (`OBS_DIM`, `FEATURE_VERSION`): the model slices what it
+    needs out of the card planes (the first `CARDS_DIM` = 312 features: hole, flop, turn, river,
+    whole board, hole + board). Models built on different encoders cannot exchange weights
+    (`load_checkpoint` raises, `parent_shape_mismatch` reports the parent as another network and a
+    worker starts from scratch). **Changing the file is a fleet reset**, like a change of shape.
+  - **Policy**: `trunk([features after the cards | encoder(own hole, board)])`. The encoder is the
+    equity network's `phi` alone, frozen, its weights inside the model's own state so a published
+    model is self-contained (`PokerActorCritic.equity` records its shape). It sees no other
+    player's cards. The suits are put in canonical order from this player's own cards and the
+    board (the network was trained with an order decided by the whole deal, which a player cannot
+    know: a distribution shift, not measured), and the output is layer-normalised without
+    parameters. **The policy therefore no longer sees the individual board cards, only the
+    encoder's 32 numbers** -- if the policy plays worse, look there first.
+  - **Critic**: a separate trunk (`value_trunk`, same shape as the policy's) over `[features after
+    the cards | EQUITY_SLOTS = 9 equities]`, in the order of the observation's seats (slot 0 is the
+    deciding player), 0 for a seat that has folded. A shared trunk cannot do this: it would have to
+    read the cards. The equities need every player's hole cards, so they exist only while
+    training: `forward(..., critic_extra=None)` returns value 0 and runs nothing of the critic,
+    which is what a playing model does. Policy and critic gradients do not meet
+    (`test_the_two_halves_are_trained_apart`), so the update costs about one more trunk.
+  - **How the table's cards reach the critic**: `TableBank` keeps `hole_cards` from the table's
+    `on_hand_started` hook, `RLAgentPlayer(deal_holes=...)` attaches a `DealView` to each
+    `DecisionRecord`, and `SelfPlayCollector(critic=CriticFns(...))` fills in, **after all the
+    hands are played and in large batches**, `critic_extra` and the critic's `value`, and only then
+    computes GAE (`policy_fn` returns value 0 in this mode). `make_critic_fns` builds the two
+    closures from the live model and the full, frozen equity network. `TrainingBatch.critic_extra`
+    is required: `build_batch` refuses a decision without it.
+  - **The equity file is the source of truth for the frozen encoder**: on `--resume` the encoder
+    is reloaded from it. Changing the file under a running fleet gives models whose trunk was
+    trained on other features: do it with a reset.
+  - Tests: `tests/unit/test_rl_equity_mode.py` (builds its own small equity network). Every other
+    test builds its networks through `tests/support.py`: `tiny_model` (a `TINY_EQUITY` encoder),
+    `tiny_parts` (`model=` and `critic=` for a trainer), `fake_critic` and `fake_collector` (a
+    collector with a torch-free critic). Never build a `PokerActorCritic` in a test without them.
 
 ## Tables: sizes and stacks (`rl/table_mix.py`)
 
@@ -441,7 +606,7 @@ every CLI that plays hands shares and `poker-loop` forwards to workers and shard
   `reward_scale` divides by; it replaces the old fixed starting stack wherever a
   normalisation constant was wanted, which is why `game.big_blind` and
   `game.starting_stack` kept working on a `TableMix`. No `FEATURE_VERSION` bump.
-  `env.py`, `duel_power` and `poker-play` still play one explicit `GameConfig`.
+  `duel_power` still plays one explicit `GameConfig`.
 - **Size per hand in training, per session in every rated result.** The collector
   draws a size for every hand (`TableBank` keeps one `Table` per size, each with its
   own button, so positions stay uniform). Validation, the benchmark and the
@@ -470,6 +635,107 @@ every CLI that plays hands shares and `poker-loop` forwards to workers and shard
   6-handed table with identical stacks and means something else on this scale, so
   the ledger and the frozen anchors start again (the project restarts from zero
   at v2; there is no code to read old ratings).
+
+## Opponent statistics (`engine/stats.py`)
+
+VPIP, PFR, 3-bet, fold-to-3bet, steal, postflop aggression, c-bet, fold-to-c-bet and
+WTSD of every player at the table, fed to the network as part of the observation, so a
+model can adapt to whoever is in front of it.
+
+- **The tracker: `engine/stats.py`, `Observation.seat_stats`, 20 slots per seat.** A
+  `StatsTracker` (pure Python, in the engine, importing nothing from `players/` or
+  `rl/`) keeps a `WINDOW`-hand (200) sliding window per `player_id`; `Table(...,
+  stats_tracker=)` feeds it every finished hand and puts each seat's vector in the
+  `Observation`s of the hands that follow. Every statistic is *events over
+  opportunities*, counted once per hand at the player's first chance (AGG counts
+  every postflop chip-in); an all-in for no more than the bet is a call (decided by
+  `ActionRecord.amount`, the street total after the action). The vector is
+  `USED_SLOTS` = 20 numbers (a "supplied" flag, hands in the window, then a rate and
+  a log-scaled opportunity count per statistic, so zero opportunities reads as
+  unknown), and `STAT_SLOTS` is that same 20: a seat block is 9 base features + 20 = 29.
+  **The input first had room for 100 slots a seat, the other 80 reserved for later and
+  always zero** (`OBS_DIM` 1380, `FEATURE_VERSION` 2); they were removed (`OBS_DIM` **660**,
+  `FEATURE_VERSION` **3**), because a statistic added later changes what the input means
+  anyway, which is a new feature version whatever the room, and 80 zeros a seat only cost
+  parameters and time. Every checkpoint of the earlier versions is rejected by
+  `check_compatible`: a fleet reset. Adding the statistics had cost 0.78M -> 1.24M
+  parameters and a batch-1 forward ~364 -> ~438 us; at 660 inputs the original network
+  is 0.87M.
+- **Computed at the `Table`, not in the player.** An `RLAgentPlayer` only sees the
+  action history when it is its turn, so once it folds preflop it stops seeing what the
+  others do and VPIP/3-bet would be lost exactly there. The `Table` hands the tracker
+  every finished hand and puts the numbers in the `Observation` as an optional field;
+  the engine keeps not importing from `players/`.
+- **Counted over opportunities, not over hands.** A percentage is over the hands where
+  the action was *possible*: a 3-bet% over every hand is misleading. Pure Python, no
+  torch, in the ordinary test suite.
+- **Every statistic carries its sample size, over a sliding window.** A VPIP of 60% over
+  8 hands and over 200 hands are different facts, and a model fed the bare percentage
+  would trust both equally: hence the opportunity count next to each rate, so zero
+  samples reads as "unknown" with no special case. A window, not a cumulative mean: in a
+  real room players change often, and a long history describes someone who is no longer
+  there.
+- **Optional, seat by seat.** A seat with no entry in `seat_stats` -- no tracker, a
+  player the tracker has not seen, the spot screen -- encodes as zeros in its stat
+  slots, which is also what an all-unknown vector looks like; there is no flag and no
+  special case. More than `STAT_SLOTS` numbers is a `ValueError` (silently truncating
+  would drop some); values are clipped to [0, 1]. **Changing what any slot means is a
+  `FEATURE_VERSION` bump.** Pinned by `tests/unit/test_stats.py` and the statistics
+  section at the end of `test_rl_features.py`.
+- **How each model plays is measured during training and shown in the
+  dashboard.** `SelfPlayCollector` pools every seat the learner took and counts the
+  same nine statistics over its last `STYLE_WINDOW` (20,000) seat-hands (about nine
+  thousand hands at the default mixture; `TableBank.last_hand` hands it the finished
+  hand, `analyse_hand` does the counting). `poker-train` prints, on the first
+  iteration and every tenth, `stile (N mani): [vpip e/o | pfr e/o | ...]` -- raw
+  counts, closed by a bracket so a line cut inside the last number cannot parse as a
+  wrong reading (`rl/style_log.py`, format and parser in one file). `monitor` reads it
+  into `WorkerHistory.style_rate/style_latest/style_hands` and a worker's expanded
+  panel draws three charts of three lines each (entering the pot: VPIP/PFR/steal;
+  reacting to raises: 3-bet/fold to 3-bet/fold to c-bet; postflop: aggression/c-bet/WTSD) with
+  the last rate and the sample behind each in the note.
+  **The style is also kept per group of table sizes** (`style_log.SIZE_GROUPS`: 2-3,
+  4-6 and 7-9 players; `SelfPlayCollector.style_by_group`, one `STYLE_WINDOW` each),
+  printed after the pooled line as `stile 4-6 (N mani): [...]`, read into
+  `WorkerHistory.style_by_size`, and the panel draws its three charts **once per group**
+  instead of the pooled ones: a model plays differently heads-up and nine-handed, and a
+  pooled VPIP mostly says how the mixture of table sizes was drawn. A log from before
+  the per-size lines has only the pooled line, and the panel then draws that. The pooled
+  style is still what the published metadata and the ranking carry. The final style also rides in the published model's metadata
+  (`style`, `style_hands`). This describes the *model*, not the opponents it faced: it
+  is the learner's own VPIP/PFR/..., which is what tells a collapsed or lopsided
+  policy from a healthy one at a glance. It is not the tracker's per-opponent window.
+- **Training supplies them, from tables that last.** `SelfPlayCollector` plays
+  `concurrent_tables` (8) tables in turn, hand by hand, and each keeps the same size,
+  the same players (learner seats and pool models, drawn once) and a fresh `StatsTracker`
+  for `table_hands` (200) hands (`config.toml` `[training]`, `--table-hands`,
+  `--concurrent-tables`, forwarded by `poker-loop`; recorded in `run_metadata`). The
+  first hand of a table has no statistics (all zeros, flag 0) and they fill in from
+  there, which is also what teaches the model to read an unknown. Stacks are still
+  redrawn every hand and cards are still i.i.d.; what is no longer independent is who
+  sits opposite, for 200 hands at a time. **Concurrent tables exist for the batch**: one
+  table at a time would make a 500-hand iteration two or three opponent sets repeated,
+  where eight in turn keep a batch varied. `TableBank` keys its tables by `(slot, size)`
+  (`slot` defaults to 0, so every other caller is unchanged) and `reset_stats` starts a
+  table's tracker afresh. `table_hands = 1` is the old behaviour. Measured on a small
+  network: 99% of decisions carry statistics, and a hand costs ~27% more CPU (104 -> 76
+  hands/s: the tracker and the encoding of nonzero slots). Pinned in
+  `test_rl_rollout.py` (the flag in the encoded observation).
+- **Rated sessions supply them too.** `TableBank.play_session` resets the table's
+  `StatsTracker` at the start of every session and lets it watch the session's hands, so
+  validation (`evaluate_against_pool`), the benchmark pass and the Elo/population passes
+  (`play_global_sessions`, the arenas, the shards) all play with the statistics a model
+  trained on, and `duel_power`'s own table (hence `elo_bb_grid`) has a tracker as well.
+  A session has its own: the next one, with other players in the seats, starts blank (the
+  first hands of a session read "unknown", as the first hands of a training table do).
+  Before this a model trained on tables with statistics was rated on tables where they
+  were all zero. **It changes what every rating means** (a model that reads statistics now
+  reads them in its rating too, and a hand costs ~27% more CPU, so every rated pass is
+  slower): a fleet reset, which `FEATURE_VERSION` 3 already is. Pinned by
+  `test_a_session_gives_the_models_the_statistics_of_the_players_in_front_of_them` and
+  `test_every_session_starts_with_blank_statistics_whoever_sat_in_the_last_one`. Still
+  without them: the spot screen (no tracker, so zeros; see the TODO). The GUI's table has one per
+  session now.
 
 ## Continuous training loop (`rl/loop.py`)
 
@@ -573,6 +839,9 @@ and run at the speed of one), organised into generations.
     stretch ("fine training"), because "training" at 100/100 really means the
     wrap-up — the saving, the publishing and the pass against the anchors. The
     run ends with a `done` marker.
+  - **The dashboard page is in English, `--status` in Italian.** The page keeps its own
+    `STAGE_LABELS` and `stage_label` (`rl/dashboard.py`), keyed by the same stage
+    constants as `monitor.STAGE_LABELS`, so adding a stage means naming it in both.
   - **The two long stages also report how far into themselves they are**
     (`phases.py::progress_marker`/`parse_progress`, `train.py::PhaseProgress`).
     A marker says *what* a worker is doing; these say *how much is left*. The
@@ -762,7 +1031,7 @@ and run at the speed of one), organised into generations.
   attributed afterwards to the settings that produced it.
   - **The axes** (`HP_AXES`): `--lr`, `--hands`, `--opponent-probability`,
     `--ppo-epochs`, `--clip-epsilon`, `--minibatch-size`, `--gae-lambda`,
-    `--value-coef`, `--max-grad-norm`, `--entropy-coef` and the two that decide
+    `--value-coef`, `--policy-max-grad-norm`, `--critic-max-grad-norm`, `--entropy-coef` and the two that decide
     how strong a field the worker draws, `--pool-top-share` and `--pool-top-n`.
     **`--pool-models`, `--global-sample` and `--global-sessions` are held fixed**:
     the first is the field's *size*, which is also what a run's cost scales with,
@@ -1289,6 +1558,18 @@ and run at the speed of one), organised into generations.
   - Candidates are taken from the lowest rating upwards and each must also clear
     the previously added one by more than the margin, so anchors stay at least 10
     apart instead of a cluster joining at once.
+  - **With fewer anchors than a table needs (`minimum_anchors` = largest table - 1, so 8)
+    it bootstraps instead**: it fills the missing places with the models whose ratings
+    are as far apart as possible (`spread_pick`, farthest-point selection: the strongest,
+    the weakest, then each time the one furthest from everything chosen, existing anchors
+    included), with no percentile and no margin. Nothing can be stronger than a best
+    anchor that does not exist, and the pass against the anchors cannot seat a table
+    until it has 8; and a ladder with both ends and an even spread measures a new model
+    better than eight near-identical strong ones. The rating of a model with few sessions
+    is a weak reason to freeze it, accepted because an empty benchmark is worse; the
+    arena run it requests settles them against each other. Models that have not played
+    at all are used only when the played ones run out. Once the count is met the ordinary
+    rule applies.
   - An added model is *moved* into the flat `checkpoints/benchmark/`, every other
     copy deleted, `frozen=True` at the rating it holds, `ref` rewritten. No
     re-settling by hand. Held under the `__prune__` lock so a prune cannot
@@ -1308,6 +1589,28 @@ and run at the speed of one), organised into generations.
     an anchor's member file and leaving the `.pt` behind lets the live fleet
     re-register the orphan as a frozen anchor at 1500 with few games. Delete the
     file *and* the member together, and never one without the other.
+- **A member is `label`, `ref`, `rating`, `games`, `frozen` and how it plays**
+  (`style`: `[events, opportunities]` per `engine/stats.py` statistic, and
+  `style_hands`, at most `style_log.STYLE_WINDOW` seat-hands). `kind`, `iteration` and
+  `benchmark` are gone: every member is a model, and the other two were read by nothing.
+  Descriptive only: nothing ranks or draws on it. **It is measured wherever a model plays
+  and kept current**: the training run's own window (the first value); the benchmark pass
+  (`BenchmarkRating.style`, folded into it before publishing, so the published style is
+  mostly the 500,000 hands against the anchors); and every population/Elo pass, where
+  `play_global_sessions(styles=)` fills one `StyleTally.export` per session, carried in the
+  pending file's `styles` list (aligned with `sessions`, requeued with them) and merged by
+  `_apply_session` under the member's lock. `style_log.merge_style` adds counts and, past
+  the window, scales old and new down together so the oldest evidence fades without a
+  record of where each hand came from. The sidecar carries it too, so a salvaged model
+  keeps it. `benchmark_arena` does not update it (anchors get it from the ordinary passes).
+  **No reset is needed**: `member_from_json` takes the fields a member has and leaves out
+  the rest of the stored entry, whatever it is called (so no list of old names is kept),
+  and a field the file lacks takes its default; the file is rewritten in the new shape the
+  next time it is written. A member with no style
+  gets one two ways: the supervisor copies the `style`/`style_hands` its checkpoint was
+  published with (`global_arena.backfill_member_styles`, at the start of every generation,
+  at most 50 checkpoints a call, each label tried once per supervisor process), and every
+  pass that seats it measures one. The shard output changed shape (`{"sessions", "styles"}`).
 - **`ref` is a real, maintained path, not a hint.** A member's `ref` is where its
   checkpoint is *now*, relative to the same root the passes run from
   (`checkpoints/...`). It is kept current three ways: promotion into the
@@ -1381,14 +1684,14 @@ reads: `pick_parents` draws uniformly from the top 100.
   once per hand, so a fixed seed deals the identical sequence no matter how the
   betting goes; `(a - b) / 2` over the two arrangements is the skill effect
   alone. Always run a null control (a model against itself) — it must read ~0 —
-  so the estimator is known to invent nothing. `rl/duel_power.py` does this.
+  so the estimator is known to invent nothing. `studies/agents/duel_power.py` does this.
 - **Tried and rejected**: weighting the Elo update by chip margin (two variants,
   both turned out to be a lower effective K in disguise — see the TODO entry on
   the bb difference), and lowering `DEFAULT_K_SCHEDULE` is what improved ordering
   in simulation. The K schedule is derived from the session's statistical power,
   not tuned, so do not edit its numbers by hand.
 
-## How long must a session be? (`rl/duel_power.py`)
+## How long must a session be? (`studies/agents/duel_power.py`)
 
 Everything the ranking does assumes that the model finishing a session ahead is
 the better one. That is not a fact, it is a probability, and it depends entirely
@@ -1396,7 +1699,7 @@ on the session length. `poker-train`, the population pass and every rated
 result rest on it, so it is worth measuring rather than assuming. Run by hand,
 nothing imports it:
 
-    OMP_NUM_THREADS=1 python -m pokerlab.rl.duel_power --model-a '#1' --model-b '#100'
+    OMP_NUM_THREADS=1 PYTHONPATH=src:studies/agents python studies/agents/duel_power.py --model-a '#1' --model-b '#100'
 
 - **A long stream *is* many sessions.** Stacks are reset after every hand in
   every evaluation path here, so hands are i.i.d. and a stream of 10,000 hands
@@ -1447,13 +1750,85 @@ before trusting any figure from an earlier one: the edges depend on the models.
 - **The statistics half is pure Python and the play half imports torch lazily**,
   the same argument as `features.py` and `pool_registry.py`: the arithmetic that
   decides what the experiment *concludes* belongs in the ordinary test suite
-  with no extra dependency. `tests/unit/test_rl_duel_power.py` (21 tests, no
+  with no extra dependency. `tests/unit/test_study_duel_power.py` (21 tests, no
   torch) covers the blocking, the histogram binning, the round-robin sampling,
   the Wilson interval, and the round trip between `win_probability` and
   `hands_for_probability`.
 - `--save` writes the per-hand chip deltas and `--load` re-analyses them without
   replaying: the hands are the expensive part by orders of magnitude, so trying
   a different grid of session lengths should cost nothing.
+
+## Studies of agents (`studies/agents/`)
+
+The tools that only measure or study models live in `studies/agents/`, not in `src/`:
+`duel_power.py` (how many hands a session needs, see the next sections), `elo_bb_grid.py`
+(bb/100 per Elo gap, see the TODO on the bb difference), `agent_study.py` (how one model
+plays), `hud_study.py` (whether the opponents' HUD changes what it does) and
+`archetype_study.py` (against opponents pushed into archetypes: does it read them, does it pay). They are scripts, run with `PYTHONPATH=src:studies/agents python studies/agents/<x>.py`;
+**`src/` never imports from `studies/`**, and they import each other as bare modules
+(`from duel_power import resolve_model`). Their tests are `tests/unit/test_study_*.py` (area
+`study`), which import them the same way: `tests/conftest.py` puts `studies/agents` on
+`sys.path`. A change under `src/pokerlab/rl/` or the engine also runs the `study` area
+(`tests/affected.py`).
+
+- **`agent_study.py`: how one model plays, against itself.** `--model` takes a label, a path
+  or `#N`; the model takes every seat on the training mixture (or `--players`/`--stack-bb`),
+  through `TableBank.play_session`, so it reads opponent statistics as in a rated session.
+  `--jobs` processes, `--save`/`--load` a JSON-lines file of the hands, so the report can be
+  re-read without replaying. Everything is read back from `HandHistory` (pure Python, tested
+  on hand-built and bot-played hands): the nine `engine/stats.py` statistics; preflop by band
+  of starting hand (169 hands ranked by the Chen formula, cut by share of the 1,326 combos:
+  5/15/35/60%) when nobody has raised, facing a raise and facing a 3-bet, and by position;
+  13x13 grids of first-in raise rate and VPIP; postflop by what the hand's own cards add to
+  the board (`made_class`: nothing, draw, pair, top pair or better, two pair, trips/set,
+  straight or better) checked to and facing a bet; river bets by class and against the cards
+  still in (self-play, so they are known); strong hands checked or flat-called (a call
+  against an all-in, with no raise left to make, is not counted as a slowplay) and strong
+  hands folded; bb won per band and position; example hands with the seat in question
+  starred. An all-in for no more than the bet is a call, as in `engine/stats.py`.
+  **Every seat-hand is also counted in its group of table sizes (2-3/4-6/7-9, `style_log`)
+  and of effective stack (<10/10-30/30+ bb, `value_diagnostics`; its own stack or the
+  deepest other, the smaller)**, in the same pass (`Study.groups`): the report puts the
+  groups side by side in two tables of the main numbers, and `--by giocatori|stack` adds the
+  whole report once per group. Per stack the bb won do not sum to zero (short against deep).
+- **`hud_study.py`: does a model play differently against different HUDs?** A
+  counterfactual: the model's own self-play states (`--decisions`), each shown to it again
+  identical but for `Observation.seat_stats`, every opponent given one profile, and the
+  softmax over the 11 bins compared exactly (no sampling). Profiles: none (`sconosciuto`),
+  the population's median style (the reference, from `style` of every member with at least
+  5,000 seat-hands), the real styles of the tightest and loosest member, and five human
+  archetypes (nit, TAG, LAG, maniaco, calling station) whose rates outside the population's
+  measured range are marked: the models never met them, so the answer is an
+  extrapolation. A profile is the exact vector a `StatsTracker` gives a player seen for
+  `WINDOW` hands, with the population's opportunities per hand and the exact rate in each
+  rate slot. Reports the total variation and the share of decisions whose most likely
+  action changes, by street; behaviours a HUD should move (steal, bluff, fold to a bet,
+  value raise); the mass of fold/call/raise sizes per situation. First reading (#1, 20,000
+  decisions): known against unknown moves it most (TV ~14%: unknown opponents make it
+  tighter and more passive); between profiles only 2-5%, along one axis -- the more
+  aggressive the opponents' numbers, the more it raises and the less it folds -- so it
+  folds more to a nit's raise (right) but also steals less from a nit (not exploitative).
+  Run on seven models (#1 to #130): the known/unknown shift is 12-20% in all of them, in a
+  direction that differs by model, and the profile-to-profile changes are small and
+  inconsistent between models -- nobody bets more for value against a calling station.
+- **`archetype_study.py`: real archetypes, a real HUD, and what reading it earns.** The
+  opponents are the model (or `--opponent-model`) with a fixed push on its logits
+  (`ARCHETYPE_BIASES` x `--strength`, by situation: preflop / checked to / facing a bet):
+  a nit, a maniaco, a calling station. The push is added to the network's own logits, so
+  cards still count and only the style bends. One hero seat per table, the rest the
+  archetype, with a `StatsTracker`, so the hero reads what they actually did. Per
+  archetype: their measured style against the population's range; the `hud_study`
+  counterfactual on the hero's states with the real HUD, the population's median HUD and
+  none (`evaluate_variants`), with the direction an exploiter would move each behaviour
+  (`EXPECTED`); and the HUD's value in chips -- the same hands played twice from the same
+  seeds (table, stacks, size, seat and torch all seeded), once reading the real HUD and once
+  the population's median for everyone, the paired difference in bb/100 with a 95%
+  interval. First reading (#1, strength 2, 60,000 hands per arm): the real HUD moves its
+  actions far more than made-up profiles (8-14% against the median HUD), but mostly one
+  way -- more aggressive and fewer folds against all three, right against the maniac (folds
+  to a bet with nothing 42% instead of 62%), wrong against the nit and the station (calls
+  their bets lighter, bluffs the station more) -- and it earns nothing measurable: -3.7 +-
+  5.9 (nit), -1.7 +- 11.2 (maniaco), +2.4 +- 9.9 (station) bb/100.
 
 ## GUI (`gui/app.py`, `players/gui.py`)
 
@@ -1507,6 +1882,42 @@ dependency (Flask, etc.) — it ships with Python. Architecture:
     changes `OBS_DIM` or `FEATURE_VERSION`, `check_compatible` rejects these files,
     so the GUI's default table, the bot picker and the spot advisors would find
     nothing loadable until they are replaced.
+- **Blinds can go up during a session**: two fields on the setup screen ("Aumenta i bui ogni N
+  mani", empty = never, and the factor, comma or dot) build a `BlindSchedule` passed to the
+  session's `Table`. The table frame follows each hand's big blind (the wheel's step is in big
+  blinds) and logs "I bui salgono" when it changes. Bots keep reading in big blinds, see the
+  engine note above.
+- **The seat whose turn it is is painted green, and each seat shows its last action under
+  "Bet:"** (`TURN_BACKGROUND`, `_set_turn_seat`, `_last_actions`). The tint is a third family of
+  styles beside `Seat.*` and `Dealer.*`, applied by `_apply_tint`: the turn wins over the dealer's
+  yellow (the "D" above the box still says who has the button). **A bot decides in microseconds
+  and `ActionReporter` pauses *after* the action, so the green has to name the next player
+  before they are asked**: the engine announces it (`first_actor` in `on_hand_started` and
+  `on_street_dealt`, `next_seat` in `on_action_applied`, None when nobody is due), computed with
+  the same test the round uses to ask (`table._next_to_act`), so during the pause that holds the
+  finished action the next player is already green -- and in step mode it stays green until
+  "Avanti". `on_street_dealt` now fires *after* `start_new_street_betting` (it only sets up the
+  street; nobody is asked until the hook returns) to be able to say who opens it. The last
+  action is the log's own text (`_describe_action`) for the seat's latest *voluntary* action of
+  the hand (blinds do not count), cleared when a new hand starts. Pinned by
+  `test_the_player_announced_as_next_is_the_one_asked_next` (engine, 900 random hands) and
+  `test_the_green_seat_is_the_one_that_acts_next_over_real_hands` (the real hooks and reporter
+  replayed into a frame).
+- **A bot's action probabilities, in step mode with the opponents' cards shown** (a panel under
+  the seats, `_show_probabilities`): for the bot about to act (the green seat), each legal bin
+  with its probability, a bar, the raise's amount, the likeliest in bold. Bots only: a human has
+  no advisor (`TableFrame(advisors=)`, built in `start_session` from the `RLAgentPlayer`s,
+  `action_probabilities`). The numbers are the policy's own softmax (`make_policy_fn(...)
+  .distribution`, with the opponent style if any), computed without sampling, so asking does not
+  move the random stream the game depends on. **The decision is built ahead of the question**:
+  `first_actor_view` (`on_hand_started`, `on_street_dealt`) and `next_view`
+  (`on_action_applied`) are `(Observation, legal actions)`, exactly what that player is then
+  handed (pinned in `test_full_hand_flow.py`), so the panel can fill while the game is held. An
+  action that follows another gets its pause from `ActionReporter`; **the first action of a hand
+  or a street follows none, so `wait_for_first_bot` holds the game for "Avanti" there too -- only
+  in step mode with the spy on** (the rest of the time the pacing is what it was). The spy
+  state lives in `step_mode_state["spy"]` because the session thread cannot read a Tk variable.
+  Toggling the spy off while the game is held on that gate does not release it: press Avanti.
 - **Busted players disappear from the table**: `TableFrame._hide_seat`
   calls `grid_remove()` (not just blanking the labels) on a seat's box once
   its stack hits 0, called from both `_render_observation` (seat missing
@@ -1519,8 +1930,7 @@ dependency (Flask, etc.) — it ships with Python. Architecture:
 - **`GuiPlayer`** (`players/gui.py`) is the only new integration point, and
   it's tiny: `act()` puts a `GuiEvent("your_turn", (observation, legal_actions))`
   onto a shared `queue.Queue`, then blocks on its own private `decisions`
-  queue until something pushes an `Action` back. Same shape as `ManualPlayer`
-  swapping `input()` for a blocking `queue.get()` — `Table`/`engine` are
+  queue until something pushes an `Action` back — `Table`/`engine` are
   completely unaware a GUI exists.
 - **Threading model**: Tkinter's mainloop must own the main thread, so
   `Table.play_session`-equivalent play (`_run_session` in `gui/app.py`) runs
@@ -1630,16 +2040,19 @@ dependency (Flask, etc.) — it ships with Python. Architecture:
   begins with no action having been taken -- every seat all-in on its own
   blind -- and then nobody has folded, which is the one case the method
   guards.
-- **Every participant's cards are shown for `SHOWDOWN_REVEAL_SECONDS`
-  (1.0) when a hand ends**, then the table is cleared by a `self.after`
-  timer (`_reveal_hand_end` / `_clear_after_showdown`). Two things that
-  look like details and are not: a seat that just *busted* is deliberately
-  **not** hidden during the reveal -- a player who shoved and lost is
-  precisely the one whose cards are worth seeing, and `_hide_seat` would
-  delete them the instant they became showable -- so the hiding moved into
-  the clear; and the timer is cancelled on the next `hand_started`
-  (`_cancel_pending_clear`) and guarded with `winfo_exists`, or it fires
-  into a frame the "Torna al menu" button has destroyed.
+- **A hand stays on the table until "Mano successiva" is pressed.** At a hand's end every
+  participant's cards are turned face-up (`_reveal_hand_end`) and the session thread blocks on
+  `next_hand_gate` (event `awaiting_next_hand`, no timer: `NEW_HAND_DELAY_SECONDS` and
+  `SHOWDOWN_REVEAL_SECONDS` are gone); the button appears in the actions row. The table is
+  cleared (`_clear_table`) only when the next `hand_started` arrives, and a seat that just
+  *busted* is deliberately **not** hidden before that -- a player who shoved and lost is
+  precisely the one whose cards are worth seeing. No button after the last hand or when fewer
+  than two players have chips (the session ends instead).
+- **Per-street last action, grey folds.** The "last action" line under a seat's bet shows only
+  an action of the *current* street (`_last_actions` filters on `observation.street`, and
+  `_render_street_dealt` clears every line). A folded seat's box is dark grey (`Folded.*`
+  styles, `FOLDED_BACKGROUND`, light text) until the next hand; turn > folded > dealer in
+  `_apply_tint`.
 - **The raise panel is scrollable and has pot-fraction shortcuts.** A mouse
   wheel notch over the slider moves the bet by `WHEEL_STEP_BIG_BLINDS` big
   blinds, and a row of buttons (`POT_FRACTION_PRESETS`: 30/50/66/100%) sets
@@ -1689,9 +2102,9 @@ dependency (Flask, etc.) — it ships with Python. Architecture:
   a window shorter than the summed content height. Any future widget added below existing content should go through
   the same `side="bottom"` treatment rather than plain `.pack()`.
 - **Reuses `cli/play.py`'s `build_players`** (with its optional
-  `human_player_factory` param, defaulting to `ManualPlayer`) and
+  `human_player_factory` param, required whenever there is a human seat) and
   `validate_bot_key`, so the GUI's bot-selection field accepts the exact
-  same `model:<path>` spec as `poker-play --bots`, with zero duplicated
+  `model:<path>` spec the rest of the project uses, with zero duplicated
   parsing logic.
 - **Known environment quirk, worked around in code**: this project's own
   Python install has `TCL_LIBRARY`/`TK_LIBRARY` pointing at the wrong
@@ -2253,6 +2666,13 @@ parallelism just oversubscribes: on a 32-core box the default 32 threads burn
 seed) — which is what makes it practical to run many independent training runs in
 parallel across the cores instead of one run hogging all of them.
 
+**Device: `--device` defaults to `auto` in every CLI that runs a network** (`rl/device.py::resolve_device`:
+`cuda` if torch sees a GPU, else `cpu`; the torch-free programs resolve it only where they load a model).
+`poker-loop` forwards `auto` to its workers. Know the cost before leaving it on a box with a GPU: a
+batch-1 forward of this small MLP is not faster on a GPU than on a core, the engine is most of a hand,
+and every worker process opens its own CUDA context, so twenty-five workers on one GPU mean twenty-five
+contexts. Set `device = "cpu"` in the `[fleet]` section of `config.toml` (or `--device cpu`) where that matters.
+
 Throughput single-threaded was of the order of **50 hands/s** at a 6-handed table;
 a hand costs about as much as it has seats, so the default mixture (4.35 seats on
 average) should be faster. Measure it on the machine before planning a run's length.
@@ -2345,10 +2765,6 @@ poker-dashboard --host 0.0.0.0 --iterations 1000   # reachable from the other ma
 # every worker also tries a cross-machine population Elo pass at the end of
 # its run (on by default -- see "Continuous training loop" above)
 poker-loop --workers 8 --no-global-elo   # opt out fleet-wide
-
-poker-play --list-bots                       # show the best trained models found
-poker-play --players 6 --stack 200 --sb 1 --bb 2 --hands 10 --human-seats 1
-poker-play --players 9 --hands 500 --human-seats 0 --seed 42 --bots model:checkpoints/models/<a-published-model>.pt
 ```
 
 Re-run `pip install -e ".[dev]"` after pulling changes that add a new
@@ -2368,86 +2784,14 @@ current behaviour is coherent. Any figure quoted comes from a measurement that
 must be repeated on the population it will be used against: models change, and so
 do the numbers.
 
-- **Opponent statistics (a HUD) so the model can adapt to different players —
-  the input and the tracker exist, the training side does not.** VPIP, PFR, 3-bet,
-  fold-to-3bet, steal, postflop aggression, c-bet, fold-to-c-bet and WTSD, fed to
-  the network as part of the observation.
-  - **Done: `engine/stats.py`, `Observation.seat_stats`, 100 slots per seat.** A
-    `StatsTracker` (pure Python, in the engine, importing nothing from `players/` or
-    `rl/`) keeps a `WINDOW`-hand (200) sliding window per `player_id`; `Table(...,
-    stats_tracker=)` feeds it every finished hand and puts each seat's vector in the
-    `Observation`s of the hands that follow. Every statistic is *events over
-    opportunities*, counted once per hand at the player's first chance (AGG counts
-    every postflop chip-in); an all-in for no more than the bet is a call (decided by
-    `ActionRecord.amount`, the street total after the action). The vector is
-    `USED_SLOTS` = 20 numbers (a "supplied" flag, hands in the window, then a rate and
-    a log-scaled opportunity count per statistic, so zero opportunities reads as
-    unknown) inside the `STAT_SLOTS` = 100 each seat has room for; **the other 80 are
-    reserved and left at zero**. Every seat block is now 9 base features + 100, so
-    **`OBS_DIM` is 1380 and `FEATURE_VERSION` 2**: every v1 checkpoint is rejected by
-    `check_compatible`, a fleet reset (v2 has no published models to lose). Cost: the
-    network goes from 0.78M to 1.24M parameters and a batch-1 forward from ~364 to
-    ~438 us (+20%).
-  - **Optional, seat by seat.** A seat with no entry in `seat_stats` -- no tracker, a
-    player the tracker has not seen, the spot screen -- encodes as zeros in its stat
-    slots, which is also what an all-unknown vector looks like; there is no flag and no
-    special case. More than `STAT_SLOTS` numbers is a `ValueError` (silently truncating
-    would drop some); values are clipped to [0, 1]. **Changing what any slot means is a
-    `FEATURE_VERSION` bump.** Pinned by `tests/unit/test_stats.py` and the statistics
-    section at the end of `test_rl_features.py`.
-  - **Done: how each model plays is measured during training and shown in the
-    dashboard.** `SelfPlayCollector` pools every seat the learner took and counts the
-    same nine statistics over its last `STYLE_WINDOW` (20,000) seat-hands (about nine
-    thousand hands at the default mixture; `TableBank.last_hand` hands it the finished
-    hand, `analyse_hand` does the counting). `poker-train` prints, on the first
-    iteration and every tenth, `stile (N mani): [vpip e/o | pfr e/o | ...]` -- raw
-    counts, closed by a bracket so a line cut inside the last number cannot parse as a
-    wrong reading (`rl/style_log.py`, format and parser in one file). `monitor` reads it
-    into `WorkerHistory.style_rate/style_latest/style_hands` and a worker's expanded
-    panel draws two charts (preflop, postflop) with the last rate and the sample behind
-    each in the note. The final style also rides in the published model's metadata
-    (`style`, `style_hands`). This describes the *model*, not the opponents it faced: it
-    is the learner's own VPIP/PFR/..., which is what tells a collapsed or lopsided
-    policy from a healthy one at a glance. It is not the tracker's per-opponent window.
-  - **NOT done: nothing in training supplies them.** `SelfPlayCollector` builds its
-    `Table`s with no tracker, so the model sees 900 zeros of statistics and has no way to
-    learn to read them. What it needs is below, and it is a change to the training
-    distribution, not a plumbing job.
-  - **Opponents need an identity in training, and today they have none.** Stacks
-    reset after every hand and `SeatProxy` swaps who sits where between hands, so
-    "the VPIP of the player on my left" means nothing. Opponents must stay the
-    same for a block of at least the statistics window (~200 hands); the
-    1,000-hand rated session already has that shape, the training collector does
-    not.
-  - **Where to compute them: at the `Table`, not in the player.** An
-    `RLAgentPlayer` only sees the action history when it is its turn, so once it
-    folds preflop it stops seeing what the others do and VPIP/3-bet would be
-    lost exactly there. A tracker fed by `Table.on_action_applied` (which exists)
-    keeps a per-seat window and hands the numbers to the `Observation` as an
-    optional field. The engine keeps not importing from `players/`.
-  - **Definitions, fixed once and tested.** Percentages are counted over the
-    hands where the action was *possible* (opportunities), not over all hands: a
-    3-bet% over every hand is misleading. Pure Python, no torch, in the ordinary
-    test suite.
-  - **Every statistic carries its sample size, over a window of at most ~200
-    hands.** A VPIP of 60% over 8 hands and over 200 hands are different facts,
-    and a model fed the bare percentage would trust both equally. In the
-    observation: an opportunity count (normalised) next to each stat, or the stat
-    shrunk toward a prior in proportion to the count; zero samples then reads as
-    "unknown" with no special case. Keep a sliding window, not a cumulative mean:
-    in a real room players change often, and a long history describes someone who
-    is no longer there. The metric of a rollout is noisy over few hands, so
-    anything that reads it needs a window and must know how full it is, as
-    `REWARD_WINDOW_HANDS` and its partial-window marker do for `train/100`.
-  - **Measure before building the training side.** A model can only adapt if the
-    opponents actually differ. Write the metrics module first, run it over the
-    hands the existing pool models play, and look at the spread of VPIP/PFR/3-bet
-    across models. If it is small, adaptation has nothing to learn from and
-    opponent diversity (next item) becomes a prerequisite.
-  - **The spot screen has no history of previous hands**, so its statistics start
-    from "unknown" (zero samples) until a way to supply them exists.
-  - **It changes `OBS_DIM`** (new input features), so it needs the versioned
-    encoder or a population reset — the same decision as "Observation v3" below.
+- **Opponent statistics on the spot screen.** Every training and rated table has a
+  `StatsTracker` (see "Opponent statistics"), and so does the GUI's table now (a fresh one
+  per session, `start_session`, following the human too -- `test_a_session_gives_the_models_
+  their_opponents_statistics`). The spot screen has none: it is one hand rebuilt from a
+  script, with no history of earlier hands, so a model advising there reads every opponent
+  as unknown, which in training it sees only on a table's first hand and which makes it
+  play 12-20% differently (tighter, more passive: `hud_study`). Its statistics need a
+  source first (the vision reader following the client across hands, say).
 - **Style constraints on the models, to keep the population's strategies diverse
   (idea, not yet designed).** Every model is trained toward the same objective
   (bb won against the drawn field) and the fleet's selection pressure is a single
@@ -2466,13 +2810,76 @@ do the numbers.
     an unconstrained one, so `pick_parents` (top 100 by rating) would discard
     every constrained lineage — selection would have to be per-style, or rate
     relative to the style's own niche (quality-diversity in the MAP-Elites
-    sense). (4) *Measuring the metrics*: same definitions and windows as the HUD
-    item above.
+    sense). (4) *Measuring the metrics*: done, the nine statistics of `engine/stats.py`
+    are measured for every model (`style` in each member and published model;
+    `studies/agents/agent_study.py` for one model in depth).
+  - **Measure first whether the population already differs**: the spread of
+    VPIP/PFR/3-bet across the members' `style`. If it is small, the opponent statistics
+    have nothing to adapt to, and this item is what would give them something.
   - Constraining only the loss changes no shape and keeps every stored model
     loadable; a style target given to the network as an input feature changes
     `OBS_DIM`.
-- **Observation v3: encode the action *sequence*, not per-street aggregates.**
-  Postponed from version 2 in favour of the opponent statistics above. Today
+- **Opponents with random styles, so the models have an HUD worth reading (coded, off,
+  scales not yet set, never trained with).** The models barely use the opponent statistics:
+  `studies/agents/hud_study.py` finds the HUD moves their actions only 2-5% between
+  profiles (12-20% between "known" and "unknown", which they read as presence of
+  information, not content), and `archetype_study.py` finds that reading the real HUD of a
+  nit, a maniac or a calling station earns nothing measurable (-3.7, -1.7, +2.4 bb/100,
+  each +-6-11). The likely cause: the opponents in training look alike (half the seats are
+  copies of the learner, the rest the same population), so there is nothing to learn from
+  telling them apart. The idea: give a share of the pool-model seats a **style**, the
+  model's own logits pushed along a few axes (`rl/styles.py`), drawn at random per table
+  and kept for its hands so the statistics fill in over it.
+  - **Two different "small shifts", not to be confused.** How little the models *react* to
+    an HUD is the problem this item is about. How little a push moves the *pushed* model's
+    own statistics is mechanical (a policy with decisive logits is bent little by a push of
+    +-2) and is what the calibration measures; the scales exist to make the styles differ
+    enough to produce different HUDs.
+  - **Decided, with the user.** No fixed archetypes: a fixed nit/maniac/station set would
+    teach the learner to exploit three artificial deformations (a nit that folds aces) and
+    not to read anyone. A continuous space instead: five axes (looseness preflop,
+    aggression preflop, aggression postflop, tenacity facing a bet -- gives up <-> calling
+    station --, bet size), a temperature (erratic <-> mechanical) and noise on the shape of
+    the push, each axis normal around 0 and cut at +-1 so most styles are mild; looseness
+    moves the marginal hands more than the best and the worst. A minority of the seats
+    (`style_share`), the rest real models, which are what the Elo measures. **Not done, by
+    decision: the bluff-vs-value axis, which would need a new HUD statistic (W$SD)** -- the
+    most profitable thing to exploit in poker and the one the HUD cannot show today.
+  - **What exists.** `rl/styles.py` (axes, `StyleConfig`, `--style-*` flags forwarded by
+    `poker-loop`; `RLAgentPlayer(style=)`, `make_policy_fn` adds the push and divides by the
+    temperature; the learner is never given one, so PPO sees its own policy), the collector
+    seating them (`SelfPlayCollector(styles=)`, `styled_seats`/`opponent_seats`),
+    `studies/agents/style_calibration.py` (per axis and strength: the style it buys and its
+    cost in bb/100 paired hand by hand, against the cost of being the #20/#50/#100 instead of
+    the #1) and the `hud_study`/`archetype_study` that measure whether it works. Memory is
+    not a concern: a style is 11 numbers on top of a model loaded once.
+  - **Calibrated (model #1 of 2026-10-08, rating 1892, 80,000 hands a cell, strengths up to
+    8; `checkpoints/studies/style_calibration.json`).** Costs are paired hand by hand, +-4-5
+    bb/100; being the #20, #50 or #100 instead of the #1 costs -3.8, -11.2 and -11.4. Scale of
+    an axis = the strength where its extreme (+-1) costs what the #50 does, the lower of the
+    two signs: looseness 5.8 (-: 7.7), preflop aggression >8, postflop aggression >8, tenacity
+    4.0 (-: it is the costly sign: giving up) and 5.9 (+), bet size 5.9; written rounded down
+    in `config.toml` `[styles]` as `style_scales = [5.5, 8, 8, 4, 5.5]`. Findings: up to
+    strength 2 nothing costs more than noise, and the styles barely move (VPIP 44-51% for
+    looseness +-2), which is why the scales are so much larger than 1; a preflop-aggression
+    push of -8 gives PFR 5% for no cost (the model calls instead); tenacity -8 costs -32.
+    **The ranking moves while the fleet trains** (`#1` was another model a day earlier and
+    mixing two in one file gave nonsense): the calibration pins the labels in its file and
+    `--restart` discards it. Recalibrate when the population has moved far.
+  - **To do.** (1) Switch on (`style_share` ~0.2-0.3, off in the shipped file) on one
+    machine with `--style-share` on its command line (a flag beats the shared file) and
+    compare with the rest. (2) Judge it by:
+    `anchors/100` and the Elo not falling (the styled seats must not take the learner away
+    from the opponents that count); `archetype_study` against archetypes *never seen in
+    training* (the three fixed ones, kept out on purpose) showing the real HUD earning more
+    than the population's; the `hud_study` shift between profiles rising above 2-5%. If
+    they do not move, the models cannot use the HUD as built and the item becomes the
+    learned history encoder (see the next entry).
+  - **Long term**: styles *trained* with the constraint in the PPO loss (the entry on style
+    constraints above) have no artificial defects to exploit, unlike a push on the logits;
+    the push is the cheap way to get diversity now.
+- **Encode the action *sequence*, not per-street aggregates (the next feature version).**
+  Postponed in favour of the opponent statistics, which took version 3. Today
   `_history_aggregates` compresses the whole betting history into 40 numbers — 4
   streets x 10 counters — and what it throws away is exactly what poker is played
   on:
@@ -2500,7 +2907,7 @@ do the numbers.
   unloadable at once. That is a population reset, not a migration. So the work is
   in two parts, in this order:
   - **Part 1, a versioned encoder.** `encode_observation` takes a `version`; the
-    current code becomes the `version=1` branch, untouched. `RLAgentPlayer` reads
+    current code becomes the `version=3` branch, untouched. `RLAgentPlayer` reads
     the version off the checkpoint it wraps and encodes at that version.
     `check_compatible` accepts any version this build can serve rather than only
     the newest. Then models of different versions sit at the same table, each fed
@@ -2511,7 +2918,7 @@ do the numbers.
     positional encoding of the **last 20 actions**, 24 features each: action type
     one-hot (7), actor's seat relative to me (9), street one-hot (4),
     `amount / pot_before` (1), `log(amount / big_blind)` (1), was-it-me (1),
-    slot-occupied/padding (1). 480 new features, so `OBS_DIM` 1380 → 1860. The
+    slot-occupied/padding (1). 480 new features, so `OBS_DIM` 660 → 1140. The
     window of 20 was sized from the distribution of actions per hand (median 12,
     max ~25 including blinds): re-measure it if the table size or stack depth
     changes. When a hand truncates it keeps the most recent actions.
@@ -2524,10 +2931,58 @@ do the numbers.
     stated scale, the one-hots left as they are. A feature left unbounded would
     dominate the first `Linear` and change what `FEATURE_VERSION` means without
     anyone noticing, so the scale is part of the version's definition.
-  - **Why not a GRU over `ActionRecord`s**: it also changes `PokerActorCritic`'s
-    architecture rather than just the features, multiplying the work and the
-    risk, for information the flat encoding already exposes. A recurrent encoder
-    only pays off once hands routinely exceed the window.
+  - **The direction for later (the user's): an embedding of the player's past actions,
+    from an encoder of its own.** The plan is to pass the policy a learned vector that
+    represents how each player has played, the way it is already passed the equity
+    encoder's 32 numbers in place of the card planes. That needs an action-history encoder
+    to be built:
+    - **Two kinds of history, two inputs.** The current hand's actions stay the flat slots
+      of Part 2 (the policy reads them directly; a hand is short). The history across
+      hands is the encoder's job, and its output reaches the policy as numbers per seat,
+      the way the opponent statistics do today: the table puts each seat's vector in the
+      `Observation` (`seat_stats` now), `features.py` lays it out in the seat block, all
+      behind `FEATURE_VERSION`. So Part 1 is still the prerequisite.
+    - **Its own study, its own file.** Designed and trained apart (a `studies/<name>` like
+      `studies/equity_net`), copied into `rl/` because `src/` cannot import from
+      `studies/`, one fleet-wide checkpoint like the equity network's (a key in
+      `[network]`). It runs outside the model (see below), so a published model does not
+      carry it: the model records *which* encoder fed it (its shape and a fingerprint of
+      the file), `check_compatible` refuses a mismatch, and a change of encoder is a
+      fleet reset.
+    - **Decided: each player's history across every hand played at the table, read by a
+      recurrent encoder.** A learned summary of how each opponent has played, in place of
+      (or next to) the nine hand-picked rates of `engine/stats.py`, which it subsumes.
+      What follows from the two choices together:
+      - **The state is kept, not recomputed.** Re-reading hundreds of hands at every
+        decision is out of the question, so each player has a hidden state that one
+        recurrent step updates per action it takes (or per hand it finishes), and a
+        decision reads the current state of every seat. That state is memory across
+        hands, which the `Observation` deliberately has none of: it lives in a tracker
+        beside the table, the way the `StatsTracker` keeps the per-player windows today,
+        keyed by `player_id` and started afresh when the players change (every
+        `table_hands` table in training, every rated session) -- the same lifecycle,
+        already in place. The engine stays torch-free, so this tracker belongs on the
+        `rl/` side, fed by the table's existing hooks (`on_action_applied`, the finished
+        `HandHistory`), and the GUI and the spot screen need one too (see the TODO on
+        their statistics).
+      - **Frozen, trained apart, shared by the table.** End-to-end training with PPO
+        would mean backpropagating through hundreds of hands of a state carried across
+        episodes (each hand is an episode); a frozen encoder makes the states plain
+        inputs, computed once at rollout and stored with the decision like
+        `critic_extra`. And because it is one fleet-wide file, like the equity network,
+        every model at a table reads the *same* per-player states: one tracker per
+        table, not one per model.
+      - **Still to decide**: what it is trained on (predict the player's next action, or
+        its hand strength from its actions -- in self-play every hole card is known, so
+        the encoder learns to read a range -- or both); what one recurrent step sees (one
+        action with its context: street, pot, sizes, position; or a whole hand); the
+        state's size, which is the number of inputs per seat the policy gains; and how
+        it treats a player it has never seen (a learned initial state, the analogue of
+        the statistics' "unknown"). Measure its cost per step like the network shapes:
+        it runs at every action of every player.
+    - This retires the old objection to a recurrent encoder ("it changes
+      `PokerActorCritic`'s architecture"): it does not touch the policy network at all.
+      The policy only gains inputs per seat; the recurrence lives in the tracker.
 - **Re-derive the K staircase and the session variance on the table mixture.**
   `DEFAULT_K_SCHEDULE` and the 238-point session sd behind it were measured at one
   6-handed table with identical 100 bb stacks. A session now has a drawn size
@@ -2537,41 +2992,14 @@ do the numbers.
   with `duel_power --mode field` per table size once a trained population exists
   (`duel_power` itself still plays one fixed table: give it the mixture first),
   then re-derive the numbers from the formula rather than editing them.
-- **Check that the value target is balanced across table sizes and stack depths.**
-  `reward_scale` is one constant (`big_blind / starting_stack` = 1/100). The spread
-  of a hand's result still changes with the table size (a 9-handed all-in can win
-  eight stacks), so log the value loss and the target spread per size from the
-  rollouts of a real run. If they differ by more than ~2x, the options are a scale
-  per table size from the measurement (config, no checkpoint state) or an adaptive
-  return normalisation (running mean/std, or PopArt), which has to be saved in the
-  checkpoint or `--resume` and inheritance start on a different scale.
-  - **The measurement exists now** (`rl/value_diagnostics.py`, pure Python):
-    `poker-train` prints two `valore per tavolo:` / `valore per stack (bb):` lines
-    on the first iteration and every `VALUE_DIAGNOSTICS_EVERY` (10), each group with
-    the sd of its target (the GAE return, in the critic's unit), the explained
-    variance of the values the policy collected with, and its decisions, plus the
-    spread (widest sd over the narrowest, groups under `MIN_DECISIONS` left out).
-    Stack groups are by *effective* stack (`HandTrajectory.effective_stack_bb`: own
-    stack or deepest opponent, whichever is smaller) at `<10`/`10-30`/`30+` bb. The
-    lines start with `valore` so the status parsers, which read only `iter ` lines,
-    are unaffected. The format and its parser (`parse_value_line`) live in the same
-    module, so they cannot drift. **Not yet read off a real run.**
-  - **The dashboard shows it** in a worker's expanded panel, four charts after the
-    training curves: target sd by stack, target sd by table size, explained variance
-    by stack, and the two spreads against a 2x line. `monitor.WorkerHistory` carries
-    them as sparse `[iteration, value]` pairs (a reading every 10 iterations, anchored
-    to the `iter` line printed just before it), empty for a log that predates the
-    lines. `--status` does not show it.
-  - **First indication, not an answer.** A from-scratch self-play study (4 constants
-    x 3 seeds, 300 iterations, duplicate-deck league, scratch script not kept) found
-    no variant stronger than the rest: the spread between seeds of one variant
-    (up to ~12 bb/100) is larger than between variants. The target sd with the 1/100
-    scale is ~8x apart across stack groups and ~2-3x across sizes, so the ~2x
-    threshold *is* exceeded, yet a constant 25x apart did not move strength. A
-    per-hand scale (`reward / effective stack`) was the only one whose critic had
-    non-negative explained variance on every stack group, and it changes what the
-    objective weighs, so it was not adopted. Settling it needs ~10 seeds per variant,
-    or the `valore` lines from production runs.
+- **The critic on short stacks (`<10` bb effective).** On the first v2 run its explained
+  variance there is a median 0.03, negative for a quarter of the workers, against ~0.18 on
+  the deeper groups, with the stake weighting (`critic_stack_power` 1.4) already on (see
+  "Value diagnostics" in the RL section). Not understood: the critic is given every
+  player's equity, and a short stack's hand mostly ends all-in and is trained on the mean
+  over runouts (`allin_runouts`), so this group should be among the easiest. Find out
+  why before reaching for a remedy (a higher power, or the per-hand scale the from-scratch
+  study preferred, which changes the policy's objective).
 - **Make the Elo update take the bb difference into account.** `pairwise_elo_delta`
   reads only the *sign* of each pair's chip delta, so winning by one chip counts as
   much as winning by 100 bb. Decided to do, not yet done. The design has to avoid
@@ -2599,12 +3027,12 @@ do the numbers.
   - **First, study how many bb/100 a model should earn for a given Elo gap.**
     Nobody has measured the exchange rate between rating points and chip winnings,
     and the update needs it. Play pairs of models spanning a range of Elo gaps with
-    `rl/duel_power.py` (duplicate decks, which is what resolves a few bb/100),
+    `studies/agents/duel_power.py` (duplicate decks, which is what resolves a few bb/100),
     enough pairs per gap to fit a relation, and report the edge with its interval
     per gap. It has to settle whether the relation is roughly linear or saturates,
     how much it depends on the field (`--mode field` vs the 3v3 duel), and whether
-    it holds at the top. **The tool exists: `rl/elo_bb_grid.py`**
-    (`python -m pokerlab.rl.elo_bb_grid --hands 10000 --jobs 20`, results in
+    it holds at the top. **The tool exists: `studies/agents/elo_bb_grid.py`**
+    (`PYTHONPATH=src:studies/agents python studies/agents/elo_bb_grid.py --hands 10000 --jobs 20`, results in
     `checkpoints/studies/elo_bb_grid.json`, resumable). Every benchmark model
     against every other and against itself, 3v3 at a 6-seat table, duplicate
     decks, one cell per unordered pair (the grid is antisymmetric); the diagonal is
@@ -2612,81 +3040,19 @@ do the numbers.
     **A cell is the row model's own bb/100 per seat, which is half the head-to-head
     margin `duel_power` reports.** The cost grows with the square of the anchor
     count, so `--max-models` exists for a first look.
-- **Bigger networks — blocked on one thing, deferred to a new version of the
-  project.** *Partly done: the shape is now configurable (`[network]` in `config.toml`,
-  see the RL section) and a mismatched parent no longer crashes a worker, it starts
-  from scratch. What is below was the analysis before that; the open part is a
-  `pick_parents` that filters by shape, so that a worker does not lose its weights.*
-  `hidden`/`num_layers` were 512/3 since day one and unused.
-  - **Almost everything already supports mixed shapes.**
-    `build_model_from_checkpoint` rebuilds at the shape the checkpoint records,
-    and *every* consumer goes through it — the training pool
-    (`registry_opponents`), the bb/100 benchmark, the population pass,
-    `benchmark_arena`, the GUI, `poker-play`. Nothing batches across models, so
-    different sizes coexist at one table.
-  - **Exactly one thing breaks: inheritance.** `load_checkpoint` is called in a
-    single place in the whole project, the `--resume` path (`train.py`), and it
-    loads into an *already built* model, so `load_state_dict` raises a bare
-    `RuntimeError` on a shape mismatch. It is not an edge case: `pick_parents`
-    draws parents by *rating*, not by shape, so a differently-sized worker would
-    almost always draw a mismatched parent and die at startup. Compounding it,
-    `check_compatible` does not look at the shape at all (only `obs_dim`,
-    `action_dim`, `feature_version`), so the failure arrives as a raw torch error
-    rather than the project's own `IncompatibleCheckpointError`.
-  - **Two possible fixes, and they are not equivalent.** Building the learner at
-    the *parent's* shape on `--resume` is the smaller change, but then `--hidden`
-    becomes a suggestion that inheritance silently overrides. Filtering
-    `pick_parents` by shape keeps each lineage at its own size, which is also what
-    makes the experiment readable — a 768 lineage with a 512 ancestor in it
-    measures nothing. Either way `check_compatible` should learn to say so clearly.
-  - **The costs** (forward pass at batch 1, `OMP_NUM_THREADS=1`, for the
-    480-input network (1380 now: ~438 us at 512x3); the hands/s compose that with the two thirds of a hand that
-    is pure Python and does not change — re-measure before relying on them):
-
-    | shape | parameters | file | us/forward | est. hands/s |
-    |---|---|---|---|---|
-    | 256x3 | 259k | 1.0 MB | 370 | 77.9 |
-    | **512x3 (today)** | **781k** | **3.1 MB** | **473** | **71.1** |
-    | 512x4 | 1.04M | 4.2 MB | 609 | 63.8 |
-    | 768x3 | 1.56M | 6.3 MB | 801 | 55.7 |
-    | 768x4 | 2.16M | 8.6 MB | 1,491 | 38.2 |
-    | 1024x3 | 2.61M | 10.4 MB | 2,018 | 30.8 |
-
-    Speed falls faster than linearly: 768x3 was the sweet spot (2.2x the
-    parameters for 22% fewer hands/s), while 768x4 halves throughput and 1024x3
-    does worse, which doubles the cost of every rated session, every benchmark and
-    every population pass.
-  - **Two operational consequences to size before trying it.** The population
-    pass loads ~55 models per worker, so bigger models multiply the transient
-    allocation when many workers arrive at that phase together. And bigger models
-    grow the store several times faster while **the pruning trigger counts files,
-    not bytes** — at a larger shape that threshold stops being the right measure.
-  - Deferred: no compatibility shims and no code written only to paper over a
-    mismatch, so this belongs to a new version of the project rather than to the
-    running fleet.
-- **Study how the network evaluates the state, to size it (decided to do, not yet
-  done).** The network size has never been chosen from evidence about what the
-  network can actually *see* in a state. The study should find out at what
-  capacity, and at what point in training, the networks start to recognise the
-  structures that decide a hand: straights, flushes, full houses and the other made
-  hands and draws, and how strong the hand is relative to the board.
-  - **What to measure.** Probe the value head and the policy (e.g. linear probes on
-    the trunk's activations, or the value/action response to controlled states) for
-    each concept: pair/two pair/trips, straight and straight draw (the wheel
-    included), flush and flush draw, full house, quads, hand rank percentile on the
-    board. For each one, the capacity (a ladder of `hidden`/`num_layers`) at which
-    it becomes decodable, and the training iteration at which it appears within a
-    run.
-  - **Why it matters.** The card input is 6 binary 4x13 planes, so a straight is a
-    pattern across ranks and a flush a pattern across suits; the first `Linear` has
-    to build those from raw planes. If a concept only becomes readable above some
-    size, a 512x3 network may be capped below it, and a bigger one would be worth
-    its cost. If every concept is already read at 256, the current size is
-    wasteful.
-  - **Feeds other items:** "Bigger networks" (which shape to try), the encoder
-    work (whether explicit hand-strength features would help or the network already
-    derives them) and the suit-isomorphic canonicalisation idea in "Where to
-    extend".
+- **Parents of the worker's own network shape (`pick_parents` by shape).** The shape is
+  configurable (`[network]`), checkpoints record it, models of any shape sit at the same
+  table, and a worker whose parent has another shape starts from scratch instead of
+  crashing (`parent_shape_mismatch`). What is missing is a `pick_parents` that draws only
+  parents of the worker's own shape: today a shape change throws away the weights of
+  every worker that draws an old-shape parent until those models are pruned, which is why
+  a change of shape goes with a fleet reset. Filtering keeps each lineage at its own
+  size, which is also what would make two shapes in one fleet a readable experiment (a
+  768 lineage with a 512 ancestor in it measures nothing). Two consequences to size
+  before running mixed shapes: the population pass loads ~55 models per worker, so bigger
+  models multiply the transient allocation when many workers reach that phase together;
+  and **the pruning trigger counts files, not bytes**, so a bigger shape fills the disk
+  several times faster for the same trigger.
 
 ## Where to extend each future section
 
@@ -2694,16 +3060,16 @@ do the numbers.
   steps, roughly in order of value: multi-process rollout collection (N `Table`s in
   N workers — note `make_policy_fn` returns a closure, which is not picklable, so
   this needs `fork` or a module-level callable); duplicate/mirror deals (replay a
-  seeded deck with rotated seats and average) for variance reduction;
-  suit-isomorphic canonicalisation of the card planes for a ~4x sample-efficiency
-  win; and the opponent statistics and later the per-action history encoder, both
-  specified in the TODO section.
+  seeded deck with rotated seats and average) for variance reduction; and the
+  per-action history encoder specified in the TODO section. (Suit-isomorphic
+  canonicalisation is done where the cards are read: the equity encoder puts the suits
+  in canonical order, `equity_net.canonical_suits`, before the policy sees them.)
   **Trained models are seatable by path**: `model:<path>` is the only bot spec
   `build_players`/`validate_bot_key` understand, so a bad path fails only for
   whoever asked for it. `discover_trained_models()` (pure Python — `pool_registry`
   carries no torch) ranks the checkpoints found across *every* machine's pool,
   since the best model is usually not on the host you are sitting at; torch is
-  imported only inside `make_model_bot`, so `poker-play` and the GUI still run
+  imported only inside `make_model_bot`, so the GUI still runs
   without the `rl` extra until someone actually picks a model. `build_players`
   takes an optional `game: GameConfig` for this: `RLAgentPlayer` normalises its
   features by `big_blind`/`starting_stack`, which an `Observation` deliberately
@@ -2720,7 +3086,7 @@ do the numbers.
 all of it the `rl` area and the real-subprocess e2e. Every test file carries an
 area marker taken from its name (`tests/conftest.py`: `test_gui_*` -> `gui`,
 `test_vision_*` -> `vision`, `test_rl_*` -> `rl`, `test_config*` -> `config`,
-everything else `engine`; `slow` marks the e2e loop test). Use
+`test_study_*` -> `study`, everything else `engine`; `slow` marks the e2e loop test). Use
 `python tests/affected.py <changed files> [-- pytest args]` (no arguments: the files
 `git diff HEAD` lists), or `pytest -m gui`, `pytest -m "rl and not slow"`, a single
 file. Engine/cards/evaluator/players changes fan out to engine+rl+gui; GUI-only

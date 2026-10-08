@@ -24,8 +24,8 @@ class Observation:
     """Everything a Player may legally see when it is asked to act: full
     public state, plus its own hole cards and stack. Deliberately a plain,
     JSON-friendly dataclass of primitives -- NOT a tensor. Encoding this
-    into a model-ready representation is the job of the future RL env
-    wrapper (see pokerlab.rl.env), not of the engine or of Player itself.
+    into a model-ready representation is the job of `pokerlab.rl.features`, not of
+    the engine or of Player itself.
     """
 
     street: Street
@@ -44,6 +44,11 @@ class Observation:
     # numbers in [0, 1]. A seat with no entry -- no tracker, a player never seen --
     # is simply unknown; nothing downstream treats "not given" as an error.
     seat_stats: Mapping[int, tuple[float, ...]] = field(default_factory=dict)
+    # The big blind of this hand, in chips (0: not given). Constant in a session unless the
+    # blinds go up (`engine/config.py::BlindSchedule`); a player that normalises by the blind
+    # (`RLAgentPlayer`) reads it from here, because the blind it was built with is only the
+    # session's first.
+    big_blind: int = 0
 
 
 def build_observation(
@@ -78,12 +83,13 @@ def build_observation(
         button_seat=hand_state.button_seat,
         action_history=tuple(hand_state.action_log),
         seat_stats=dict(seat_stats) if seat_stats else {},
+        big_blind=hand_state.big_blind,
     )
 
 
 class Player(ABC):
-    """The single extension point for every kind of decision-maker: a human
-    at the terminal, an RL agent, or a GUI-driven player. The engine only
+    """The single extension point for every kind of decision-maker: an RL
+    agent or a GUI-driven player. The engine only
     ever calls `act`; it never branches on what kind of Player it is
     talking to.
     """
@@ -95,7 +101,3 @@ class Player(ABC):
     @abstractmethod
     def act(self, observation: Observation, legal_actions: list[LegalAction]) -> Action: ...
 
-    def notify(self, event: str, **data: object) -> None:
-        """Optional hook for things like 'new_hand', 'opponent_action',
-        'showdown'. No-op by default; ManualPlayer overrides it to render
-        updates to the terminal."""

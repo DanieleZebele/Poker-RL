@@ -7,11 +7,10 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-cov", "ruff"]
-rl = ["torch", "numpy", "gymnasium"]
+rl = ["torch", "numpy"]
 vision = ["opencv-python", "numpy", "mss"]
 
 [project.scripts]
-poker-play = "pokerlab.cli.play:main"
 poker-gui = "pokerlab.gui.app:main"
 poker-train = "pokerlab.rl.train:main"  # needs the `rl` extra installed
 poker-loop = "pokerlab.rl.loop:main"  # continuous multi-process training; needs `rl`
@@ -34,6 +33,7 @@ markers = [
     "gui: Tkinter app, spot screen, screen reader",
     "vision: screen capture and recognisers",
     "config: config.toml loading",
+    "study: the scripts under studies/agents (duel_power, elo_bb_grid, agent_study, hud_study, archetype_study)",
     "slow: launches real poker-loop / poker-train subprocesses",
 ]
 

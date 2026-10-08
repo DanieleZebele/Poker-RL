@@ -11,6 +11,7 @@ acted, which silently corrupts the gradient.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,8 +33,22 @@ class PPOConfig:
     entropy_coefficient: float = 0.0
     epochs: int = 4
     minibatch_size: int = 1024
-    max_grad_norm: float = 0.5
+    # The gradient-norm clip, one per network: the policy and the critic share no weight,
+    # and their gradients live on different scales (the policy's loss is of order 1 on
+    # normalised advantages, the critic's is a squared error in the reward's unit), so one
+    # clip over both would cut each by a factor the other decides.
+    policy_max_grad_norm: float = 0.5
+    critic_max_grad_norm: float = 1.0
     normalize_advantages: bool = True
+    # Each decision's squared error in the critic's loss is weighed by its chips at stake,
+    # in big blinds, to the power -critic_stack_power (0: every decision alike). The
+    # spread of the value target grows with the stake, so an unweighted loss is spent on
+    # the deep hands and the short ones are left out: inverse-variance weighting.
+    # A weight that is a function of the state alone leaves the minimiser where it was,
+    # E[G | s], for every state -- only the critic's capacity moves between them -- and
+    # any state-only critic is still an unbiased baseline, so the policy's gradient
+    # keeps its objective. Never weigh the policy's loss this way: that would change it.
+    critic_stack_power: float = 0.0
 
 
 @dataclass
@@ -44,6 +59,10 @@ class TrainingBatch:
     old_log_probs: Tensor  # (N,)
     advantages: Tensor  # (N,)
     returns: Tensor  # (N,)
+    # What the critic reads (`rl/policy.py`): the equity of every seat of the decision's hand.
+    critic_extra: Tensor  # (N, EQUITY_SLOTS)
+    # Each decision's chips at stake in big blinds (`DecisionRecord.stake_bb`).
+    stakes: Tensor  # (N,)
 
     def __len__(self) -> int:
         return int(self.features.shape[0])
@@ -63,6 +82,8 @@ def build_batch(
     old_log_probs: list[float] = []
     advantages: list[float] = []
     returns: list[float] = []
+    critic_extra: list[list[float]] = []
+    stakes: list[float] = []
 
     for trajectory in trajectories:
         for decision, advantage, value_target in zip(
@@ -74,6 +95,10 @@ def build_batch(
             old_log_probs.append(decision.log_prob)
             advantages.append(advantage)
             returns.append(value_target)
+            if decision.critic_extra is None:
+                raise ValueError("a decision reached the batch without what the critic reads")
+            critic_extra.append(decision.critic_extra)
+            stakes.append(decision.stake_bb)
 
     return TrainingBatch(
         features=torch.tensor(features, dtype=torch.float32, device=device),
@@ -82,7 +107,24 @@ def build_batch(
         old_log_probs=torch.tensor(old_log_probs, dtype=torch.float32, device=device),
         advantages=torch.tensor(advantages, dtype=torch.float32, device=device),
         returns=torch.tensor(returns, dtype=torch.float32, device=device),
+        critic_extra=torch.tensor(critic_extra, dtype=torch.float32, device=device),
+        stakes=torch.tensor(stakes, dtype=torch.float32, device=device),
     )
+
+
+# The stake below which a decision is weighed as if it were this deep: a seat with less
+# than a big blind behind is rare, and its weight would otherwise grow without bound.
+MIN_STAKE_BB = 1.0
+
+
+def critic_weights(stakes: Tensor, power: float) -> Tensor:
+    """The weight of each decision in the critic's loss: stake ** -power, rescaled to a
+    mean of 1 over the batch so the loss keeps its scale (and the critic's gradient clip
+    its meaning) whatever the power."""
+    if power == 0.0:
+        return torch.ones_like(stakes)
+    weights = stakes.clamp(min=MIN_STAKE_BB).pow(-power)
+    return weights / weights.mean()
 
 
 def ppo_update(
@@ -91,7 +133,12 @@ def ppo_update(
     batch: TrainingBatch,
     config: PPOConfig,
 ) -> dict[str, float]:
-    """One PPO update over a batch. Returns diagnostics, averaged per minibatch."""
+    """One PPO update over a batch. Returns diagnostics, averaged per minibatch.
+
+    Each network's gradient is clipped to its own threshold, and reported per network as
+    the mean norm before the cut, its sd over the steps and the share of steps cut
+    (`grad_norm_policy`, `grad_norm_policy_sd`, `grad_clipped_policy` and the same for the
+    critic, see `rl/grad_log.py`): the mean alone does not say how often the cut fires."""
     advantages = batch.advantages
     # Raw statistics, read before normalising: after it they are 0 and 1 by
     # construction, which says nothing about the scale the GAE produced.
@@ -99,16 +146,24 @@ def ppo_update(
     raw_std = float(advantages.std()) if len(batch) > 1 else 0.0
     if config.normalize_advantages and len(batch) > 1:
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    value_weights = critic_weights(batch.stakes, config.critic_stack_power)
 
     totals = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "approx_kl": 0.0,
-              "clip_fraction": 0.0, "grad_norm": 0.0}
+              "clip_fraction": 0.0}
     steps = 0
+    # The norm of every step, before the cut (what `clip_grad_norm_` returns), per network.
+    policy_norms: list[float] = []
+    critic_norms: list[float] = []
 
     for _ in range(config.epochs):
         permutation = torch.randperm(len(batch), device=batch.features.device)
         for start in range(0, len(batch), config.minibatch_size):
             index = permutation[start : start + config.minibatch_size]
-            logits, values = model(batch.features[index], batch.masks[index])
+            logits, values = model(
+                batch.features[index],
+                batch.masks[index],
+                batch.critic_extra[index],
+            )
             distribution = torch.distributions.Categorical(logits=logits)
 
             log_probs = distribution.log_prob(batch.actions[index])
@@ -119,7 +174,8 @@ def ppo_update(
             unclipped = ratio * minibatch_advantages
             clipped = ratio.clamp(1 - config.clip_epsilon, 1 + config.clip_epsilon)
             policy_loss = -torch.min(unclipped, clipped * minibatch_advantages).mean()
-            value_loss = nn.functional.mse_loss(values, batch.returns[index])
+            squared_errors = (values - batch.returns[index]) ** 2
+            value_loss = (value_weights[index] * squared_errors).mean()
             entropy = distribution.entropy().mean()
 
             loss = (
@@ -130,25 +186,44 @@ def ppo_update(
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+            policy_norms.append(float(
+                nn.utils.clip_grad_norm_(model.policy_parameters(), config.policy_max_grad_norm)
+            ))
+            critic_norms.append(float(
+                nn.utils.clip_grad_norm_(model.critic_parameters(), config.critic_max_grad_norm)
+            ))
             optimizer.step()
 
             with torch.no_grad():
                 totals["policy_loss"] += float(policy_loss)
-                totals["value_loss"] += float(value_loss)
+                # Unweighted, so the reading means the same with the weighting on or off.
+                totals["value_loss"] += float(squared_errors.mean())
                 totals["entropy"] += float(entropy)
                 # Schulman's low-variance KL estimator; stays non-negative.
                 totals["approx_kl"] += float(((ratio - 1) - log_ratio).mean())
                 totals["clip_fraction"] += float(
                     ((ratio - 1).abs() > config.clip_epsilon).float().mean()
                 )
-                totals["grad_norm"] += float(grad_norm)
             steps += 1
 
     stats = {name: value / max(steps, 1) for name, value in totals.items()}
+    for name, norms, threshold in (
+        ("policy", policy_norms, config.policy_max_grad_norm),
+        ("critic", critic_norms, config.critic_max_grad_norm),
+    ):
+        stats[f"grad_norm_{name}"], stats[f"grad_norm_{name}_sd"] = _mean_and_sd(norms)
+        stats[f"grad_clipped_{name}"] = sum(n > threshold for n in norms) / max(steps, 1)
+    stats["grad_steps"] = float(steps)
     stats["adv_mean"] = raw_mean
     stats["adv_std"] = raw_std
     return stats
+
+
+def _mean_and_sd(values: list[float]) -> tuple[float, float]:
+    if not values:
+        return 0.0, 0.0
+    mean = sum(values) / len(values)
+    return mean, math.sqrt(sum((v - mean) ** 2 for v in values) / len(values))
 
 
 def save_checkpoint(
@@ -171,6 +246,9 @@ def save_checkpoint(
             "action_dim": ACTION_DIM,
             "feature_version": FEATURE_VERSION,
             **model.shape,
+            # The per-player encoder of the equity network the model was built with; its
+            # weights are in `model`'s state, frozen.
+            "equity": model.equity,
             "iteration": iteration,
             "model": model.state_dict(),
             "optimizer": None if optimizer is None else optimizer.state_dict(),
@@ -191,10 +269,10 @@ def check_compatible(checkpoint: dict[str, Any], source: str = "checkpoint") -> 
             f"action_dim={checkpoint.get('action_dim')}, but this build uses "
             f"{OBS_DIM}/{ACTION_DIM} -- the encoding changed since it was saved"
         )
-    if any(key not in checkpoint for key in SHAPE_KEYS):
+    if any(key not in checkpoint for key in (*SHAPE_KEYS, "equity")) or checkpoint["equity"] is None:
         raise IncompatibleCheckpointError(
-            f"{source} was saved before a network's shape was fully recorded (it has no "
-            "head layers), and its weights are named for the old layout, so it cannot be "
+            f"{source} was saved before every network read the cards through an equity "
+            "encoder, and its weights are named for the old layout, so it cannot be "
             "loaded into this build's network"
         )
     saved_version = checkpoint.get("feature_version", 0)
@@ -215,6 +293,11 @@ def load_checkpoint(
 ) -> dict[str, Any]:
     checkpoint = torch.load(path, map_location=device, weights_only=True)
     check_compatible(checkpoint, str(path))
+    if checkpoint["equity"] != model.equity:
+        raise IncompatibleCheckpointError(
+            f"{path} was built with equity encoder {checkpoint['equity']}, this network "
+            f"with {model.equity}: models built on different encoders cannot exchange weights"
+        )
     model.load_state_dict(checkpoint["model"])
     if optimizer is not None and checkpoint["optimizer"] is not None:
         optimizer.load_state_dict(checkpoint["optimizer"])
@@ -233,7 +316,7 @@ def build_model_from_checkpoint(
     inference. Used to seat previously trained agents as opponents."""
     checkpoint = torch.load(path, map_location=device, weights_only=True)
     check_compatible(checkpoint, str(path))
-    model = PokerActorCritic(**checkpoint_shape(checkpoint))
+    model = PokerActorCritic(**checkpoint_shape(checkpoint), equity=checkpoint["equity"])
     model.load_state_dict(checkpoint["model"])
     model.to(device).eval()
     for parameter in model.parameters():

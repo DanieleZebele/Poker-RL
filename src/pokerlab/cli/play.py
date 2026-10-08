@@ -1,16 +1,12 @@
 from __future__ import annotations
 
-import argparse
 import json
 import random
 from collections.abc import Callable
 from pathlib import Path
 
 from pokerlab.engine.config import GameConfig
-from pokerlab.engine.history import HandHistoryWriter
-from pokerlab.engine.table import Table
 from pokerlab.players.base import Player
-from pokerlab.players.manual import ManualPlayer
 from pokerlab.rl.global_arena import (
     DEFAULT_GLOBAL_DIR,
     discover_benchmark_population,
@@ -20,7 +16,7 @@ from pokerlab.rl.global_store import load_ranking
 
 # A trained checkpoint as an opponent, given by path. Every non-human seat is a
 # `model:<path>` spec, so a bad path only ever fails for whoever asked for that
-# seat, never for anyone else running `poker-play`.
+# seat, never for anyone else at the table.
 MODEL_PREFIX = "model:"
 
 DEFAULT_CHECKPOINT_ROOT = Path("checkpoints")
@@ -114,7 +110,7 @@ def _registry_top_models(global_dir: str | Path, limit: int) -> list[tuple[str, 
     registry = load_ranking(global_dir)
     on_disk: dict[str, Path] | None = None
     found: list[tuple[str, Path, float]] = []
-    for member in registry.models():
+    for member in registry.ranked():
         if len(found) >= limit:
             break
         path = Path(member.ref)
@@ -135,9 +131,9 @@ def _registry_top_models(global_dir: str | Path, limit: int) -> list[tuple[str, 
 def make_model_bot(path: str | Path, player_id: str, name: str, game: GameConfig) -> Player:
     """Seat a trained checkpoint as an opponent.
 
-    torch is imported here and nowhere else in this module, so `poker-play` and
-    the GUI keep working without the `rl` extra installed for as long as nobody
-    actually asks for a model. The policy samples rather than taking the argmax,
+    torch is imported here and nowhere else in this module, so the GUI keeps
+    working without the `rl` extra installed for as long as nobody actually
+    asks for a model. The policy samples rather than taking the argmax,
     which is how the agent played while it was being trained.
     """
     from pokerlab.players.rl_agent import RLAgentPlayer
@@ -159,12 +155,12 @@ def build_players(
     human_seats: int,
     rng: random.Random,
     bot_keys: list[str] | None = None,
-    human_player_factory: Callable[[str, str], Player] = ManualPlayer,
+    human_player_factory: Callable[[str, str], Player] | None = None,
     game: GameConfig | None = None,
 ) -> list[Player]:
-    """Build the seat list for a session. `human_player_factory` defaults to
-    ManualPlayer (terminal input); the GUI passes a factory that builds a
-    GuiPlayer instead, reusing all of this function's bot-cycling for free.
+    """Build the seat list for a session. The first `human_seats` seats are built by
+    `human_player_factory` (the GUI passes one that builds a GuiPlayer), which is
+    therefore required whenever there is a human seat.
 
     With no `bot_keys`, the non-human seats cycle through the best-rated
     trained models found across every machine's pool (see
@@ -172,6 +168,8 @@ def build_players(
     and no trained model can be found for them, rather than silently seating
     nothing.
     """
+    if human_seats and human_player_factory is None:
+        raise ValueError("seating a human needs a human_player_factory")
     if bot_keys:
         keys = bot_keys
     else:
@@ -187,6 +185,7 @@ def build_players(
     for seat in range(num_players):
         player_id = f"p{seat}"
         if seat < human_seats:
+            assert human_player_factory is not None
             players.append(human_player_factory(player_id, f"Human{seat}"))
         else:
             key = keys[(seat - human_seats) % len(keys)]
@@ -203,22 +202,10 @@ def build_players(
     return players
 
 
-def print_available_bots() -> None:
-    models = discover_trained_models()
-    if not models:
-        print("No trained models found under checkpoints/. Train a model first "
-              "(see poker-train), or pass --bots model:<path> to seat a specific "
-              "checkpoint.")
-        return
-    print("Available bots -- trained models, best rating first:")
-    for label, path, rating in models:
-        print(f"  {rating:7.0f}  {label:<28} {path}")
-
-
 def validate_bot_key(key: str) -> None:
     """Raise ValueError with a clear message if `key` isn't a usable bot
-    spec -- a 'model:<path>' pointing at an existing checkpoint. Shared by
-    the CLI's argparse validation and the GUI's form validation."""
+    spec -- a 'model:<path>' pointing at an existing checkpoint. Used by the
+    GUI's form validation."""
     if not key.startswith(MODEL_PREFIX):
         raise ValueError(
             f"unknown bot spec {key!r}; only 'model:<path>' is supported"
@@ -226,75 +213,3 @@ def validate_bot_key(key: str) -> None:
     path = Path(key[len(MODEL_PREFIX) :])
     if not path.is_file():
         raise ValueError(f"no checkpoint at {path}")
-
-
-def _validate_bot_key(parser: argparse.ArgumentParser, key: str) -> None:
-    try:
-        validate_bot_key(key)
-    except ValueError as e:
-        parser.error(str(e))
-
-
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Play (or watch bots play) a No-Limit Hold'em session.")
-    parser.add_argument("--players", type=int, default=6, help="number of seats (2-9)")
-    parser.add_argument("--stack", type=int, default=200, help="starting stack per player")
-    parser.add_argument("--sb", type=int, default=1, help="small blind")
-    parser.add_argument("--bb", type=int, default=2, help="big blind")
-    parser.add_argument("--hands", type=int, default=10, help="number of hands to play")
-    parser.add_argument("--human-seats", type=int, default=0, help="how many of the seats are manual/human")
-    parser.add_argument("--seed", type=int, default=None, help="RNG seed for reproducible sessions")
-    parser.add_argument(
-        "--bots",
-        type=str,
-        default=None,
-        help="comma-separated 'model:<path>' specs to cycle through for the "
-        "non-human seats; see --list-bots for the best trained checkpoints "
-        "found. Default: cycle through those same best-rated models.",
-    )
-    parser.add_argument(
-        "--list-bots", action="store_true", help="print the trained models available to seat, then exit"
-    )
-    parser.add_argument(
-        "--history-dir",
-        type=Path,
-        default=Path("hand_histories"),
-        help="directory to write the session's hand history JSONL file into",
-    )
-    args = parser.parse_args(argv)
-
-    if args.bots:
-        for key in args.bots.split(","):
-            _validate_bot_key(parser, key.strip())
-
-    return args
-
-
-def main(argv: list[str] | None = None) -> None:
-    args = parse_args(argv)
-
-    if args.list_bots:
-        print_available_bots()
-        return
-
-    rng = random.Random(args.seed)
-    bot_keys = [key.strip() for key in args.bots.split(",")] if args.bots else None
-
-    config = GameConfig(num_players=args.players, starting_stack=args.stack, small_blind=args.sb, big_blind=args.bb)
-    players = build_players(args.players, args.human_seats, rng, bot_keys, game=config)
-
-    history_path = args.history_dir / f"session_{int(rng.random() * 1_000_000):06d}.jsonl"
-    with HandHistoryWriter(history_path) as writer:
-        table = Table(config, players, rng=rng, history_writer=writer)
-        for i in range(args.hands):
-            if sum(1 for s in table.stacks if s > 0) < 2:
-                print(f"Session ended early after {i} hands: fewer than 2 players have chips left.")
-                break
-            result = table.play_hand()
-            print(f"Hand {result.hand_id}: payouts={result.payouts}  stacks={result.final_stacks}")
-
-    print(f"Hand history written to {history_path}")
-
-
-if __name__ == "__main__":
-    main()

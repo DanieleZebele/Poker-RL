@@ -37,7 +37,7 @@ def ranking_of(**groups):
         for index in range(count):
             label = f"{prefix}{index:03d}"
             ranking[label] = PoolMember(
-                label=label, kind="model", ref=f"{label}.pt", rating=top_rating - index, games=games
+                label=label, ref=f"{label}.pt", rating=top_rating - index, games=games
             )
     return ranking
 
@@ -159,7 +159,7 @@ def test_parents_are_distinct_rated_models_from_the_top():
 
 def test_parents_exclude_unrated_and_frozen_models():
     ranking = ranking_of(good=(2, 1800.0, 50))
-    ranking["anchor"] = PoolMember(label="anchor", kind="model", ref="a.pt", rating=2500.0, games=99, frozen=True)
+    ranking["anchor"] = PoolMember(label="anchor", ref="a.pt", rating=2500.0, games=99, frozen=True)
 
     parents = pick_parents(ranking, [*ranking, "unrated"], 4, rng=random.Random(0))
 
@@ -197,13 +197,15 @@ def test_publishing_puts_the_model_in_the_store_and_the_ranking(tmp_path):
 
     member = publish_model(
         source, models_dir=tmp_path / "models", global_dir=tmp_path / "global",
-        name="host-a-gen0001-w00-agent-x.pt", rating=1655.0, iteration=50, machine="host-a",
+        name="host-a-gen0001-w00-agent-x.pt", rating=1655.0, machine="host-a",
+        style={"vpip": [243, 900], "three_bet": [0, 0]}, style_hands=900,
     )
 
     assert (tmp_path / "models" / "host-a-gen0001-w00-agent-x.pt").read_bytes() == b"weights"
     assert member.label == "host-a-gen0001-w00-agent-x"
     stored = read_member(tmp_path / "global", member.label)
-    assert (stored.rating, stored.games, stored.iteration, stored.frozen) == (1655.0, 0, 50, False)
+    assert (stored.rating, stored.games, stored.frozen) == (1655.0, 0, False)
+    assert (stored.style, stored.style_hands) == ({"vpip": [243, 900], "three_bet": [0, 0]}, 900)
     assert stored.ref == str(tmp_path / "models" / "host-a-gen0001-w00-agent-x.pt")
     assert not list((tmp_path / "models").glob(".*"))  # no partial file left behind
 
@@ -212,7 +214,7 @@ def test_publishing_is_write_once(tmp_path):
     source = tmp_path / "agent.pt"
     source.write_bytes(b"first")
     kwargs = {"models_dir": tmp_path / "models", "global_dir": tmp_path / "global",
-              "name": "m.pt", "rating": 1600.0, "iteration": 1, "machine": "a"}
+              "name": "m.pt", "rating": 1600.0, "machine": "a"}
     assert publish_model(source, **kwargs) is not None
 
     source.write_bytes(b"second")
@@ -222,39 +224,39 @@ def test_publishing_is_write_once(tmp_path):
 
 
 def test_publishing_never_overwrites_a_rating_the_ranking_already_holds(tmp_path):
-    write_member(tmp_path / "global", PoolMember(label="m", kind="model", ref="x", rating=1777.0, games=40))
+    write_member(tmp_path / "global", PoolMember(label="m", ref="x", rating=1777.0, games=40))
     source = tmp_path / "agent.pt"
     source.write_bytes(b"w")
 
     publish_model(source, models_dir=tmp_path / "models", global_dir=tmp_path / "global",
-                  name="m.pt", rating=1500.0, iteration=1, machine="a")
+                  name="m.pt", rating=1500.0, machine="a")
 
     assert read_member(tmp_path / "global", "m").rating == 1777.0
 
 
 def test_a_sidecar_round_trips_and_defaults_when_missing(tmp_path):
     checkpoint = tmp_path / "agent.pt"
-    assert read_sidecar(checkpoint) == (DEFAULT_RATING, 0)
-    write_sidecar(checkpoint, rating=1712.5, iteration=25)
-    assert read_sidecar(checkpoint) == (1712.5, 25)
+    assert read_sidecar(checkpoint) == (DEFAULT_RATING, {}, 0)
+    write_sidecar(checkpoint, rating=1712.5, style={"vpip": [155, 500], "cbet": [0, 0]}, style_hands=500)
+    assert read_sidecar(checkpoint) == (1712.5, {"vpip": [155, 500], "cbet": [0, 0]}, 500)
     checkpoint.with_suffix(".json").write_text("{not json")
-    assert read_sidecar(checkpoint) == (DEFAULT_RATING, 0)
+    assert read_sidecar(checkpoint) == (DEFAULT_RATING, {}, 0)
 
 
 # ---- reading the ranking cheaply ------------------------------------------------------
 
 
 def test_load_ranking_prefers_the_single_file_snapshot(tmp_path):
-    write_member(tmp_path, PoolMember(label="a", kind="model", ref="a.pt", rating=1600.0))
+    write_member(tmp_path, PoolMember(label="a", ref="a.pt", rating=1600.0))
     write_snapshot(tmp_path, machine="m", force=True)
-    write_member(tmp_path, PoolMember(label="a", kind="model", ref="a.pt", rating=1700.0))
+    write_member(tmp_path, PoolMember(label="a", ref="a.pt", rating=1700.0))
 
     # Deliberately the snapshot's (older) value: it is a cheap read, not the truth.
     assert load_ranking(tmp_path).members["a"].rating == 1600.0
 
 
 def test_load_ranking_falls_back_to_the_member_files_when_there_is_no_snapshot(tmp_path):
-    write_member(tmp_path, PoolMember(label="a", kind="model", ref="a.pt", rating=1650.0))
+    write_member(tmp_path, PoolMember(label="a", ref="a.pt", rating=1650.0))
     assert load_ranking(tmp_path).members["a"].rating == 1650.0
 
 
@@ -264,7 +266,7 @@ def test_load_ranking_on_an_empty_directory_is_empty(tmp_path):
 
 def test_a_legacy_snapshot_only_registry_is_still_readable(tmp_path):
     registry = PoolRegistry(directory=tmp_path, max_models=10**9)
-    registry.members["old"] = PoolMember(label="old", kind="model", ref="o.pt", rating=1550.0)
+    registry.members["old"] = PoolMember(label="old", ref="o.pt", rating=1550.0)
     registry.save()
     assert json.loads((tmp_path / "registry.json").read_text())["members"]
     assert load_ranking(tmp_path).members["old"].rating == pytest.approx(1550.0)

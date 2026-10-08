@@ -44,17 +44,44 @@ from pokerlab.config import add_config_arguments, resolve_cli
 from pokerlab.rl.global_store import DEFAULT_MODELS_DIR
 from pokerlab.rl.monitor import (
     DEFAULT_MAX_POINTS,
-    STAGE_LABELS,
+    STAGE_ERROR,
+    STAGE_STARTING,
+    STAGE_TRAINING,
     LoopState,
+    WorkerProgress,
     benchmark_series,
-    stage_label,
     worker_history,
     worker_progress,
 )
+from pokerlab.rl.phases import DONE, ELO_FILL, ELO_MERGE, ELO_PLAY, EVALUATION, PRUNING, SERIES
 from pokerlab.rl.siblings import sibling_parsers
 from pokerlab.rl.training_pool import available_labels
 
 DEFAULT_BENCHMARK_DIR = Path("checkpoints/benchmark")
+
+# The page is in English while `--status` in the terminal keeps `monitor.STAGE_LABELS`,
+# so the stages have names of their own here, keyed by the same stage constants.
+STAGE_LABELS = {
+    STAGE_STARTING: "starting",
+    STAGE_TRAINING: "training",
+    EVALUATION: "evaluation",
+    SERIES: "anchors",
+    ELO_PLAY: "elo: playing",
+    ELO_MERGE: "elo: merge",
+    PRUNING: "pruning",
+    ELO_FILL: "elo: extra",
+    DONE: "done",
+    STAGE_ERROR: "ERROR",
+}
+
+
+def stage_label(row: WorkerProgress, target_iterations: int) -> str:
+    """The stage as the page shows it: `monitor.stage_label`, in English."""
+    # Past the last iteration the ordinary "training" is really the wrap-up:
+    # saving, publishing, and the benchmark pass that rates the model.
+    if target_iterations and row.iterations >= target_iterations and row.stage == STAGE_TRAINING:
+        return "wrapping up"
+    return STAGE_LABELS.get(row.stage, row.stage)
 
 DEFAULT_PORT = 8770
 DEFAULT_MACHINES_DIR = Path("checkpoints/machines")
@@ -234,7 +261,7 @@ class State:
 
 
 PAGE = """<!doctype html>
-<html lang="it"><head><meta charset="utf-8">
+<html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Poker RL</title>
 <style>
@@ -292,10 +319,16 @@ button{font:inherit;color:var(--muted);background:var(--panel);cursor:pointer;
 tr.worker{cursor:pointer}
 tr.worker td:first-child::before{content:"\u25B8 ";color:var(--muted)}
 tr.worker.open td:first-child::before{content:"\u25BE "}
-tr.panelrow td{padding:0;background:color-mix(in srgb,var(--accent) 4%,transparent)}
+/* The panel lives in a table cell, and cells are `nowrap` and right-aligned for the
+   numbers of the worker table: inherited, that would stop every legend and note from
+   wrapping and clip them at the edge of their box. */
+tr.panelrow td{padding:0;background:color-mix(in srgb,var(--accent) 4%,transparent);
+  white-space:normal;text-align:left}
 .charts{display:grid;gap:10px;padding:12px 14px;
   grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
-.chart{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 10px 6px}
+.charts>*{min-width:0}
+.chart{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 10px 6px;
+  min-width:0;overflow:hidden}
 .hp{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:12px 14px 0}
 .hp .chip{border:1px solid var(--line);border-radius:6px;padding:2px 7px;font-size:12px;
   font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--panel)}
@@ -307,19 +340,22 @@ tr.panelrow td{padding:0;background:color-mix(in srgb,var(--accent) 4%,transpare
 .hp .chip b{font-weight:600;color:var(--muted);font-weight:400}
 .hp .arm{border-color:var(--accent);color:var(--accent)}
 .chart h4{margin:0 0 2px;font-size:11.5px;font-weight:600;letter-spacing:.02em;
-  display:flex;gap:8px;align-items:baseline}
-.chart h4 .last{margin-left:auto;font-variant-numeric:tabular-nums;font-weight:650}
-.chart .note{color:var(--muted);font-size:10.5px;margin:0 0 4px}
+  display:flex;gap:8px;align-items:baseline;justify-content:space-between;min-width:0}
+.chart h4 .t{min-width:0;overflow-wrap:anywhere}
+.chart h4 .last{flex:none;font-variant-numeric:tabular-nums;font-weight:650}
+.chart .legend{display:flex;flex-wrap:wrap;gap:1px 10px;margin:0 0 3px;font-size:10.5px;color:var(--muted)}
+.chart .legend span{white-space:nowrap}
+.chart .note{color:var(--muted);font-size:10.5px;margin:0 0 4px;overflow-wrap:anywhere}
 .chart canvas{width:100%;height:120px;display:block}
 .swatch{display:inline-block;width:8px;height:8px;border-radius:2px;vertical-align:baseline}
 @media(max-width:700px){.bar{width:60px}th,td{padding:6px 6px}
   .charts{grid-template-columns:1fr}}
 </style></head><body><div class="wrap">
 <header>
-  <h1>Poker RL &mdash; addestramento</h1>
+  <h1>Poker RL &mdash; training</h1>
   <span class="sub" id="stamp"></span>
   <span class="grow"></span>
-  <button id="theme">tema</button>
+  <button id="theme">theme</button>
 </header>
 <div class="tiles" id="tiles"></div>
 <div id="machines"></div>
@@ -340,7 +376,7 @@ function dur(a){
 
 // The two stages that take the best part of an hour each -- the benchmark
 // pass and the population pass -- report how far in they are. Without it the
-// cell reads "elo: gioco" for ninety minutes and says nothing about whether the
+// cell reads "elo: playing" for ninety minutes and says nothing about whether the
 // worker is moving.
 function stage(w){
   const p = w.progress;
@@ -363,15 +399,15 @@ function tiles(d){
   const f = d.fleet, series = (f.benchmark_series || []).length;
   const r = f.ratings || {};
   const items = [
-    ['macchine attive', `${d.active_machines}/${d.machines.length}`, 'che scrivono log da meno di 10 min'],
-    ['modelli nello store', (f.models || 0).toLocaleString('it'), 'checkpoints/models'],
-    ['rating medio', r.mean === undefined ? '&ndash;' : r.mean.toFixed(0),
-     r.rated === undefined ? 'registry.json non leggibile'
-       : `mediana ${r.median.toFixed(0)} su ${r.rated.toLocaleString('it')} valutati`],
-    ['rating del 1% migliore', r.top1_mean === undefined ? '&ndash;' : r.top1_mean.toFixed(0),
-     r.best === undefined ? '' : `migliore ${r.best.toFixed(0)}, su ${r.top1_count} modelli`],
-    ['ancore congelate', f.benchmark_models || 0, `${series} serie`],
-    ['worker in corsa', d.machines.reduce((a,m) => a + m.workers.filter(w => w.stage !== 'done' && w.stage !== 'error').length, 0), 'su tutte le macchine'],
+    ['active machines', `${d.active_machines}/${d.machines.length}`, 'writing logs in the last 10 min'],
+    ['models in the store', (f.models || 0).toLocaleString('en'), 'checkpoints/models'],
+    ['mean rating', r.mean === undefined ? '&ndash;' : r.mean.toFixed(0),
+     r.rated === undefined ? 'registry.json not readable'
+       : `median ${r.median.toFixed(0)} over ${r.rated.toLocaleString('en')} rated`],
+    ['top 1% rating', r.top1_mean === undefined ? '&ndash;' : r.top1_mean.toFixed(0),
+     r.best === undefined ? '' : `best ${r.best.toFixed(0)}, over ${r.top1_count} models`],
+    ['frozen anchors', f.benchmark_models || 0, `${series} series`],
+    ['workers running', d.machines.reduce((a,m) => a + m.workers.filter(w => w.stage !== 'done' && w.stage !== 'error').length, 0), 'across every machine'],
   ];
   $('#tiles').innerHTML = items.map(([k,v,n]) =>
     `<div class="tile"><div class="k">${k}</div><div class="v">${v}</div><div class="n">${esc(n)}</div></div>`).join('');
@@ -391,8 +427,8 @@ function sweepPill(m){
   if (!counts.size) return '';
   const parts = [...counts.entries()].sort((a, b) => b[1] - a[1])
     .map(([arm, n]) => n + ' ' + (HP_ARM_LABELS[arm] || arm));
-  return '<span class="pill" title="ogni worker allena con i propri iperparametri: '
-    + 'clicca una riga per vederli">' + esc(parts.join(', ')) + '</span>';
+  return '<span class="pill" title="every worker trains with its own hyperparameters: '
+    + 'click a row to see them">' + esc(parts.join(', ')) + '</span>';
 }
 
 function machine(m){
@@ -400,33 +436,33 @@ function machine(m){
   const pct = Math.round((m.progress || 0) * 100);
   const head = `<div class="mhead">
     <span class="mname">${esc(m.machine)}</span>
-    <span class="pill ${alive ? 'on' : 'off'}">${alive ? 'attiva' : 'ferma'}</span>
+    <span class="pill ${alive ? 'on' : 'off'}">${alive ? 'active' : 'stopped'}</span>
     <span class="pill">gen ${m.generation}</span>
     <span class="pill">${esc(m.phase)}</span>
-    <span class="pill">${m.done}/${m.workers.length} worker completi</span>
+    <span class="pill">${m.done}/${m.workers.length} workers done</span>
     ${m.finish_eta === null || m.finish_eta === undefined ? ''
-      : `<span class="pill" title="il worker piu' lento nelle passate finali di elo e ancore">fine ~${dur(m.finish_eta)}</span>`}
+      : `<span class="pill" title="the slowest worker in the final anchor and elo passes">done in ~${dur(m.finish_eta)}</span>`}
     ${sweepPill(m)}
     <span class="grow"></span>
     <span class="bar"><i style="width:${pct}%"></i></span><span class="dim">${pct}%</span>
   </div>`;
-  if (!m.workers.length) return `<div class="machine">${head}<div class="empty">nessun log per la generazione ${m.generation}</div></div>`;
+  if (!m.workers.length) return `<div class="machine">${head}<div class="empty">no logs for generation ${m.generation}</div></div>`;
   const rows = m.workers.map(w => {
     const p = Math.min(100, Math.round(w.iterations / Math.max(1, m.iterations_target) * 100));
     const key = `${m.machine}|${w.name}|${m.generation}`;
     hpByKey.set(key, w.hyperparameters || null);
     parentByKey.set(key, w.parent_rating);
     return `<tr class="worker${openPanels.has(key) ? ' open' : ''}" data-key="${esc(key)}">
-      <td class="mono">${esc(w.name)}<span class="dim" title="${w.inherited ? 'eredita i pesi' : 'parte da zero'}"> ${w.inherited ? '^' : '.'}</span></td>
+      <td class="mono">${esc(w.name)}<span class="dim" title="${w.inherited ? 'inherits weights' : 'starts from scratch'}"> ${w.inherited ? '^' : '.'}</span></td>
       <td><span class="bar"><i style="width:${p}%"></i></span><span class="dim">${w.iterations}/${m.iterations_target}</span></td>
       <td>${stage(w)}</td>
-      <td title="${w.train_hands ? 'media su ' + w.train_hands.toLocaleString('it') + ' mani'
-        : 'nessuna iterazione ancora'}">${num(w.train_bb100, 1)}${
-        w.train_hands && w.train_hands < 100000 ? '<span class="dim" title="finestra ancora incompleta">*</span>' : ''}</td>
+      <td title="${w.train_hands ? 'mean over ' + w.train_hands.toLocaleString('en') + ' hands'
+        : 'no iteration yet'}">${num(w.train_bb100, 1)}${
+        w.train_hands && w.train_hands < 100000 ? '<span class="dim" title="window not full yet">*</span>' : ''}</td>
       <td>${sig(w.eval)}</td>
       <td class="mono">${w.rating === '-' ? '<span class="dim">&ndash;</span>' : esc(w.rating)}</td>
       <td class="mono dim">${w.pool_rating === '-' ? '<span class="dim">&ndash;</span>' : esc(w.pool_rating)}</td>
-      <td${w.benchmark_live ? ' class="dim" title="provvisorio: passata contro le ancore in corso (' + w.benchmark_sessions + ' sessioni)"' : ''}>${num(w.benchmark_bb100, 1)}</td>
+      <td${w.benchmark_live ? ' class="dim" title="provisional: pass against the anchors in progress (' + w.benchmark_sessions + ' sessions)"' : ''}>${num(w.benchmark_bb100, 1)}</td>
       <td class="mono${w.benchmark_live ? ' dim' : ''}">${w.benchmark_rating === '-' ? '<span class="dim">&ndash;</span>' : esc(w.benchmark_rating) + (w.benchmark_live ? '~' : '')}</td>
       <td class="dim">${w.entropy}</td>
       <td>${age(w.age)}</td>
@@ -434,20 +470,20 @@ function machine(m){
   }).join('');
   return `<div class="machine">${head}
     <table><thead><tr>
-      <th>worker</th><th>progresso</th><th>fase</th><th>train/100</th><th>eval/100</th>
+      <th>worker</th><th>progress</th><th>stage</th><th>train/100</th><th>eval/100</th>
       <th>rating</th>
-      <th title="rating medio del campo che questo worker ha pescato: contro chi valgono eval e rating">pool</th>
-      <th>ancore/100</th><th>elo ancore</th><th>entropia</th><th>agg.</th>
+      <th title="mean rating of the field this worker drew: who eval and rating were earned against">pool</th>
+      <th>anchors/100</th><th>anchor elo</th><th>entropy</th><th>upd.</th>
     </tr></thead><tbody>${rows}</tbody></table>
-    <p class="legend">train/100 = bb ogni 100 mani sulle ultime 100.000 mani di training,
-      contro pool e propri snapshot (~&plusmn;3 bb/100 a finestra piena) &middot;
-      eval = ultima valutazione contro il pool estratto &middot;
-      pool = rating medio del campo pescato da quel worker, cio&egrave; contro chi valgono eval e rating &middot;
-      serie = passata finale per ogni cartella benchmark &middot;
-      entropia = quanto la policy sta ancora mischiando (tetto ln 11 = 2.40) &middot;
-      <b>!</b> = log fermo da oltre 10 minuti &middot;
-      la fase mostra l'avanzamento e il tempo stimato per le due passate finali (serie ed elo), che durano circa un'ora ciascuno &middot;
-      <b>clicca una riga</b> per gli iperparametri di quel worker e le curve di addestramento</p>
+    <p class="legend">train/100 = bb per 100 hands over the last 100,000 training hands,
+      against the pool and the run's own seats (~&plusmn;3 bb/100 with a full window) &middot;
+      eval = latest evaluation against the drawn pool &middot;
+      pool = mean rating of the field that worker drew, i.e. who eval and rating were earned against &middot;
+      anchors/100 and anchor elo = the final pass against the frozen anchors &middot;
+      entropy = how much the policy still mixes (ceiling ln 11 = 2.40) &middot;
+      <b>!</b> = log silent for over 10 minutes &middot;
+      the stage shows progress and an ETA for the two final passes (anchors and elo), about an hour each &middot;
+      <b>click a row</b> for that worker's hyperparameters and training curves</p>
   </div>`;
 }
 
@@ -472,14 +508,15 @@ const ITER_CHARTS = [
      metric is read for -- the mean would hide the single collapsed iteration
      the curve exists to reveal. */
   {k:'train_bb100', t:'training', u:'bb/100', d:1, zero:true,
-   mean:'train_bb100_mean', meanT:'media 100k mani', rawT:'per iterazione',
-   note:'linea spessa = media mobile sulle ultime 100.000 mani (come la colonna train/100); '
-      + 'linea tenue = valore della singola iterazione'},
-  {k:'entropy', t:'entropia',     u:'', d:3,
-   note:"esplorazione: non c'\u00e8 una std, lo spazio azioni \u00e8 discreto (11 bin, tetto ln 11 \u2248 2.4)"},
-  {k:'kl',      t:'kl',           u:'', d:4, ref:0.05, refT:'0.05 = passo troppo grande'},
+   mean:'train_bb100_mean', meanT:'100k-hand mean', rawT:'per iteration',
+   note:'thick line = moving mean over the last 100,000 hands (as in the train/100 column); '
+      + 'faint line = the single iteration'},
+  {k:'entropy', t:'entropy',      u:'', d:3,
+   note:'exploration: there is no std, the action space is discrete (11 bins, ceiling ln 11 \u2248 2.4)'},
+  {k:'kl',      t:'kl',           u:'', d:4, ref:0.05, refT:'0.05 = step too large'},
   {k:'clip',    t:'clip fraction',u:'', d:3},
-  {k:'value',   t:'value loss',   u:'', d:3, note:'se sale invece di restare piatta, il passo \u00e8 troppo grande'},
+  {k:'value',   t:'value loss',   u:'', d:3,
+   note:'it also falls when the target narrows: read it with the explained variance below'},
   {k:'policy',  t:'policy loss',  u:'', d:4, zero:true},
 ];
 
@@ -498,7 +535,7 @@ function draw(cv, sets, o){
   g.font = '10px ui-monospace,SFMono-Regular,Menlo,monospace';
   if (!all.length){
     g.fillStyle = C('--muted'); g.textAlign = 'center'; g.textBaseline = 'middle';
-    g.fillText('nessun dato', w / 2, h / 2); return;
+    g.fillText('no data', w / 2, h / 2); return;
   }
   let x0 = Math.min(...all.map(p => p[0])), x1 = Math.max(...all.map(p => p[0]));
   let y0 = Math.min(...all.map(p => p[1])), y1 = Math.max(...all.map(p => p[1]));
@@ -548,103 +585,205 @@ function draw(cv, sets, o){
 
 function chartBox(title, note, last, sets, o){
   const legend = sets.length > 1
-    ? sets.map(s => `<span class="dim"><span class="swatch" style="background:${s.color}"></span> ${esc(s.name)}</span>`).join(' ')
+    ? `<div class="legend">${sets.map(s => `<span><span class="swatch" style="background:${s.color}"></span> ${esc(s.name)}</span>`).join('')}</div>`
     : '';
   return `<div class="chart">
-    <h4>${esc(title)} ${legend}<span class="last">${last}</span></h4>
+    <h4><span class="t">${esc(title)}</span><span class="last">${last}</span></h4>
+    ${legend}
     ${note ? `<p class="note">${note}</p>` : ''}
     <canvas></canvas></div>`;
 }
 
-/* The critic's target, by table size and by effective stack. A light-to-dark ramp
-   of one hue rather than a colour per group: the groups are ordered (smaller to
-   larger table, shorter to deeper stack) and eight unrelated colours would not say
-   so. The lightness range stays clear of both ends so a line reads on the light
-   and the dark theme alike. */
+/* No chart carries more than MAX_LINES lines: past three the eye cannot follow them
+   and the legend no longer fits a box. A larger set is split over several charts,
+   each titled with what it holds. */
+const MAX_LINES = 3;
+function chunks(items, n){
+  const out = [];
+  for (let i = 0; i < items.length; i += n) out.push(items.slice(i, i + n));
+  return out;
+}
+
+/* A light-to-dark ramp of one hue rather than a colour per line: the lines in a
+   chart are ordered (smaller to larger table, shorter to deeper stack, earlier to
+   later street). The lightness range stays clear of both ends so a line reads on the
+   light and the dark theme alike. */
 const STACK_ORDER = ['<10', '10-30', '30+'];
+const STREET_ORDER = ['preflop', 'flop', 'turn', 'river'];
 function ramp(i, n){
   return `hsl(212, 62%, ${n < 2 ? 55 : Math.round(76 - 36 * i / (n - 1))}%)`;
 }
-function groupSets(series, order){
-  const names = order.filter(k => (series || {})[k] && series[k].length);
-  return names.map((k, i) => ({name: k, color: ramp(i, names.length), pts: series[k]}));
+function lineSets(series, names, label){
+  const shown = names.filter(k => (series || {})[k] && series[k].length);
+  return shown.map((k, i) => ({
+    name: label ? label(k) : k, color: ramp(i, shown.length), pts: series[k],
+  }));
 }
 function lastOf(pts){ return pts && pts.length ? pts[pts.length - 1][1] : null; }
 
-/* How the model plays: each statistic's rate over its recent training hands
-   (`rl/style_log.py`), in percent. Preflop and postflop get a chart each, so no
-   chart carries more than five lines. A statistic the page does not know by name
-   still shows, under its own name, in the second chart. */
-const STYLE_LABELS = {
-  vpip: 'VPIP', pfr: 'PFR', three_bet: '3-bet', fold_to_three_bet: 'fold al 3-bet',
-  steal: 'steal', aggression: 'aggressivit\u00e0', cbet: 'c-bet',
-  fold_to_cbet: 'fold alla c-bet', wtsd: 'WTSD',
-};
-const STYLE_PREFLOP = ['vpip', 'pfr', 'three_bet', 'fold_to_three_bet', 'steal'];
+/* The four streets, two to a chart: four lines in one ramp are too close to tell
+   apart, and preflop/flop against turn/river is the split the reading wants. Each
+   chart's colours run over the whole street order, so a street keeps its shade in
+   every chart. */
+function streetSpecs(series, title, note, o){
+  const all = lineSets(series, STREET_ORDER);
+  if (!all.length) return [{o, sets: [], title, note: '', last: '&ndash;'}];
+  return chunks(STREET_ORDER, 2).map(pair => {
+    const sets = all.filter(set => pair.includes(set.name));
+    return {o, sets, title: `${title}: ${pair.join(' and ')}`, note, last: ''};
+  });
+}
 
-function styleSpec(hist, names, title){
-  const series = hist.style_rate || {}, latest = hist.style_latest || {};
+/* The critic's target, by table size, by effective stack and by street. */
+function valueSpecs(hist){
+  const cs = getComputedStyle(document.documentElement);
+  const C = k => cs.getPropertyValue(k).trim();
+  const spSize = hist.value_spread_size || [], spStack = hist.value_spread_stack || [];
+  const x = v => v === null ? '&ndash;' : v.toFixed(1) + 'x';
+  const specs = [];
+
+  /* By street first: it says whether the critic learns where it can. On the river it
+     is given every player's exact equity, so it should explain a lot there; on the
+     preflop most of the target is cards still to come. */
+  specs.push(...streetSpecs(
+    hist.value_ev_street, 'critic explained variance by street', '0 = no better than the mean, below 0 = worse; '
+      + 'the river should be well above the preflop', {d: 2, zero: true}));
+  specs.push(...streetSpecs(
+    hist.value_sd_street, 'critic target by street (sd)', 'sd of the return by street', {d: 3, zero: true}));
+
+  const stackSets = lineSets(hist.value_sd_stack, STACK_ORDER);
+  specs.push({
+    o: {d: 3, zero: true}, sets: stackSets, title: 'critic target by stack (sd)',
+    note: 'sd of the return by effective stack (bb): lines far apart = the fixed reward scale weighs them differently',
+    last: stackSets.length ? 'spread ' + x(lastOf(spStack)) : '&ndash;',
+  });
+
+  const sizes = Object.keys(hist.value_sd_size || {}).sort((a, b) => a - b);
+  if (!sizes.length){
+    specs.push({o: {d: 3, zero: true}, sets: [], title: 'critic target by table (sd)', note: '', last: '&ndash;'});
+  }
+  for (const group of chunks(sizes, MAX_LINES)){
+    const first = group[0], last = group[group.length - 1];
+    specs.push({
+      o: {d: 3, zero: true}, sets: lineSets(hist.value_sd_size, group, k => k + ' players'),
+      title: first === last ? `critic target: ${first}-player table (sd)` : `critic target: ${first} to ${last} players (sd)`,
+      note: 'sd of the return by table size',
+      last: 'spread ' + x(lastOf(spSize)),
+    });
+  }
+
+  const evSets = lineSets(hist.value_ev_stack, STACK_ORDER);
+  specs.push({
+    o: {d: 2, zero: true}, sets: evSets, title: 'critic explained variance by stack',
+    note: '0 = no better than the mean, below 0 = worse',
+    last: '&ndash;',
+  });
+  specs.push({
+    o: {d: 1, ref: 2},
+    sets: [{name: 'tables', color: C('--accent'), pts: spSize, dots: true},
+           {name: 'stacks', color: C('--warn'), pts: spStack, dots: true}],
+    title: 'target spread (max sd / min sd)',
+    note: 'dashed: 2x = the threshold past which a scale per group would be needed',
+    last: (spSize.length || spStack.length) ? x(lastOf(spSize)) + ' / ' + x(lastOf(spStack)) : '&ndash;',
+  });
+  return specs;
+}
+
+/* How the model plays: each statistic's rate over its recent training hands
+   (`rl/style_log.py`), in percent, three to a chart, one set of charts per group of
+   table sizes. A statistic the page does not know by name still shows, under its own
+   name, in a chart of "other". */
+const STYLE_LABELS = {
+  vpip: 'VPIP', pfr: 'PFR', three_bet: '3-bet', fold_to_three_bet: 'fold to 3-bet',
+  steal: 'steal', aggression: 'aggression', cbet: 'c-bet',
+  fold_to_cbet: 'fold to c-bet', wtsd: 'WTSD',
+};
+const STYLE_GROUPS = [
+  {title: 'style: entering the pot (%)', names: ['vpip', 'pfr', 'steal']},
+  {title: 'style: facing raises (%)', names: ['three_bet', 'fold_to_three_bet', 'fold_to_cbet']},
+  {title: 'style: postflop (%)', names: ['aggression', 'cbet', 'wtsd']},
+];
+
+function styleSpec(style, names, title){
+  const series = style.rate || {}, latest = style.latest || {};
   const shown = names.filter(k => (series[k] || []).length);
   const sets = shown.map((k, i) => ({
     name: STYLE_LABELS[k] || k, color: ramp(i, shown.length),
     pts: series[k].map(p => [p[0], p[1] * 100]),
   }));
-  /* The legend already names the lines, so the last values go in the note with
-     the sample behind each: a rate over 40 chances and over 4,000 are not the same.
-     Names come from a fixed map or from `\\w+` in the log line, so need no escaping. */
+  /* The last values go in the note with the sample behind each: a rate over 40
+     chances and over 4,000 are not the same. Names come from a fixed map or from
+     `\\w+` in the log line, so need no escaping. */
   const values = shown.map(k => {
     const pts = series[k];
     return `${STYLE_LABELS[k] || k} ${(pts[pts.length - 1][1] * 100).toFixed(0)}% (${latest[k][0]}/${latest[k][1]})`;
   }).join(' &middot; ');
   return {
     o: {d: 0, zero: true}, sets, title,
-    note: shown.length
-      ? `% delle volte che ha scelto l'azione quando poteva, sulle ultime ${hist.style_hands} mani sedute dal modello (finestra mobile) &middot; ora: ${values}`
-      : '',
+    note: shown.length ? `now: ${values}` : '',
     last: '',
   };
 }
 
-function styleSpecs(hist){
-  const all = Object.keys(hist.style_rate || {});
-  const post = all.filter(k => !STYLE_PREFLOP.includes(k));
-  const known = ['aggression', 'cbet', 'fold_to_cbet', 'wtsd'];
-  post.sort((a, b) => (known.indexOf(a) + 1 || 99) - (known.indexOf(b) + 1 || 99));
-  return [
-    styleSpec(hist, STYLE_PREFLOP, 'stile del modello: preflop (%)'),
-    styleSpec(hist, post, 'stile del modello: postflop (%)'),
-  ];
+/* The three charts of one style, plus "other" for statistics the page does not know. */
+function styleGroupSpecs(style, prefix){
+  const all = Object.keys(style.rate || {});
+  const grouped = STYLE_GROUPS.flatMap(g => g.names);
+  const specs = STYLE_GROUPS.map(g => styleSpec(style, g.names, prefix + g.title));
+  const others = all.filter(k => !grouped.includes(k));
+  chunks(others, MAX_LINES).forEach(g => specs.push(styleSpec(style, g, prefix + 'style: other (%)')));
+  return specs;
 }
 
-function valueSpecs(hist){
+/* One set of charts per group of table sizes (2-3, 4-6, 7-9 players): a model plays
+   differently heads-up and nine-handed, and the pooled rates mostly say how the run's
+   mixture of table sizes was drawn. A log from before the per-size lines has only the
+   pooled style, which is then drawn as it always was. */
+function styleSpecs(hist){
+  const bySize = hist.style_by_size || {};
+  const groups = Object.keys(bySize).sort((a, b) => parseInt(a) - parseInt(b));
+  if (groups.length){
+    return groups.flatMap(g => styleGroupSpecs(
+      bySize[g], `${g} players, ${bySize[g].hands || 0} seat-hands -- `));
+  }
+  const pooled = {rate: hist.style_rate, latest: hist.style_latest};
+  if (!Object.keys(hist.style_rate || {}).length){
+    return [styleSpec(pooled, [], 'model style (%)')];
+  }
+  return styleGroupSpecs(pooled, '');
+}
+
+/* The gradient-norm clips (`rl/grad_log.py`), one per network: the norm before the cut,
+   as a mean and a standard deviation over the iteration's minibatch steps, against that
+   network's threshold, and the share of steps each clip cut. A mean alone cannot say how
+   often a cut fires. */
+function gradSpecs(hist){
   const cs = getComputedStyle(document.documentElement);
   const C = k => cs.getPropertyValue(k).trim();
-  const sizeSets = groupSets(hist.value_sd_size,
-    Object.keys(hist.value_sd_size || {}).sort((a, b) => a - b));
-  const stackSets = groupSets(hist.value_sd_stack, STACK_ORDER);
-  const evSets = groupSets(hist.value_ev_stack, STACK_ORDER);
-  const spSize = hist.value_spread_size || [], spStack = hist.value_spread_stack || [];
-  const x = v => v === null ? '&ndash;' : v.toFixed(1) + 'x';
+  const norm = (name, mean, sd, threshold) => {
+    const o = {d: 3, zero: true};
+    if (threshold !== null && threshold !== undefined) o.ref = threshold;
+    return {
+      o, title: `${name} gradient norm before the clip`,
+      sets: [{name: 'mean', color: C('--accent'), pts: mean || []},
+             {name: 'sd over the steps', color: C('--warn'), pts: sd || []}],
+      note: o.ref === undefined ? '' : `dashed: ${name} max grad norm = ${threshold}; a step above it is cut to it`,
+      last: (mean || []).length ? fmtN(lastOf(mean), 3) : '&ndash;',
+    };
+  };
+  const pct = pts => (pts || []).map(p => [p[0], 100 * p[1]]);
+  const cutP = hist.grad_policy_clipped || [], cutC = hist.grad_critic_clipped || [];
   return [
-    {o: {d: 3, zero: true}, sets: stackSets,
-     title: 'target del critico per stack (sd)',
-     note: 'deviazione standard del return per stack effettivo, in bb: <10, 10-30, 30+; '
-         + 'le linee lontane dicono che la scala fissa del reward pesa in modo diverso',
-     last: stackSets.length ? 'spread ' + x(lastOf(spStack)) : '&ndash;'},
-    {o: {d: 3, zero: true}, sets: sizeSets,
-     title: 'target del critico per tavolo (sd)',
-     note: 'deviazione standard del return, dal tavolo da 2 (chiaro) a quello da 9 (scuro)',
-     last: sizeSets.length ? 'spread ' + x(lastOf(spSize)) : '&ndash;'},
-    {o: {d: 2, zero: true}, sets: evSets,
-     title: 'varianza spiegata dal critico per stack',
-     note: '0 = non meglio della media, sotto 0 = peggio; calcolata sui valori con cui la policy ha giocato',
-     last: '&ndash;'},
-    {o: {d: 1, ref: 2},
-     sets: [{name: 'tavoli', color: C('--accent'), pts: spSize, dots: true},
-            {name: 'stack', color: C('--warn'), pts: spStack, dots: true}],
-     title: 'spread del target (max sd / min sd)',
-     note: 'tratteggio: 2x = soglia oltre cui servirebbe una scala per gruppo',
-     last: (spSize.length || spStack.length) ? x(lastOf(spSize)) + ' / ' + x(lastOf(spStack)) : '&ndash;'},
+    norm('policy', hist.grad_policy_mean, hist.grad_policy_sd, hist.grad_policy_threshold),
+    norm('critic', hist.grad_critic_mean, hist.grad_critic_sd, hist.grad_critic_threshold),
+    {
+      o: {d: 0, zero: true}, title: 'steps cut by the gradient clips (%)',
+      sets: [{name: 'policy', color: C('--accent'), pts: pct(cutP)},
+             {name: 'critic', color: C('--warn'), pts: pct(cutC)}],
+      note: 'share of minibatch steps above the threshold of their network. With Adam a steady cut barely '
+        + 'changes the step; what it does is shrink the steps whose norm is unusual',
+      last: cutP.length ? (100 * lastOf(cutP)).toFixed(0) + '% / ' + (100 * lastOf(cutC)).toFixed(0) + '%' : '&ndash;',
+    },
   ];
 }
 
@@ -669,16 +808,17 @@ function renderCharts(host, hist){
     specs.push({
       o: c, sets,
       title: c.t + (c.u ? ' (' + c.u + ')' : ''),
-      note: c.refT ? `tratteggio: ${c.refT}` : (c.note || ''),
+      note: c.refT ? `dashed: ${c.refT}` : (c.note || ''),
       last: last === null ? '&ndash;' : fmtN(last, c.d),
     });
   }
+  specs.push(...gradSpecs(hist));
   const evalPts = hist.eval_bb100 || [];
   specs.push({
     o: {d: 1, zero: true},
     sets: [{name: 'eval vs pool', color: C('--accent'), pts: evalPts, dots: true}],
     title: 'eval vs pool (bb/100)',
-    note: 'contro il pool che questo worker ha pescato, quindi non confrontabile fra worker',
+    note: 'against the pool this worker drew, so not comparable between workers',
     last: evalPts.length ? fmtN(evalPts[evalPts.length - 1][1], 1) : '&ndash;',
   });
   const rating = hist.eval_rating || [];
@@ -686,7 +826,8 @@ function renderCharts(host, hist){
     o: {d: 0},
     sets: [{name: 'rating', color: C('--warn'), pts: rating, dots: true}],
     title: 'rating in-run',
-    note: 'cumulativo da 1500, 10 sessioni da 1000 mani per punto; K 24 le prime 10 sessioni, poi 8 e 3: si muove presto e poi si assesta',
+    note: 'starts from the rating of its parent (1500 without one), 10 sessions of 1000 hands per point; '
+      + 'K falls along the staircase as sessions accumulate, so it moves early and then settles',
     last: rating.length ? fmtN(rating[rating.length - 1][1], 0) : '&ndash;',
   });
   specs.push(...valueSpecs(hist), ...styleSpecs(hist));
@@ -699,29 +840,29 @@ function renderCharts(host, hist){
    page uses. Anything the worker recorded that is not listed still shows, under
    its own name, so an axis added to the sweep appears here without a change. */
 const HP_LABELS = {
-  lr: 'lr', hands: 'mani/iter', ppo_epochs: 'epoche PPO',
-  clip_epsilon: 'clip', minibatch_size: 'minibatch', gae_lambda: 'lambda GAE',
-  value_coef: 'coef. value', max_grad_norm: 'max grad norm', entropy_coef: 'coef. entropia', opponent_probability: 'prob. avversario',
+  lr: 'lr', hands: 'hands/iter', ppo_epochs: 'PPO epochs',
+  clip_epsilon: 'clip', minibatch_size: 'minibatch', gae_lambda: 'GAE lambda',
+  value_coef: 'value coef', policy_max_grad_norm: 'policy max grad norm', critic_max_grad_norm: 'critic max grad norm', entropy_coef: 'entropy coef', opponent_probability: 'opponent prob.',
   /* Together these two are the strength of the field the worker trains against:
      what share of its seats come from the best-rated band, and how deep that
      band is. The `pool` column shows the strength they actually produced. */
-  pool_top_share: 'quota top', pool_top_n: 'fascia top',
+  pool_top_share: 'top share', pool_top_n: 'top band',
 };
 const HP_ARM_LABELS = {
-  sampled: 'campionati', inherited: 'ereditati e perturbati',
-  'sampled-fallback': 'campionati: genitore senza metadati',
+  sampled: 'sampled', inherited: 'inherited and perturbed',
+  'sampled-fallback': 'sampled: parent without metadata',
 };
 
 function hpHtml(key){
   const hp = hpByKey.get(key);
   const parent = parentByKey.get(key);
-  const parentChip = parent == null ? '' : '<span class="chip"><b>Elo genitore</b> ' + esc(parent) + '</span>';
+  const parentChip = parent == null ? '' : '<span class="chip"><b>parent Elo</b> ' + esc(parent) + '</span>';
   if (!hp || !Object.keys(hp).length){
-    return '<div class="hp"><span class="dim">iperparametri non registrati: log di un worker '
-      + 'avviato prima dello sweep</span>' + parentChip + '</div>';
+    return '<div class="hp"><span class="dim">no hyperparameters recorded: the log of a worker '
+      + 'started before the sweep</span>' + parentChip + '</div>';
   }
   const arm = hp.hp_arm || '';
-  const chips = ['<span class="chip arm" title="solo un braccio campionato in modo indipendente si legge come curva di risposta">'
+  const chips = ['<span class="chip arm" title="only an independently sampled arm reads as a response curve">'
     + esc(HP_ARM_LABELS[arm] || arm) + '</span>'];
   if (parentChip) chips.push(parentChip);
   const known = Object.keys(HP_LABELS).filter(k => k in hp);
@@ -736,7 +877,7 @@ function hpHtml(key){
    site. */
 function panelHtml(key){
   return '<td colspan="12">' + hpHtml(key)
-    + '<div class="charts"><div class="empty">carico...</div></div></td>';
+    + '<div class="charts"><div class="empty">loading...</div></div></td>';
 }
 
 async function loadPanel(key){
@@ -750,7 +891,7 @@ async function loadPanel(key){
     drawn.set(key, hist);
     renderCharts(host, hist);
   }catch(e){
-    if (!drawn.has(key)) host.innerHTML = '<div class="empty">storia non disponibile per questo worker</div>';
+    if (!drawn.has(key)) host.innerHTML = '<div class="empty">no history available for this worker</div>';
   }
 }
 
@@ -796,8 +937,8 @@ async function tick(){
     tiles(d);
     $('#machines').innerHTML = d.machines.map(machine).join('');
     restorePanels();
-    $('#stamp').textContent = 'aggiornato alle ' + d.generated;
-  }catch(e){ $('#stamp').textContent = 'server non raggiungibile'; }
+    $('#stamp').textContent = 'updated at ' + d.generated;
+  }catch(e){ $('#stamp').textContent = 'server unreachable'; }
 }
 $('#theme').onclick = () => {
   const now = document.documentElement.getAttribute('data-theme');
@@ -924,12 +1065,12 @@ def main(argv: list[str] | None = None) -> int:
     state = State(args)
     server = QuietServer((args.host, args.dashboard_port), make_handler(state, args.dashboard_refresh))
     shown = "localhost" if args.host in ("127.0.0.1", "localhost") else args.host
-    print(f"dashboard su http://{shown}:{args.dashboard_port}  (ogni {args.dashboard_refresh}s, Ctrl-C per uscire)")
-    print(f"  macchine: {args.machines_dir}\n  modelli : {args.models_dir}")
+    print(f"dashboard at http://{shown}:{args.dashboard_port}  (every {args.dashboard_refresh}s, Ctrl-C to quit)")
+    print(f"  machines: {args.machines_dir}\n  models  : {args.models_dir}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nchiuso")
+        print("\nclosed")
     finally:
         server.server_close()
     return 0

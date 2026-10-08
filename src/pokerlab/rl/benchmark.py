@@ -16,6 +16,7 @@ from __future__ import annotations
 import random
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 
 import torch
@@ -30,6 +31,7 @@ from pokerlab.rl.pool_registry import (
 from pokerlab.rl.pool_registry import DEFAULT_RATING as DEFAULT_ANCHOR_RATING
 from pokerlab.rl.ppo import build_model_from_checkpoint
 from pokerlab.rl.rollout import Opponent, TableBank, policy_opponent
+from pokerlab.rl.style_log import StyleTally
 from pokerlab.rl.table_mix import DEFAULT_SESSION_HANDS, TableMix
 
 DEFAULT_BENCHMARK_DIR = Path("checkpoints/benchmark")
@@ -86,6 +88,10 @@ class BenchmarkRating:
     # The learner's bb/100 at each table size it played, a diagnostic to read and
     # nothing more: the rating is one number over the whole mixture.
     bb_per_100_by_size: dict[int, float] = field(default_factory=dict)
+    # How the learner played over the whole pass (`style_log`): `[events,
+    # opportunities]` per statistic and the seat-hands behind them.
+    style: dict[str, list[int]] = field(default_factory=dict)
+    style_hands: int = 0
 
 
 def anchor_paths(directory: str | Path) -> list[Path]:
@@ -161,6 +167,7 @@ def rate_against_benchmark(
     bot_rng = random.Random(rng.random())
     size_rng = random.Random(rng.random())
     bank = TableBank(mix, rng)
+    tally = StyleTally(track=[label])
     learners = [
         RLAgentPlayer(
             f"s{seat}", label,
@@ -228,7 +235,9 @@ def rate_against_benchmark(
                 proxy.name = opponent.label
                 occupants[seat] = opponent.label
 
-        deltas = bank.play_session(num_players, hands)
+        deltas = bank.play_session(
+            num_players, hands, on_hand=partial(tally.add_hand, labels=occupants)
+        )
         won += deltas[learner_seat]
         won_by_size[num_players] = won_by_size.get(num_players, 0) + deltas[learner_seat]
         hands_by_size[num_players] = hands_by_size.get(num_players, 0) + hands
@@ -260,6 +269,7 @@ def rate_against_benchmark(
 
     if played == 0:
         return None
+    style = tally.export().get(label, {"hands": 0, "style": {}})
     return BenchmarkRating(
         bb_per_100=won / mix.big_blind / (played * hands) * 100,
         sessions=played,
@@ -273,4 +283,6 @@ def rate_against_benchmark(
             size: won_by_size[size] / mix.big_blind / hands_by_size[size] * 100
             for size in sorted(won_by_size)
         },
+        style=style["style"],
+        style_hands=style["hands"],
     )

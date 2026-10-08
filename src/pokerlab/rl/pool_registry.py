@@ -24,8 +24,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from itertools import pairwise
 from pathlib import Path
 
@@ -185,9 +186,6 @@ DEFAULT_ELIMINATION_FRACTION = 0.05
 # harder.
 DEFAULT_PROTECT_PERCENTILE = 25.0
 
-MODEL = "model"
-
-
 @dataclass
 class PoolMember:
     """One rated pool entry: a saved checkpoint.
@@ -200,24 +198,30 @@ class PoolMember:
     """
 
     label: str
-    kind: str
     ref: str
     rating: float = DEFAULT_RATING
     games: int = 0
-    iteration: int = 0
-    # Not read or written by anything. It stays because member files on disk
-    # carry it and `PoolMember(**json)` rejects unknown keys, so dropping the
-    # field would make every stored member unreadable.
-    benchmark: float | None = None
+    # How the model plays: `[events, opportunities]` of each statistic of
+    # `engine/stats.py` (VPIP, PFR, 3-bet, ...) over its last `style_hands` seat-hands
+    # (at most `style_log.STYLE_WINDOW`). Set by the run that trained it and refreshed
+    # by every pass that seats it (`style_log.merge_style`). Empty for a model never
+    # measured. Descriptive only: nothing ranks or draws on it.
+    style: dict[str, list[int]] = field(default_factory=dict)
+    style_hands: int = 0
     # A frozen member's rating is a fixed reference point: it shapes *other*
     # members' deltas but never moves itself -- see `record_session_with_
     # ratings`. Used for the benchmark anchors, and for the opponents a training
     # run scores its learner against (so a run never edits anyone else's rating).
     frozen: bool = False
 
-    @property
-    def is_model(self) -> bool:
-        return self.kind == MODEL
+
+def member_from_json(entry: Mapping) -> PoolMember:
+    """A `PoolMember` from a stored entry: the fields it knows are taken, and what it
+    does not (a file written by another version) is left out rather than refused, so a
+    store loads whichever version wrote it and a field the member now has but the file
+    lacks simply takes its default."""
+    known = {f.name for f in fields(PoolMember)}
+    return PoolMember(**{k: v for k, v in entry.items() if k in known})
 
 
 def expected_score(rating: float, opponent_rating: float) -> float:
@@ -344,7 +348,7 @@ class PoolRegistry:
             return registry
         for entry in raw.get("members", []):
             try:
-                member = PoolMember(**entry)
+                member = member_from_json(entry)
             except TypeError:
                 continue
             registry.members[member.label] = member
@@ -360,16 +364,16 @@ class PoolRegistry:
         # Write-then-rename: a crash mid-write must not leave a truncated file
         # that the next run silently reads as an empty ranking.
         temporary = self.path.with_suffix(".json.tmp")
-        temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        text = json.dumps(payload, indent=2)
+        # A style pair on one line, so a member stays readable by eye.
+        text = re.sub(r"\[\s+(\d+),\s+(\d+)\s+\]", r"[\1, \2]", text)
+        temporary.write_text(text, encoding="utf-8")
         temporary.replace(self.path)
 
     # ---- ranking --------------------------------------------------------
 
     def ranked(self) -> list[PoolMember]:
         return sorted(self.members.values(), key=lambda m: (-m.rating, m.label))
-
-    def models(self) -> list[PoolMember]:
-        return [m for m in self.ranked() if m.is_model]
 
     def record_session(self, results: dict[str, float]) -> dict[str, float]:
         """Fold one session's per-participant chip deltas into the ratings.
@@ -392,13 +396,17 @@ class PoolRegistry:
         *,
         k_factors: Mapping[str, float] | None = None,
     ) -> dict[str, float]:
-        """Apply one session's deltas, except to a frozen member's rating.
+        """Apply one session's deltas, except to a frozen member.
 
         A frozen member still appears in `ratings` and is scored normally
         inside `pairwise_elo_delta`, so it still shapes every *other*
         participant's expected score and delta exactly like a normal
-        opponent -- only its own rating is held fixed (`games` still counts,
-        for honest bookkeeping). The returned dict still carries its
+        opponent -- but nothing of its own moves: neither its rating nor its
+        `games`. An anchor's rating and the games behind it belong to
+        `benchmark_arena` alone, which reads `games` to pick each anchor's K; a
+        count that grew with every pass that merely seated it as a yardstick
+        would make the arena treat the anchor as more settled than its own
+        games among the anchors say. The returned dict still carries its
         unapplied delta, for a caller that wants to know how it fared without
         persisting the result.
 
@@ -426,10 +434,9 @@ class PoolRegistry:
         deltas = pairwise_elo_delta(results, ratings, k_factors=schedule_factors)
         for label, delta in deltas.items():
             member = self.members.get(label)
-            if member is not None:
+            if member is not None and not member.frozen:
                 member.games += 1
-                if not member.frozen:
-                    member.rating += delta
+                member.rating += delta
         return deltas
 
     def eliminate_lowest_rated(
@@ -464,7 +471,7 @@ class PoolRegistry:
         """
         eligible = [
             m
-            for m in self.models()
+            for m in self.ranked()
             if not m.frozen
             and m.games >= games_threshold
             and (among is None or m.label in among)
@@ -486,7 +493,7 @@ class PoolRegistry:
         second registry entry: it is the same model seated twice, which
         simply weights it more heavily in the sampling.
         """
-        models = self.models()
+        models = self.ranked()
         if count <= 0 or not models:
             return []
         return [models[index % len(models)] for index in range(count)]

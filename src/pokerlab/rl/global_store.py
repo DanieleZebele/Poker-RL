@@ -27,16 +27,18 @@ import random
 import shutil
 import time
 import uuid
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
+from typing import NamedTuple
 
 from pokerlab.rl.pool_registry import (
     DEFAULT_RATING,
-    MODEL,
     REGISTRY_FILENAME,
     PoolMember,
     PoolRegistry,
+    member_from_json,
 )
 
 MEMBERS_DIRNAME = "members"
@@ -141,7 +143,7 @@ def _member_file(global_dir: Path, label: str) -> Path:
 
 def _read_member_file(path: Path) -> PoolMember | None:
     try:
-        return PoolMember(**json.loads(path.read_text(encoding="utf-8")))
+        return member_from_json(json.loads(path.read_text(encoding="utf-8")))
     except (OSError, ValueError, TypeError):
         return None
 
@@ -240,23 +242,42 @@ def sidecar_path(checkpoint: str | Path) -> Path:
     return Path(checkpoint).with_suffix(".json")
 
 
-def write_sidecar(checkpoint: str | Path, *, rating: float, iteration: int) -> None:
+class Sidecar(NamedTuple):
+    rating: float
+    style: dict[str, list[int]]
+    style_hands: int
+
+
+def write_sidecar(
+    checkpoint: str | Path,
+    *,
+    rating: float,
+    style: Mapping[str, Sequence[int]] | None = None,
+    style_hands: int = 0,
+) -> None:
     """Record what the run knew about a checkpoint when it saved it -- its
-    learner rating and iteration -- so a *salvaged* model (published later by
-    someone other than the run that trained it) still enters the ranking at the
-    rating it earned rather than at the baseline."""
+    learner rating and how it plays (`PoolMember.style`) -- so a *salvaged* model
+    (published later by someone other than the run that trained it) still enters
+    the ranking at the rating it earned rather than at the baseline."""
     path = sidecar_path(checkpoint)
     staging = path.with_name(f".{path.name}.tmp")
-    staging.write_text(json.dumps({"rating": rating, "iteration": iteration}), encoding="utf-8")
+    payload = {
+        "rating": rating,
+        "style": {name: list(pair) for name, pair in (style or {}).items()},
+        "style_hands": style_hands,
+    }
+    staging.write_text(json.dumps(payload), encoding="utf-8")
     staging.replace(path)
 
 
-def read_sidecar(checkpoint: str | Path) -> tuple[float, int]:
+def read_sidecar(checkpoint: str | Path) -> Sidecar:
     try:
         payload = json.loads(sidecar_path(checkpoint).read_text(encoding="utf-8"))
-        return float(payload["rating"]), int(payload["iteration"])
+        return Sidecar(
+            float(payload["rating"]), dict(payload["style"]), int(payload["style_hands"])
+        )
     except (OSError, ValueError, KeyError, TypeError):
-        return DEFAULT_RATING, 0
+        return Sidecar(DEFAULT_RATING, {}, 0)
 
 
 def publish_model(
@@ -267,7 +288,8 @@ def publish_model(
     name: str,
     rating: float,
     games: int = 0,
-    iteration: int,
+    style: Mapping[str, Sequence[int]] | None = None,
+    style_hands: int = 0,
     machine: str,
     lock_ttl: float = DEFAULT_LOCK_SECONDS,
 ) -> PoolMember | None:
@@ -301,11 +323,11 @@ def publish_model(
         raise
     member = PoolMember(
         label=target.stem,
-        kind=MODEL,
         ref=str(target),
         rating=rating,
         games=games,
-        iteration=iteration,
+        style={name: list(pair) for name, pair in (style or {}).items()},
+        style_hands=style_hands,
     )
     if acquire_locks(global_dir, [member.label], machine=machine, ttl=lock_ttl, timeout=lock_ttl):
         try:

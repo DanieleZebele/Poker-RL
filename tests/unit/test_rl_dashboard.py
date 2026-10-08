@@ -54,7 +54,7 @@ def test_a_machine_reports_when_its_slowest_worker_should_be_done(tmp_path):
     # numbers rather than a third derived from them.
     progress = machine["workers"][0]["progress"]
     assert (progress["done"], progress["total"], progress["eta_seconds"]) == (1000, 2750, 600)
-    assert machine["workers"][0]["stage_label"] == "elo: gioco"
+    assert machine["workers"][0]["stage_label"] == "elo: playing"
 
 
 def test_a_machine_that_is_still_training_has_no_finish_eta(tmp_path):
@@ -339,7 +339,10 @@ def test_the_snapshot_says_how_many_hands_the_training_rate_covers(tmp_path):
 def test_the_page_marks_a_window_that_is_still_filling():
     from pokerlab.rl.dashboard import PAGE
 
-    assert "w.train_hands.toLocaleString('it') + ' mani'" in PAGE
+    assert "w.train_hands.toLocaleString('en') + ' hands'" in PAGE
+    # The gradient clip: drawn from the worker history, after the iteration charts.
+    assert "specs.push(...gradSpecs(hist));" in PAGE
+    assert "hist.grad_policy_clipped" in PAGE and "hist.grad_critic_threshold" in PAGE
     assert "w.train_hands < 100000" in PAGE
 
 

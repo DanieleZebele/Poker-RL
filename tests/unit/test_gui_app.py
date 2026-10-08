@@ -1,11 +1,15 @@
 import queue
 import threading
 import time
+from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
 tk = pytest.importorskip("tkinter")
+from tkinter import ttk
 
+import pokerlab.gui.app as app_module
 from pokerlab.cards.card import Card
 from pokerlab.engine.actions import Action, ActionType, LegalAction
 from pokerlab.engine.history import SCHEMA_VERSION, HandHistory
@@ -13,6 +17,7 @@ from pokerlab.engine.state import ActionRecord, PlayerStatus, Street
 from pokerlab.engine.table import HandResult
 from pokerlab.gui.app import (
     DEALER_BACKGROUND,
+    TURN_BACKGROUND,
     ActionReporter,
     TableFrame,
     _bot_spec_label,
@@ -541,13 +546,12 @@ def test_the_end_of_a_hand_reveals_every_participant(table_frame):
     assert [len(c.find_all()) for c in table_frame.board_canvases] == [4, 4, 4, 4, 4]
     for seat in (0, 1, 2):
         assert _card_item_counts(table_frame.seat_widgets[seat]) == [4, 4]
-    assert table_frame._pending_clear is not None
 
 
 def test_a_seat_that_just_busted_is_not_hidden_before_its_cards_are_shown(table_frame):
     """A player who went all-in and lost is exactly the one whose cards are
     worth seeing, so the seat survives the reveal and is only hidden when
-    the table is cleared."""
+    the next hand starts."""
     result = _hand_result(final_stacks={0: 0, 1: 0, 2: 600})
     table_frame._handle_event(_hand_started_event())
 
@@ -555,53 +559,60 @@ def test_a_seat_that_just_busted_is_not_hidden_before_its_cards_are_shown(table_
     assert table_frame._busted_seats == set()
     assert _card_item_counts(table_frame.seat_widgets[0]) == [4, 4]
 
-    table_frame._clear_after_showdown(result)
+    table_frame._handle_event(_hand_started_event())
     assert table_frame._busted_seats == {0, 1}
 
 
-def test_clearing_after_the_showdown_empties_every_card(table_frame):
+def test_the_hand_stays_on_the_table_until_the_next_one_starts(table_frame):
     result = _hand_result(final_stacks={0: 100, 1: 100, 2: 400})
     table_frame._handle_event(_hand_started_event())
     table_frame._handle_event(GuiEvent("hand_complete", result))
+    table_frame._handle_event(GuiEvent("awaiting_next_hand"))
+    table_frame.update()
 
-    table_frame._clear_after_showdown(result)
+    assert [len(c.find_all()) for c in table_frame.board_canvases] == [4, 4, 4, 4, 4]
+    for seat in (0, 1, 2):
+        assert _card_item_counts(table_frame.seat_widgets[seat]) == [4, 4]
+
+    table_frame._handle_event(_hand_started_event())
 
     assert [len(c.find_all()) for c in table_frame.board_canvases] == [1] * 5
     assert [len(c.find_all()) for c in table_frame.hole_canvases] == [1, 1]
-    for seat in (0, 1, 2):
-        assert _card_item_counts(table_frame.seat_widgets[seat]) == [1, 1]
     assert table_frame._busted_seats == set()
 
 
-def test_a_new_hand_cancels_a_pending_reveal_clear(table_frame):
-    """Otherwise a timer armed by the previous hand would fire during the
-    new one and blank cards that have just been dealt."""
-    table_frame._handle_event(_hand_started_event())
-    table_frame._handle_event(GuiEvent("hand_complete", _hand_result(final_stacks={0: 100, 1: 100, 2: 400})))
-    assert table_frame._pending_clear is not None
+def test_the_next_hand_button_releases_the_session_thread(table_frame):
+    table_frame._handle_event(GuiEvent("awaiting_next_hand"))
+    assert table_frame.next_hand_gate.empty()
+    assert table_frame.next_hand_button is not None
 
-    table_frame._handle_event(_hand_started_event())
+    table_frame.next_hand_button.invoke()
 
-    assert table_frame._pending_clear is None
+    assert table_frame.next_hand_gate.qsize() == 1
+    assert table_frame.next_hand_button is None
 
 
-def test_clearing_a_destroyed_frame_is_harmless(app):
-    """_clear_after_showdown is a timer callback, and leaving the table for
-    the menu destroys the frame while it is still armed."""
-    frame = TableFrame(
-        app,
-        num_players=3,
-        event_queue=queue.Queue(),
-        human_player=None,
-        history_path="unused.jsonl",
-        seat_names={0: "A", 1: "B", 2: "C"},
-        step_gate=queue.Queue(),
-        step_mode_state={"on": False},
-    )
-    result = _hand_result()
-    frame.destroy()
+def test_the_session_waits_for_the_next_hand_button_between_hands():
+    import threading
 
-    frame._clear_after_showdown(result)  # must not raise
+    table = SimpleNamespace(stacks=[100, 100], play_hand=lambda: SimpleNamespace(hand_history=None))
+    events: queue.Queue = queue.Queue()
+    gate: queue.Queue = queue.Queue()
+    writer = SimpleNamespace(close=lambda: None)
+    thread = threading.Thread(target=app_module._run_session, args=(table, 2, events, writer, gate), daemon=True)
+    thread.start()
+
+    assert events.get(timeout=2).kind == "hand_complete"
+    assert events.get(timeout=2).kind == "awaiting_next_hand"
+    thread.join(timeout=0.3)
+    assert thread.is_alive()  # held: the button has not been pressed
+
+    gate.put(None)
+
+    assert events.get(timeout=2).kind == "hand_complete"
+    assert events.get(timeout=2).kind == "session_complete"
+    thread.join(timeout=2)
+    assert not thread.is_alive()
 
 
 # --------------------------------------------------------------------------
@@ -814,3 +825,451 @@ def test_a_runout_with_no_action_at_all_reveals_everyone(table_frame):
     assert table_frame._folded_seats() == set()
     for seat in (0, 1, 2):
         assert _card_item_counts(table_frame.seat_widgets[seat]) == [4, 4]
+
+
+def test_a_session_gives_the_models_their_opponents_statistics(app, tmp_path, monkeypatch):
+    """The table of a GUI session has a `StatsTracker`, so a model seated there reads its
+    opponents' VPIP, PFR... like at every table it was trained and rated on (without one
+    every opponent is "unknown" for the whole session)."""
+    pytest.importorskip("torch")
+    from support import tiny_model
+
+    import pokerlab.gui.app as app_module
+    from pokerlab.engine.config import GameConfig
+    from pokerlab.engine.stats import StatsTracker
+    from pokerlab.rl.ppo import save_checkpoint
+
+    checkpoint = tmp_path / "agent.pt"
+    save_checkpoint(checkpoint, tiny_model())
+    built: list = []
+    real_table = app_module.Table
+
+    def recording_table(*args, **kwargs):
+        built.append(real_table(*args, **kwargs))
+        return built[-1]
+
+    monkeypatch.setattr(app_module, "Table", recording_table)
+    monkeypatch.setattr(app_module, "_run_session", lambda *args: None)  # build the table, play nothing
+    monkeypatch.chdir(tmp_path)  # the session opens its hand-history file in the working directory
+    config = GameConfig(num_players=3, starting_stack=2000, small_blind=10, big_blind=20)
+    app.start_session(config, 0, [f"model:{checkpoint}"] * 3, hands=1, seed=1)
+
+    table = built[0]
+    assert isinstance(table.stats_tracker, StatsTracker)
+    for _ in range(3):
+        table.stacks = [2000] * 3
+        table.play_hand()
+    assert all(table.stats_tracker.hands(player.player_id) == 3 for player in table.players)
+
+
+# ---- blinds that go up -------------------------------------------------------------
+
+
+def test_the_table_follows_the_blinds_of_each_hand_and_says_when_they_go_up(table_frame):
+    started = _hand_started_event()
+    table_frame._handle_event(started)
+    assert table_frame.big_blind == 2
+    assert "bui salgono" not in table_frame.log.get("1.0", "end")
+
+    raised = _hand_started_event()
+    raised.payload.update(small_blind=3, big_blind=5, hand_id="hand-2")
+    table_frame._handle_event(raised)
+    assert table_frame.big_blind == 5  # the mouse wheel moves a raise in big blinds
+    text = table_frame.log.get("1.0", "end")
+    assert "I bui salgono: 3/5" in text and "big blind prima: 2" in text
+
+
+def test_the_setup_screen_reads_the_blind_increase_from_its_two_fields(app):
+    from pokerlab.engine.config import BlindSchedule
+    from pokerlab.gui.app import SetupFrame
+
+    setup = SetupFrame(app)
+    try:
+        assert setup._blind_schedule() is None  # the first field empty: the blinds never move
+        setup.blind_every_var.set("5")
+        setup.blind_factor_var.set("1,2")  # a comma, as it is written here
+        assert setup._blind_schedule() == BlindSchedule(every=5, factor=1.2)
+        setup.blind_factor_var.set("1.5")
+        assert setup._blind_schedule() == BlindSchedule(every=5, factor=1.5)
+        for every, factor in (("0", "1.2"), ("5", "0.8"), ("cinque", "1.2"), ("5", "molto")):
+            setup.blind_every_var.set(every)
+            setup.blind_factor_var.set(factor)
+            with pytest.raises(ValueError):
+                setup._blind_schedule()
+    finally:
+        setup.destroy()
+
+
+def test_a_session_raises_the_blinds_on_schedule(app, tmp_path, monkeypatch):
+    pytest.importorskip("torch")
+    from support import tiny_model
+
+    import pokerlab.gui.app as app_module
+    from pokerlab.engine.config import BlindSchedule, GameConfig
+    from pokerlab.rl.ppo import save_checkpoint
+
+    checkpoint = tmp_path / "agent.pt"
+    save_checkpoint(checkpoint, tiny_model())
+    built: list = []
+    real_table = app_module.Table
+
+    def recording_table(*args, **kwargs):
+        built.append(real_table(*args, **kwargs))
+        return built[-1]
+
+    monkeypatch.setattr(app_module, "Table", recording_table)
+    monkeypatch.setattr(app_module, "_run_session", lambda *args: None)
+    monkeypatch.chdir(tmp_path)
+    config = GameConfig(num_players=3, starting_stack=2000, small_blind=10, big_blind=20)
+    app.start_session(config, 0, [f"model:{checkpoint}"] * 3, hands=1, seed=1, blind_schedule=BlindSchedule(2, 1.5))
+
+    table = built[0]
+    assert table.blind_schedule == BlindSchedule(2, 1.5)
+    played = []
+    for _ in range(5):
+        table.stacks = [2000] * 3
+        played.append(table.play_hand().hand_history.big_blind)
+    assert played == [20, 20, 30, 30, 45]
+
+
+# --------------------------------------------------------------------------
+# The seat whose turn it is, and each seat's last action
+# --------------------------------------------------------------------------
+
+
+def test_the_seat_whose_turn_it_is_is_painted_green_and_the_paint_follows_the_turn(table_frame):
+    table_frame._set_turn_seat(2)
+    widgets = table_frame.seat_widgets[2]
+    assert _seat_style(table_frame, 2) == "Turn.TLabelframe"
+    assert all(str(label.cget("style")) == "Turn.TLabel" for label in widgets["labels"])
+    assert str(widgets["cards_frame"].cget("style")) == "Turn.TFrame"
+    assert all(str(c.cget("background")) == TURN_BACKGROUND for c in widgets["cards"])
+
+    table_frame._set_turn_seat(0)
+    assert _seat_style(table_frame, 0) == "Turn.TLabelframe"
+    assert _seat_style(table_frame, 2) == "Seat.TLabelframe"  # only one seat at a time
+
+    table_frame._set_turn_seat(None)
+    assert all(_seat_style(table_frame, seat) == "Seat.TLabelframe" for seat in range(3))
+
+
+def test_the_turn_wins_over_the_dealer_and_the_dealer_colour_comes_back(table_frame):
+    table_frame._set_dealer_seat(1)
+    table_frame._set_turn_seat(1)
+    assert _seat_style(table_frame, 1) == "Turn.TLabelframe"
+    table_frame._set_turn_seat(2)
+    assert _seat_style(table_frame, 1) == "Dealer.TLabelframe"
+    assert _seat_style(table_frame, 2) == "Turn.TLabelframe"
+
+
+def test_the_events_of_a_hand_move_the_green_seat(table_frame):
+    started = _hand_started_event()
+    started.payload["first_actor"] = 2
+    table_frame._handle_event(started)
+    assert _seat_style(table_frame, 2) == "Turn.TLabelframe"
+
+    action = _action_event(seat=2)
+    action.payload["next_seat"] = 0  # announced before player 0 is asked
+    table_frame._handle_event(action)
+    assert _seat_style(table_frame, 0) == "Turn.TLabelframe"
+    assert _seat_style(table_frame, 2) == "Seat.TLabelframe"
+
+    table_frame._handle_event(GuiEvent("your_turn", (_flop_observation(my_seat=1), [])))
+    assert _seat_style(table_frame, 1) == "Turn.TLabelframe"
+
+    street = GuiEvent("street_dealt", {"hand_id": "hand-1", "street": Street.TURN,
+                                      "community_cards": _BOARD[:4], "betting_closed": False, "first_actor": 2})
+    table_frame._handle_event(street)
+    assert _seat_style(table_frame, 2) == "Turn.TLabelframe"
+
+    table_frame._handle_event(_action_event(seat=2))  # a payload without next_seat: nobody is due
+    assert all(_seat_style(table_frame, seat) != "Turn.TLabelframe" for seat in range(3))
+
+
+def test_each_seat_shows_its_last_action_under_its_bet(table_frame):
+    history = (
+        _record(seat=0, action_type=ActionType.POST_BLIND, amount=1, street=Street.PREFLOP),
+        _record(seat=1, action_type=ActionType.CALL, stack_before=200, stack_after=190, street=Street.PREFLOP),
+        _record(seat=1, action_type=ActionType.RAISE, amount=60, street=Street.FLOP),
+        _record(seat=2, action_type=ActionType.FOLD, street=Street.FLOP),
+        _record(seat=2, action_type=ActionType.ALL_IN, stack_before=75, stack_after=0, street=Street.FLOP),
+    )
+    observation = replace(_flop_observation(), action_history=history)
+    table_frame._render_observation(observation)
+
+    shown = {seat: table_frame.seat_widgets[seat]["last_action"].get() for seat in range(3)}
+    assert shown == {0: "", 1: "Raise to 60", 2: "All-in (75)"}  # the blind is not a choice; the latest wins
+    # it sits in the box right under "Bet:", above the status
+    order = [str(label.cget("textvariable")) for label in table_frame.seat_widgets[1]["labels"]]
+    widgets = table_frame.seat_widgets[1]
+    assert order.index(str(widgets["last_action"])) == order.index(str(widgets["bet"])) + 1
+
+    table_frame._handle_event(_hand_started_event())  # a new hand starts clean
+    assert all(table_frame.seat_widgets[seat]["last_action"].get() == "" for seat in range(3))
+
+
+def test_an_action_of_an_earlier_street_is_not_shown(table_frame):
+    history = (
+        _record(seat=1, action_type=ActionType.CALL, stack_before=200, stack_after=190, street=Street.PREFLOP),
+        _record(seat=2, action_type=ActionType.RAISE, amount=60, street=Street.FLOP),
+    )
+    table_frame._render_observation(replace(_flop_observation(), action_history=history))
+
+    shown = {seat: table_frame.seat_widgets[seat]["last_action"].get() for seat in range(3)}
+    assert shown == {0: "", 1: "", 2: "Raise to 60"}
+
+
+def test_dealing_a_street_clears_the_last_actions(table_frame):
+    table_frame.seat_widgets[1]["last_action"].set("Call 10")
+
+    table_frame._handle_event(_street_event(Street.FLOP, _BOARD[:3], betting_closed=False))
+
+    assert all(table_frame.seat_widgets[seat]["last_action"].get() == "" for seat in range(3))
+
+
+def test_a_folded_seat_is_dark_grey_until_the_next_hand(table_frame):
+    table_frame._render_observation(_flop_observation(folded=(2,)))
+    assert _seat_style(table_frame, 2) == "Folded.TLabelframe"
+    assert _seat_style(table_frame, 0) != "Folded.TLabelframe"
+
+    table_frame._handle_event(_hand_started_event())
+    assert _seat_style(table_frame, 2) != "Folded.TLabelframe"
+
+
+def test_the_green_seat_is_the_one_that_acts_next_over_real_hands(table_frame):
+    """Real hands (random bots, the real ActionReporter and hooks) replayed into the frame: each
+    time an action arrives, the seat painted green is the seat that took it. That is what the
+    player watching sees -- the green box is the one about to act, and it is already green while
+    the previous action is still on screen."""
+    import random
+
+    from support import make_random_legal_bot
+
+    from pokerlab.engine.config import GameConfig
+    from pokerlab.engine.table import Table
+    from pokerlab.gui.app import ActionReporter
+
+    events: queue.Queue = queue.Queue()
+    rng = random.Random(5)
+    players = [make_random_legal_bot(f"p{i}", f"B{i}", rng=random.Random(rng.random())) for i in range(3)]
+    table = Table(
+        GameConfig(num_players=3, starting_stack=400, small_blind=2, big_blind=4),
+        players,
+        rng=random.Random(5),
+        on_hand_started=lambda info: events.put(GuiEvent("hand_started", info)),
+        on_street_dealt=lambda info: events.put(GuiEvent("street_dealt", info)),
+        on_action_applied=ActionReporter(events, queue.Queue(), {"on": False}, None, delay_seconds=0),
+    )
+    for _ in range(25):
+        table.stacks = [rng.randint(20, 400) for _ in range(3)]
+        table.play_hand()
+
+    green_checked = 0
+    while not events.empty():
+        event = events.get()
+        if event.kind == "action_taken":
+            greens = [seat for seat in range(3) if _seat_style(table_frame, seat) == "Turn.TLabelframe"]
+            assert greens == [event.payload["seat"]], f"{greens} painted, {event.payload['seat']} acted"
+            green_checked += 1
+        table_frame._handle_event(event)
+    assert green_checked > 25
+
+
+# --------------------------------------------------------------------------
+# A bot's action probabilities, in step mode with the opponents' cards shown
+# --------------------------------------------------------------------------
+
+
+def _probability_rows(frame):
+    """`{label: percent}` of the rows the panel shows."""
+    rows = {}
+    for row in frame.probability_rows.winfo_children():
+        texts = [child.cget("text") for child in row.winfo_children() if isinstance(child, ttk.Label)]
+        rows[texts[0]] = float(texts[1].rstrip("%"))
+    return rows
+
+
+def _decision_for_seat(seat=1):
+    from pokerlab.engine.actions import ActionType as T
+
+    observation = _flop_observation(my_seat=seat, to_match=20)
+    legal = [LegalAction(T.FOLD), LegalAction(T.CALL), LegalAction(T.RAISE, min_amount=40, max_amount=200),
+             LegalAction(T.ALL_IN)]
+    return observation, legal
+
+
+def _fake_probabilities(observation, legal):
+    from pokerlab.rl.action_space import (
+        ACTION_DIM,
+        ALL_IN_BIN,
+        CHECK_CALL_BIN,
+        FOLD_BIN,
+        RAISE_MIN_BIN,
+    )
+
+    probabilities = [0.0] * ACTION_DIM
+    probabilities[FOLD_BIN], probabilities[CHECK_CALL_BIN], probabilities[RAISE_MIN_BIN] = 0.125, 0.5, 0.25
+    probabilities[ALL_IN_BIN] = 0.125
+    return probabilities
+
+
+def _panel_frame(app, advisors):
+    frame = TableFrame(
+        app, num_players=3, event_queue=queue.Queue(), human_player=None, history_path="unused.jsonl",
+        seat_names={0: "A", 1: "B", 2: "C"}, step_gate=queue.Queue(), step_mode_state={"on": False},
+        advisors=advisors,
+    )
+    return frame
+
+
+def test_the_panel_shows_each_legal_actions_probability_for_the_bot_about_to_act(app):
+    frame = _panel_frame(app, {1: _fake_probabilities})
+    try:
+        frame.step_mode_state.update(on=True, spy=True)
+        action = _action_event(seat=0)
+        action.payload["next_seat"] = 1
+        action.payload["next_view"] = _decision_for_seat(1)
+        frame._handle_event(action)
+
+        rows = _probability_rows(frame)
+        assert rows["fold"] == 12.5 and rows["check/call"] == 50.0
+        assert rows["min-raise -> 40"] == 25.0 and rows["all-in"] == 12.5  # the raise shows its amount
+        # the other legal raise sizes are listed too, at zero; an illegal action never is
+        assert any("pot" in label and probability == 0.0 for label, probability in rows.items())
+        assert sum(rows.values()) == 100.0
+        assert "Tocca a B" in frame.probability_hint.get() and "Ah Kh" in frame.probability_hint.get()
+    finally:
+        frame.destroy()
+
+
+def test_the_panel_waits_for_step_mode_and_the_spy_and_answers_the_toggles(app):
+    frame = _panel_frame(app, {1: _fake_probabilities})
+    try:
+        action = _action_event(seat=0)
+        action.payload["next_seat"], action.payload["next_view"] = 1, _decision_for_seat(1)
+        frame._handle_event(action)
+        assert _probability_rows(frame) == {} and "Attiva" in frame.probability_hint.get()
+
+        frame.step_mode_var.set(True)
+        frame._on_step_mode_toggled()
+        assert _probability_rows(frame) == {}  # the spy is still off
+        frame.spy_var.set(True)
+        frame._on_spy_toggled()
+        assert frame.step_mode_state["spy"] is True
+        assert _probability_rows(frame)["check/call"] == 50.0  # the decision being held shows at once
+
+        frame.spy_var.set(False)
+        frame._on_spy_toggled()
+        assert _probability_rows(frame) == {} and frame.step_mode_state["spy"] is False
+    finally:
+        frame.destroy()
+
+
+def test_the_panel_says_so_when_the_one_to_act_is_not_a_bot_or_nobody_is(app):
+    frame = _panel_frame(app, {1: _fake_probabilities})  # seat 2 has no advisor
+    try:
+        frame.step_mode_state.update(on=True, spy=True)
+        frame._show_probabilities(_decision_for_seat(2))
+        assert _probability_rows(frame) == {} and "non e' un bot" in frame.probability_hint.get()
+        frame._show_probabilities(None)
+        assert "Nessun bot" in frame.probability_hint.get()
+    finally:
+        frame.destroy()
+
+
+def test_the_game_is_held_before_a_hand_or_street_opened_by_a_bot_only_when_both_modes_are_on():
+    from pokerlab.gui.app import wait_for_first_bot
+
+    def released(first_actor, state, human_seat=0):
+        gate: queue.Queue = queue.Queue()
+        done = threading.Event()
+
+        def run():
+            wait_for_first_bot({"first_actor": first_actor}, human_seat, state, gate)
+            done.set()
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        finished_alone = done.wait(0.3)
+        gate.put(None)  # the "Avanti" click
+        thread.join(2)
+        return finished_alone
+
+    assert released(1, {"on": True, "spy": True}) is False  # a bot opens: it waits for Avanti
+    assert released(0, {"on": True, "spy": True}) is True  # the human opens: nothing to look at
+    assert released(None, {"on": True, "spy": True}) is True  # nobody is due
+    assert released(1, {"on": True, "spy": False}) is True  # without the spy: the old behaviour
+    assert released(1, {"on": False, "spy": True}) is True  # without step mode: the old behaviour
+
+
+def test_real_models_real_hands_show_probabilities_that_agree_with_what_they_do(app):
+    """Hands played by models (`RLAgentPlayer`, the real hooks and reporter) replayed into a frame
+    in step mode with the spy on: every time a bot is about to act the panel lists its legal
+    actions summing to 100%, and the action it then takes is one of them."""
+    pytest.importorskip("torch")
+    import random
+
+    from support import tiny_model
+
+    from pokerlab.engine.config import GameConfig
+    from pokerlab.engine.table import Table
+    from pokerlab.gui.app import ActionReporter
+    from pokerlab.players.rl_agent import RLAgentPlayer
+    from pokerlab.rl.policy import make_policy_fn
+
+    events: queue.Queue = queue.Queue()
+    model = tiny_model()
+    players = [
+        RLAgentPlayer(f"p{i}", f"B{i}", policy_fn=make_policy_fn(model), big_blind=4, starting_stack=400)
+        for i in range(3)
+    ]
+    table = Table(
+        GameConfig(num_players=3, starting_stack=400, small_blind=2, big_blind=4),
+        players,
+        rng=random.Random(2),
+        on_hand_started=lambda info: events.put(GuiEvent("hand_started", info)),
+        on_street_dealt=lambda info: events.put(GuiEvent("street_dealt", info)),
+        on_action_applied=ActionReporter(events, queue.Queue(), {"on": False}, None, delay_seconds=0),
+    )
+    for _ in range(8):
+        table.stacks = [400] * 3
+        table.play_hand()
+
+    def labels_of(action_type):
+        """The panel rows an action of this type can have come from."""
+        if action_type == ActionType.FOLD:
+            return {"fold"}
+        if action_type in (ActionType.CHECK, ActionType.CALL):
+            return {"check/call"}
+        if action_type == ActionType.ALL_IN:
+            return {"all-in"}
+        return None  # a bet or raise: any row that is not one of the three above
+
+    frame = _panel_frame(app, {seat: player.action_probabilities for seat, player in enumerate(players)})
+    try:
+        frame.step_mode_state.update(on=True, spy=True)
+        shown: list = []  # (seat the panel was about, its rows) for the player due
+        while not events.empty():
+            event = events.get()
+            if event.kind == "action_taken":
+                seat, rows = shown[-1]
+                assert seat == event.payload["seat"], "the panel was not about the player who acted"
+                labels = {label.split(" ->")[0] for label in rows}
+                allowed = labels_of(event.payload["record"].action_type)
+                if allowed is None:
+                    assert labels - {"fold", "check/call", "all-in"}, "a raise that was not among the actions"
+                else:
+                    assert labels & allowed, f"{event.payload['record'].action_type} not among {labels}"
+            frame._handle_event(event)
+            view = {
+                "action_taken": event.payload.get("next_view"),
+                "hand_started": event.payload.get("first_actor_view"),
+                "street_dealt": event.payload.get("first_actor_view"),
+            }.get(event.kind)
+            if view is not None:
+                rows = _probability_rows(frame)
+                assert sum(rows.values()) == pytest.approx(100.0, abs=0.6)
+                shown.append((view[0].my_seat, rows))
+        assert len(shown) > 20
+    finally:
+        frame.destroy()

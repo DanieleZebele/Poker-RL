@@ -42,7 +42,6 @@ or skip activation entirely and call the venv's executables directly:
 
 ```powershell
 .venv\Scripts\python.exe -m pytest
-.venv\Scripts\python.exe -m pokerlab.cli.play --list-bots
 ```
 
 ## Playing with the GUI
@@ -52,27 +51,8 @@ poker-gui
 ```
 
 Opens a setup screen (players, stack, blinds, hands, bot selection --
-accepts the same `model:<path>` specs as `--bots` below) and
+accepts `model:<path>` specs for trained checkpoints) and
 then a live table screen with clickable action buttons for your seat.
-
-## Playing a session (terminal)
-
-```powershell
-# see the best trained models found
-poker-play --list-bots
-
-# 6 players, one of them you (seat 0), the rest bots
-poker-play --players 6 --stack 200 --sb 1 --bb 2 --hands 10 --human-seats 1
-
-# pick which models fill the non-human seats (cycled if there are more seats than specs)
-poker-play --players 4 --human-seats 1 --bots model:checkpoints/models/<a-model>.pt
-
-# fully unattended bot-only run, reproducible via --seed
-poker-play --players 9 --hands 500 --human-seats 0 --seed 42
-```
-
-Each session writes a hand-by-hand log to `hand_histories/session_<id>.jsonl`
-(one JSON object per line, one line per hand).
 
 ## Running the tests
 
@@ -90,8 +70,8 @@ src/pokerlab/
   evaluator/   hand-strength evaluation (5-7 cards -> best 5-card hand)
   engine/      GameConfig, betting rules, side pots, Table orchestration,
                hand-history read/write
-  players/     Player interface, ManualPlayer, RLAgentPlayer, GuiPlayer
-  cli/         `poker-play` command-line entrypoint
+  players/     Player interface, RLAgentPlayer, GuiPlayer
+  cli/         model discovery and bot building shared by the GUI
   gui/         `poker-gui` Tkinter desktop app
   rl/          self-play PPO, opponent pool, Elo ranking, continuous training loop
   vision/      live screen-capture recognition (cards, dealer, seats, amounts)

@@ -22,7 +22,7 @@ from pokerlab.rl.benchmark_arena import (
     write_ratings,
 )
 from pokerlab.rl.global_store import read_member, write_member
-from pokerlab.rl.pool_registry import DEFAULT_K_SCHEDULE, MODEL, PoolMember, PoolRegistry
+from pokerlab.rl.pool_registry import DEFAULT_K_SCHEDULE, PoolMember, PoolRegistry
 
 
 def anchor_store(tmp_path, count=6, series=2, rating=1500.0):
@@ -39,7 +39,7 @@ def anchor_store(tmp_path, count=6, series=2, rating=1500.0):
             write_member(
                 global_dir,
                 PoolMember(
-                    label=label, kind=MODEL, ref=str(directory / f"{label}.pt"),
+                    label=label, ref=str(directory / f"{label}.pt"),
                     rating=rating + n, games=7, frozen=True,
                 ),
             )
@@ -116,17 +116,17 @@ def test_writing_changes_the_rating_and_nothing_else(tmp_path):
 
     after = read_member(global_dir, anchors[0].label)
     assert after.rating == before.rating + 42.0
-    assert (after.games, after.ref, after.kind) == (before.games, before.ref, before.kind)
+    assert (after.games, after.ref) == (before.games, before.ref)
     assert after.frozen, "an anchor must still be an anchor afterwards"
 
 
 def test_an_anchor_stays_unreachable_to_everything_else(tmp_path):
     """The guarantee this module is the exception to: an ordinary rated session
-    scores an anchor normally but never applies its delta."""
+    scores an anchor normally but moves nothing of its own, rating or games."""
     _root, global_dir = anchor_store(tmp_path, count=2, series=1)
     members = {
-        "a": PoolMember(label="a", kind=MODEL, ref="a.pt", rating=1500.0, frozen=True),
-        "b": PoolMember(label="b", kind=MODEL, ref="b.pt", rating=1500.0),
+        "a": PoolMember(label="a", ref="a.pt", rating=1500.0, frozen=True),
+        "b": PoolMember(label="b", ref="b.pt", rating=1500.0),
     }
     registry = PoolRegistry(
         directory=global_dir, max_models=10, members=members, k_schedule=DEFAULT_K_SCHEDULE
@@ -136,7 +136,8 @@ def test_an_anchor_stays_unreachable_to_everything_else(tmp_path):
 
     assert members["a"].rating == 1500.0, "frozen: unchanged even though it won"
     assert members["b"].rating < 1500.0
-    assert members["a"].games == 1, "but it still counts as having played"
+    assert members["a"].games == 0, "and no game is counted: only the arena counts an anchor's"
+    assert members["b"].games == 1
 
 
 def test_a_run_can_be_undone_from_its_backup(tmp_path):
@@ -155,6 +156,27 @@ def test_a_run_can_be_undone_from_its_backup(tmp_path):
     for label, rating in original.items():
         assert read_member(global_dir, label).rating == rating
     assert json.loads(backup.read_text()) == original
+
+
+def test_the_arena_writes_the_games_it_played_and_a_restore_keeps_them(tmp_path):
+    """The arena is the only writer of an anchor's games: it writes the count it started
+    from plus the sessions it played. A backup records ratings, so restoring one puts
+    the ratings back and leaves the games played where they are."""
+    root, global_dir = anchor_store(tmp_path, count=3, series=1)
+    anchors = collect_anchors(root, global_dir)
+    backup = save_backup(global_dir, anchors)
+    by_label = {a.label: a for a in anchors}
+    labels = list(by_label)
+    before = {a.label: a.games for a in anchors}
+    played = apply_sessions(by_label, [{labels[0]: 10.0, labels[1]: -10.0}] * 4)
+    assert played == 4
+    write_ratings(global_dir, anchors, machine="t", lock_ttl=5)
+    assert read_member(global_dir, labels[0]).games == before[labels[0]] + 4
+    assert read_member(global_dir, labels[2]).games == before[labels[2]]
+
+    restore(global_dir, backup, machine="t", lock_ttl=5)
+    assert read_member(global_dir, labels[0]).games == before[labels[0]] + 4
+    assert read_member(global_dir, labels[0]).rating == by_label[labels[0]].start
 
 
 def test_the_table_groups_by_folder_and_shows_every_model(tmp_path):

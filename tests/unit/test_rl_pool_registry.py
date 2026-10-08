@@ -36,7 +36,7 @@ def add_model_file(
 ) -> None:
     (registry.directory / f"{label}.pt").write_bytes(b"not a real checkpoint")
     registry.members[label] = PoolMember(
-        label=label, kind="model", ref=f"{label}.pt", rating=rating, games=games, frozen=frozen
+        label=label, ref=f"{label}.pt", rating=rating, games=games, frozen=frozen
     )
 
 
@@ -116,12 +116,24 @@ def test_a_corrupt_registry_loads_as_empty_instead_of_raising(tmp_path):
     assert PoolRegistry.load(tmp_path).members == {}
 
 
-def test_an_unknown_field_in_a_stored_member_is_skipped_not_fatal(tmp_path):
-    (tmp_path / "registry.json").write_text(
-        json.dumps({"members": [{"label": "x", "kind": "model", "ref": "x.pt", "bogus": 1}]}),
-        encoding="utf-8",
+def test_a_saved_style_pair_stays_on_one_line(tmp_path):
+    registry = PoolRegistry(directory=tmp_path)
+    registry.members["m"] = PoolMember(
+        label="m", ref="m.pt", style={"vpip": [243, 900]}, style_hands=900
     )
-    assert PoolRegistry.load(tmp_path).members == {}
+    registry.save()
+
+    assert '"vpip": [243, 900]' in (tmp_path / "registry.json").read_text(encoding="utf-8")
+    assert PoolRegistry.load(tmp_path).members["m"].style == {"vpip": [243, 900]}
+
+
+def test_a_stored_member_loads_whatever_version_wrote_it(tmp_path):
+    """Fields the member does not have are left out, and fields it has that the file
+    lacks take their default: an older file gains the new ones."""
+    stored = {"label": "x", "kind": "model", "ref": "x.pt", "iteration": 100, "bogus": 1}
+    (tmp_path / "registry.json").write_text(json.dumps({"members": [stored]}), encoding="utf-8")
+    member = PoolRegistry.load(tmp_path).members["x"]
+    assert (member.ref, member.rating, member.style, member.style_hands) == ("x.pt", 1500.0, {}, 0)
 
 
 # ---- seat filling --------------------------------------------------------
@@ -137,7 +149,7 @@ def test_a_registry_can_hold_a_model_directly(tmp_path):
     registry = make_registry(tmp_path)
     add_model_file(registry, "m", rating=1720.0)
     assert registry.members["m"].rating == 1720.0
-    assert registry.models()[0].label == "m"
+    assert registry.ranked()[0].label == "m"
 
 
 def test_fill_slots_prefers_models_then_duplicates(tmp_path):
@@ -190,7 +202,9 @@ def test_an_unregistered_participant_is_rated_but_not_persisted(tmp_path):
 # ---- frozen members --------------------------------------------------------
 
 
-def test_a_frozen_members_rating_never_moves_but_games_still_counts(tmp_path):
+def test_a_frozen_member_moves_neither_its_rating_nor_its_games(tmp_path):
+    """An anchor's rating and games belong to `benchmark_arena`, which reads the games
+    to pick its K: a pass that seats it as a yardstick changes neither."""
     registry = make_registry(tmp_path)
     add_model_file(registry, "anchor", rating=1500.0, games=5, frozen=True)
     add_model_file(registry, "challenger", rating=1500.0, games=5)
@@ -198,7 +212,8 @@ def test_a_frozen_members_rating_never_moves_but_games_still_counts(tmp_path):
     registry.record_session({"anchor": -80.0, "challenger": 80.0})
 
     assert registry.members["anchor"].rating == 1500.0
-    assert registry.members["anchor"].games == 6
+    assert registry.members["anchor"].games == 5
+    assert registry.members["challenger"].games == 6
     assert registry.members["challenger"].rating > 1500.0
 
 
@@ -415,8 +430,8 @@ def test_the_schedule_burns_in_fast_and_then_settles():
 
 def test_a_veteran_moves_less_than_a_newcomer_at_the_same_table(tmp_path):
     registry = PoolRegistry(directory=tmp_path, k_schedule=DEFAULT_K_SCHEDULE)
-    registry.members["vet"] = PoolMember(label="vet", kind="model", ref="v.pt", games=1500)
-    registry.members["new"] = PoolMember(label="new", kind="model", ref="n.pt", games=0)
+    registry.members["vet"] = PoolMember(label="vet", ref="v.pt", games=1500)
+    registry.members["new"] = PoolMember(label="new", ref="n.pt", games=0)
 
     registry.record_session({"vet": 50.0, "new": -50.0})
 
@@ -434,8 +449,8 @@ def test_without_a_schedule_or_a_k_a_session_cannot_be_rated(tmp_path):
     """There is no flat K to fall back on: a registry that was given no schedule
     and a caller that named no K have nothing to rate with, and say so."""
     registry = PoolRegistry(directory=tmp_path)
-    registry.members["vet"] = PoolMember(label="vet", kind="model", ref="v.pt", games=1500)
-    registry.members["new"] = PoolMember(label="new", kind="model", ref="n.pt", games=0)
+    registry.members["vet"] = PoolMember(label="vet", ref="v.pt", games=1500)
+    registry.members["new"] = PoolMember(label="new", ref="n.pt", games=0)
 
     with pytest.raises(ValueError, match="K-factor"):
         registry.record_session({"vet": 50.0, "new": -50.0})
@@ -450,8 +465,8 @@ def test_a_session_is_rated_at_the_experience_the_model_had_when_it_sat_down(tmp
     whichever value were used."""
     boundary = DEFAULT_K_SCHEDULE[3][0]
     registry = PoolRegistry(directory=tmp_path, k_schedule=DEFAULT_K_SCHEDULE)
-    registry.members["a"] = PoolMember(label="a", kind="model", ref="a.pt", games=boundary - 1)
-    registry.members["b"] = PoolMember(label="b", kind="model", ref="b.pt", games=boundary - 1)
+    registry.members["a"] = PoolMember(label="a", ref="a.pt", games=boundary - 1)
+    registry.members["b"] = PoolMember(label="b", ref="b.pt", games=boundary - 1)
 
     registry.record_session({"a": 10.0, "b": -10.0})
 
@@ -463,7 +478,7 @@ def test_a_session_is_rated_at_the_experience_the_model_had_when_it_sat_down(tmp
 
 def test_an_unregistered_participant_with_no_k_of_its_own_is_an_error(tmp_path):
     registry = PoolRegistry(directory=tmp_path, k_schedule=DEFAULT_K_SCHEDULE)
-    registry.members["vet"] = PoolMember(label="vet", kind="model", ref="v.pt", games=1500)
+    registry.members["vet"] = PoolMember(label="vet", ref="v.pt", games=1500)
 
     with pytest.raises(ValueError, match="learner"):
         registry.record_session({"vet": 50.0, "learner": -50.0})
@@ -476,7 +491,7 @@ def test_a_caller_can_give_an_unregistered_participant_its_own_k(tmp_path):
     rated sessions and passes the K that follows, so the learner walks the same
     staircase as a registered model instead of sitting on the flat fallback."""
     registry = PoolRegistry(directory=tmp_path, k_schedule=DEFAULT_K_SCHEDULE)
-    registry.members["vet"] = PoolMember(label="vet", kind="model", ref="v.pt", games=1500)
+    registry.members["vet"] = PoolMember(label="vet", ref="v.pt", games=1500)
     results = {"vet": -50.0, "learner": 50.0}
     ratings = {"vet": DEFAULT_RATING, "learner": DEFAULT_RATING}
 
@@ -492,8 +507,8 @@ def test_a_caller_can_give_an_unregistered_participant_its_own_k(tmp_path):
 
 def test_an_override_wins_over_the_schedule_for_the_same_label(tmp_path):
     registry = PoolRegistry(directory=tmp_path, k_schedule=DEFAULT_K_SCHEDULE)
-    registry.members["vet"] = PoolMember(label="vet", kind="model", ref="v.pt", games=1500)
-    registry.members["other"] = PoolMember(label="other", kind="model", ref="o.pt", games=1500)
+    registry.members["vet"] = PoolMember(label="vet", ref="v.pt", games=1500)
+    registry.members["other"] = PoolMember(label="other", ref="o.pt", games=1500)
 
     deltas = registry.record_session_with_ratings(
         {"vet": 50.0, "other": -50.0},

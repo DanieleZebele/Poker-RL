@@ -21,7 +21,7 @@ import pytest
 import pokerlab.rl.population_arena as arena
 from pokerlab.rl.global_arena import Candidate
 from pokerlab.rl.global_store import write_member
-from pokerlab.rl.pool_registry import MODEL, PoolMember
+from pokerlab.rl.pool_registry import PoolMember
 
 
 def test_the_module_does_not_import_torch():
@@ -91,7 +91,7 @@ def store(tmp_path, models=8):
         (directory / f"m{index}.pt").write_bytes(b"weights")
         write_member(
             tmp_path / "checkpoints" / "global",
-            PoolMember(label=f"m{index}", kind=MODEL, ref="x", rating=1500.0, games=index),
+            PoolMember(label=f"m{index}", ref="x", rating=1500.0, games=index),
         )
     return tmp_path / "checkpoints"
 

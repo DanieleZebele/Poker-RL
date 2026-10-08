@@ -27,8 +27,8 @@ An all-in for no more than what is already on the table is a call, not a raise,
 which is why the amounts of the engine's own `ActionRecord`s decide it: they hold
 the street total after the action.
 
-**The vector** (`stat_vector`, `USED_SLOTS` = 20 of the `STAT_SLOTS` = 100 the
-model has room for, the rest is reserved and left at zero):
+**The vector** (`stat_vector`, `USED_SLOTS` = `STAT_SLOTS` = 20 numbers, all of them
+what the model's input holds for a seat):
 
     0       1.0, "statistics supplied"
     1       hands in the window, log-scaled
@@ -58,9 +58,12 @@ from dataclasses import dataclass
 from pokerlab.engine.actions import ActionType
 from pokerlab.engine.state import ActionRecord, Street
 
-# Room the model's input has per player, and how many of those this module fills.
-STAT_SLOTS = 100
+# What the model's input holds per player: exactly the vector this module fills. (There used
+# to be 100 slots a seat, 80 of them reserved for later and always zero; they were removed
+# because a statistic added later changes what the input means anyway, which is a new
+# `FEATURE_VERSION` whatever the room.)
 USED_SLOTS = 20
+STAT_SLOTS = USED_SLOTS
 
 WINDOW = 200
 

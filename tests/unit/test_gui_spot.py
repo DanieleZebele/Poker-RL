@@ -73,13 +73,14 @@ def test_validation_errors_are_clear():
 
 def test_advice_from_an_untrained_model():
     pytest.importorskip("torch")
+    from support import tiny_model
+
     from pokerlab.gui.spot import advise
-    from pokerlab.rl.policy import PokerActorCritic
 
     spot = Spot(num_players=3, my_seat=0, hole_cards=(parse_card("Ah"), parse_card("Kh")))
     state = replay(spot)
     out = advise(state.observation, state.legal_actions,
-                 [("m", 1500.0, PokerActorCritic(hidden=16, num_layers=1))],
+                 [("m", 1500.0, tiny_model(hidden=16, num_layers=1))],
                  big_blind=2, starting_stack=200)
     assert len(out) == 1
     assert abs(sum(b.probability for b in out[0].bins) - 1.0) < 1e-4

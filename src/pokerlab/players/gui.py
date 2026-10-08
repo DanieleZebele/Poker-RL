@@ -42,9 +42,8 @@ class GuiPlayer(Player):
     hook publishes the "action_taken" event instead -- for the human and
     the bots alike, from one place, with the state from after the action.
     This is the only integration point a GUI needs -- Table and the rest of
-    the engine are completely unaware a GUI exists, exactly like
-    ManualPlayer just swaps a blocking `queue.get()` in for a blocking
-    `input()`.
+    the engine are completely unaware a GUI exists: `act()` simply blocks on a
+    `queue.get()` until the human's decision arrives.
     """
 
     def __init__(self, player_id: str, name: str, event_queue: queue.Queue[GuiEvent]) -> None:

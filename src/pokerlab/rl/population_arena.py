@@ -64,6 +64,7 @@ import time
 from pathlib import Path
 
 from pokerlab.config import add_config_arguments, resolve_cli
+from pokerlab.rl.device import resolve_device
 from pokerlab.rl.global_arena import (
     DEFAULT_BENCHMARK_SAMPLE,
     DEFAULT_GLOBAL_DIR,
@@ -171,7 +172,9 @@ def build_parser() -> argparse.ArgumentParser:
         "riga di comando: un file condiviso non deve poterlo accendere per tutti",
     )
     add_table_arguments(parser)
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--device", default="auto", help="cpu, cuda or auto (the default): the GPU if there is one"
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--global-lock-seconds", type=int, default=DEFAULT_LOCK_SECONDS)
     parser.add_argument(
@@ -254,7 +257,7 @@ def main(argv: list[str] | None = None) -> int:
             benchmark_sample=args.global_benchmark_sample,
             sessions=batch,
             session_hands=args.session_hands,
-            device=args.device,
+            device=resolve_device(args.device),
             seed=rng.randrange(2**31),
             workers=min(workers, batch),
             draw=draw,

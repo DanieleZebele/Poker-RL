@@ -254,7 +254,7 @@ def test_the_vector_pairs_every_rate_with_how_often_it_could_have_happened():
 
 
 def test_the_model_has_room_for_far_more_than_is_filled_today():
-    assert USED_SLOTS < STAT_SLOTS == 100 and WINDOW == 200
+    assert USED_SLOTS == STAT_SLOTS == 20 and WINDOW == 200
 
 
 # ---- through the table -----------------------------------------------------------

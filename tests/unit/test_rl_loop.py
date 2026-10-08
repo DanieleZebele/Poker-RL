@@ -97,7 +97,7 @@ def test_state_is_written_atomically(tmp_path):
 def test_the_leaderboard_ranks_by_rating(tmp_path):
     registry = PoolRegistry(directory=tmp_path, max_models=20)
     for label, rating in (("low", 1100.0), ("high", 1900.0), ("mid", 1500.0)):
-        registry.members[label] = PoolMember(label=label, kind="model", ref=f"{label}.pt", rating=rating)
+        registry.members[label] = PoolMember(label=label, ref=f"{label}.pt", rating=rating)
 
     lines = format_leaderboard(registry).splitlines()
     assert "high" in lines[1] and "low" in lines[3]
@@ -106,9 +106,9 @@ def test_the_leaderboard_ranks_by_rating(tmp_path):
 def test_the_leaderboard_leaves_out_the_frozen_benchmark_anchors(tmp_path):
     registry = PoolRegistry(directory=tmp_path, max_models=20)
     registry.members["anchor"] = PoolMember(
-        label="anchor", kind="model", ref="anchor.pt", rating=2500.0, frozen=True
+        label="anchor", ref="anchor.pt", rating=2500.0, frozen=True
     )
-    registry.members["model"] = PoolMember(label="model", kind="model", ref="model.pt", rating=1600.0)
+    registry.members["model"] = PoolMember(label="model", ref="model.pt", rating=1600.0)
 
     text = format_leaderboard(registry)
 
@@ -389,7 +389,7 @@ def store_with_ranking(tmp_path, count: int, *, games: int = 10):
         label = f"m{index:02d}"
         (models / f"{label}.pt").write_bytes(b"weights")
         ranking.members[label] = PoolMember(
-            label=label, kind="model", ref=f"{label}.pt", rating=2000.0 - index, games=games
+            label=label, ref=f"{label}.pt", rating=2000.0 - index, games=games
         )
     return models, ranking
 
@@ -444,11 +444,11 @@ def launch_args(tmp_path, **overrides):
         "workers": 4, "seed_base": 1000, "iterations": 5, "hands": 8,
         "table_weights": [0.0, 1.0, 0, 0, 0, 0, 0, 0], "stack_min_bb": 50.0, "stack_max_bb": 50.0,
         "sb": 1, "bb": 2, "lr": 3e-4, "device": "cpu",
-        "hidden": 512, "num_layers": 3, "head_hidden": 256, "head_layers": 1,
+        "hidden": 512, "num_layers": 3, "head_hidden": 256, "head_layers": 1, "equity_model": "e.pt",
         "models_dir": tmp_path / "models",
-        "machine": "host-a", "pool_models": 20, "pool_top_share": 0.5, "pool_top_n": 100,
+        "machine": "host-a", "pool_models": 20, "table_hands": 200, "concurrent_tables": 8, "allin_runouts": 20, "style_share": 0.0, "style_spread": 0.5, "style_temperature_spread": 0.2, "style_jitter": 0.1, "style_scales": [1.0] * 5, "critic_stack_power": 1.4, "pool_top_share": 0.5, "pool_top_n": 100,
         "ppo_epochs": 4, "clip_epsilon": 0.2, "eval_every": 10,
-        "minibatch_size": 1024, "gae_lambda": 0.95, "value_coef": 0.5, "max_grad_norm": 0.5,
+        "minibatch_size": 1024, "gae_lambda": 0.95, "value_coef": 0.5, "policy_max_grad_norm": 0.5, "critic_max_grad_norm": 1.0,
         "entropy_coef": 0.0, "k_schedule": "0:16, 100:2", "draw_tiers": "10, 100, 1000, all",
         "eval_sessions": 2,
         "benchmark_dir": tmp_path / "benchmark",
@@ -568,7 +568,7 @@ def a_parent(**overrides):
         "minibatch_size": 1024,
         "gae_lambda": 0.95,
         "value_coef": 0.5,
-        "max_grad_norm": 0.5,
+        "policy_max_grad_norm": 0.5, "critic_max_grad_norm": 1.0,
         "entropy_coef": 0.0,
     }
     values.update(overrides)
@@ -820,19 +820,20 @@ def test_the_settings_are_read_back_out_of_a_real_checkpoint(tmp_path):
     turns every worker of the generation into a restart from the fleet's own settings,
     which is the opposite of the search the fleet is supposed to be running."""
     pytest.importorskip("torch")
-    from pokerlab.rl.policy import PokerActorCritic
+    from support import tiny_model
+
     from pokerlab.rl.ppo import save_checkpoint
     from pokerlab.rl.train import run_metadata
 
     args = SimpleNamespace(
-        hp_arm=HP_ARM_SAMPLED, parent_label="", hidden=512, num_layers=3, head_hidden=256, head_layers=1, machine="host-a", seed=7, resume=True, iterations=100,
+        hp_arm=HP_ARM_SAMPLED, parent_label="", hidden=512, num_layers=3, head_hidden=256, head_layers=1, equity_model="e.pt", machine="host-a", seed=7, resume=True, iterations=100,
         hands=640, table_weights=[25.0, 20.0, 15.0, 10.0, 10.0, 10.0, 5.0, 5.0], stack_min_bb=1.0, stack_max_bb=100.0, sb=50, bb=100, lr=3.8e-4, ppo_epochs=5,
         clip_epsilon=0.25, entropy_coef=0.0, opponent_probability=0.62,
-        pool_models=20, pool_top_share=0.5, pool_top_n=100,
-        minibatch_size=1024, gae_lambda=0.95, value_coef=0.5, max_grad_norm=0.5,
+        pool_models=20, table_hands=200, concurrent_tables=8, pool_top_share=0.5, pool_top_n=100,
+        minibatch_size=1024, gae_lambda=0.95, value_coef=0.5, policy_max_grad_norm=0.5, critic_max_grad_norm=1.0,
     )
     path = tmp_path / "agent.pt"
-    save_checkpoint(path, PokerActorCritic(), iteration=100, metadata=run_metadata(args))
+    save_checkpoint(path, tiny_model(), iteration=100, metadata=run_metadata(args))
 
     recovered = loop_module.read_run_metadata(path)
     child = perturb_hyperparameters(recovered, random.Random(0))
@@ -845,11 +846,12 @@ def test_a_model_published_before_the_metadata_existed_reads_as_nothing(tmp_path
     """Every model on the volume today is one of these, so this is the path the
     first generation actually takes."""
     pytest.importorskip("torch")
-    from pokerlab.rl.policy import PokerActorCritic
+    from support import tiny_model
+
     from pokerlab.rl.ppo import save_checkpoint
 
     path = tmp_path / "old.pt"
-    save_checkpoint(path, PokerActorCritic(), iteration=100)
+    save_checkpoint(path, tiny_model(), iteration=100)
 
     assert loop_module.read_run_metadata(path) is None
     assert loop_module.read_run_metadata(tmp_path / "missing.pt") is None
@@ -892,7 +894,7 @@ def _abandoned_generation(work, generation=155, worker=7, *, archive=True, ratin
     worker_dir.mkdir(parents=True)
     if archive:
         (worker_dir / "agent-20260923-070159.pt").write_bytes(b"the model this worker trained")
-        write_sidecar(worker_dir / "agent-20260923-070159.pt", rating=rating, iteration=50)
+        write_sidecar(worker_dir / "agent-20260923-070159.pt", rating=rating)
     live = work / f"agent-{name}.pt"
     live.write_bytes(b"x" * 1000)
     return worker_dir, live
@@ -1236,7 +1238,8 @@ valore per stack (bb): <10 sd 0.083 ev -4.12 n 281 | 30+ sd 0.669 ev n/a n 2666 
 iter    2  reward   -0.15 bb  policy +0.0078  value    0.044  entropy 0.440  kl 0.0069  clip 0.063
 iter   10  reward   +0.10 bb  policy +0.0078  value    0.044  entropy 0.440  kl 0.0069  clip 0.063
 valore per tavolo: 2 sd 0.300 ev -0.10 n 500 | 9 sd 0.600 ev -0.05 n 400  (spread 2.0x)
-valore per stack (bb): <10 sd 0.080 ev -2.00 n 280 | 30+ sd 0.600 ev +0.02 n 2600  (spread 7.5x)"""
+valore per stack (bb): <10 sd 0.080 ev -2.00 n 280 | 30+ sd 0.600 ev +0.02 n 2600  (spread 7.5x)
+valore per strada: preflop sd 0.500 ev +0.05 n 2000 | river sd 0.900 ev +0.60 n 300  (spread 1.8x)"""
     history = parse_worker_history("w01", text)
     # Each reading is anchored to the iteration printed just before it.
     assert history.value_sd_size == {"2": [[1, 0.27], [10, 0.3]], "9": [[1, 0.674], [10, 0.6]]}
@@ -1245,6 +1248,30 @@ valore per stack (bb): <10 sd 0.080 ev -2.00 n 280 | 30+ sd 0.600 ev +0.02 n 260
     assert history.value_ev_stack == {"<10": [[1, -4.12], [10, -2.0]], "30+": [[10, 0.02]]}
     assert history.value_spread_size == [[1, 2.5], [10, 2.0]]
     assert history.value_spread_stack == [[1, 8.1], [10, 7.5]]
+    # By street: sd and explained variance, and its spread is not mistaken for another kind's.
+    assert history.value_sd_street == {"preflop": [[10, 0.5]], "river": [[10, 0.9]]}
+    assert history.value_ev_street == {"preflop": [[10, 0.05]], "river": [[10, 0.6]]}
+
+
+def test_parse_worker_history_reads_the_gradient_lines():
+    from pokerlab.rl.monitor import parse_worker_history
+
+    text = """iter    1  reward   +0.54 bb  policy -0.0078  value    0.039  entropy 0.427  kl 0.0242  clip 0.148
+gradienti: policy media 0.8000 sd 0.2000 tagliati 75.0% soglia 0.5 | critico media 0.1000 sd 0.0500 tagliati 0.0% soglia 1 [40 passi]
+iter    2  reward   -0.15 bb  policy +0.0078  value    0.044  entropy 0.440  kl 0.0069  clip 0.063
+iter    3  reward   -0.15 bb  policy +0.0078  value    0.044  entropy 0.440  kl 0.0069  clip 0.063
+gradienti: policy media 0.3000 sd 0.1000 tagliati 10.0% soglia 0.65 | critico media 0.2000 sd 0.0400 tagliati 5.0% soglia 0.25 [40 passi]
+gradienti: policy media 0.3000 sd 0.1000 tagliati 10.0% soglia 0.65 | critico media 0.2000 sd 0.04"""
+    history = parse_worker_history("w01", text)
+    # Anchored to the iteration printed just before; an iteration without a line has no
+    # point, and a cut line is not read at all.
+    assert history.grad_policy_mean == [[1, 0.8], [3, 0.3]]
+    assert history.grad_policy_sd == [[1, 0.2], [3, 0.1]]
+    assert history.grad_policy_clipped == [[1, 0.75], [3, 0.1]]
+    assert history.grad_critic_mean == [[1, 0.1], [3, 0.2]]
+    assert history.grad_critic_clipped == [[1, 0.0], [3, 0.05]]
+    assert (history.grad_policy_threshold, history.grad_critic_threshold) == (0.65, 0.25)
+    assert parse_worker_history("w01", text.splitlines()[0]).grad_policy_threshold is None
 
 
 def test_parse_worker_history_reads_the_style_lines():
@@ -1265,6 +1292,25 @@ stile (9900 mani): [vpip 2970/99"""
     assert history.style_hands == 9900
 
 
+def test_parse_worker_history_reads_the_style_of_each_group_of_table_sizes():
+    from pokerlab.rl.monitor import parse_worker_history
+
+    text = """iter    1  reward   +0.54 bb  policy -0.0078  value    0.039  entropy 0.427  kl 0.0242  clip 0.148
+stile (1100 mani): [vpip 440/1100 | pfr 220/1100]
+stile 2-3 (300 mani): [vpip 210/300 | pfr 150/300]
+stile 7-9 (800 mani): [vpip 160/800 | pfr 0/0]
+iter   10  reward   +0.10 bb  policy +0.0078  value    0.044  entropy 0.440  kl 0.0069  clip 0.063
+stile 2-3 (900 mani): [vpip 540/900 | pfr 360/900]"""
+    history = parse_worker_history("w01", text)
+    # The pooled line is still the pooled style; each group has its own series.
+    assert history.style_rate["vpip"] == [[1, 0.4]] and history.style_hands == 1100
+    assert history.style_by_size["2-3"]["rate"]["vpip"] == [[1, 0.7], [10, 0.6]]
+    assert history.style_by_size["2-3"]["latest"]["pfr"] == [360, 900]
+    assert history.style_by_size["2-3"]["hands"] == 900
+    assert history.style_by_size["7-9"]["rate"] == {"vpip": [[1, 0.2]]}  # no chance at pfr yet
+    assert "4-6" not in history.style_by_size
+
+
 def test_a_log_without_style_lines_has_no_style():
     from pokerlab.rl.monitor import parse_worker_history
 
@@ -1272,6 +1318,7 @@ def test_a_log_without_style_lines_has_no_style():
         "w01", "iter    1  reward   +0.54 bb  policy -0.0078  value    0.039  entropy 0.427  kl 0.0242  clip 0.148"
     )
     assert history.style_rate == {} and history.style_latest == {} and history.style_hands == 0
+    assert history.style_by_size == {}
 
 
 def test_a_log_without_value_lines_has_empty_value_series():
@@ -1543,21 +1590,18 @@ def test_a_small_machine_is_held_by_cores_and_memory_not_the_ceiling(monkeypatch
     assert auto(25, cores=32) == 25  # memory unreadable: only cores and ceiling count
 
 
-def test_workers_zero_resolves_through_the_ceiling(monkeypatch):
+def test_workers_zero_resolves_through_the_ceiling(monkeypatch, tmp_path):
     monkeypatch.setattr(loop_module, "available_memory_mb", lambda: 100_000)
     monkeypatch.setattr(loop_module.os, "cpu_count", lambda: 32)
-    args, _ = loop_module.load_args(["--workers", "0", "--config", ""])
+    (tmp_path / "equity.pt").write_bytes(b"")
+    args, _ = loop_module.load_args(
+        ["--workers", "0", "--config", "", "--equity-model", str(tmp_path / "equity.pt")]
+    )
     assert loop_module.resolve_workers(args).workers == 25
     args.worker_ceiling = 10
     assert loop_module.resolve_workers(args).workers == 10
     args.workers = 7  # an explicit count is left alone
     assert loop_module.resolve_workers(args).workers == 7
-
-
-def test_the_shipped_config_sets_the_worker_ceiling_for_the_whole_fleet():
-    from pokerlab.config import read_config
-
-    assert read_config(REPO_CONFIG)["worker_ceiling"] == loop_module.DEFAULT_WORKERS
 
 
 # ---- the Elo fill-in handshake ---------------------------------------------
@@ -1930,7 +1974,7 @@ def test_a_parent_without_the_newest_axes_still_gets_perturbed():
 
 
 def test_the_newest_axes_are_inherited_from_a_parent_that_has_them():
-    parent = a_parent(minibatch_size=2000, gae_lambda=0.99, value_coef=1.0, max_grad_norm=0.1)
+    parent = a_parent(minibatch_size=2000, gae_lambda=0.99, value_coef=1.0, policy_max_grad_norm=0.1)
     seen = {perturb_hyperparameters(parent, random.Random(s)).minibatch_size for s in range(50)}
     assert seen <= {1600, 2000, 2400}
 
@@ -1956,6 +2000,14 @@ def test_the_gae_lambda_moves_through_its_complement():
 # ---- config.toml -------------------------------------------------------------
 
 REPO_CONFIG = Path(__file__).resolve().parents[2] / "config.toml"
+
+
+def write_config(path, text):
+    """A `config.toml` for a test: `text` plus an `equity_model`, which every run needs and
+    which only has to exist as a file (nothing here loads it)."""
+    equity = path.parent / "equity.pt"
+    equity.write_bytes(b"")
+    path.write_text(f'equity_model = "{equity}"\n' + text, encoding="utf-8")
 
 
 def test_the_shipped_config_is_valid_for_every_cli():
@@ -2025,7 +2077,7 @@ def test_a_worker_is_told_not_to_read_the_config_again(tmp_path, monkeypatch):
 def test_the_file_sets_where_a_worker_with_no_parent_starts(tmp_path):
     pytest.importorskip("torch")
     path = tmp_path / "c.toml"
-    path.write_text("lr = 0.5\nhands = 9\nstack_max_bb = 80.0\n", encoding="utf-8")
+    write_config(path, "lr = 0.5\nhands = 9\nstack_max_bb = 80.0\n")
     args, _ = loop_module.load_args(["--config", str(path)])
     assert args.stack_max_bb == 80.0
     start = starting_hyperparameters(args)
@@ -2037,9 +2089,8 @@ def test_the_file_sets_the_shape_of_the_network(tmp_path):
     from pokerlab.rl.train import network_shape
 
     path = tmp_path / "c.toml"
-    path.write_text(
+    write_config(path, 
         "[network]\nhidden = 128\nnum_layers = 2\nhead_hidden = 64\nhead_layers = 3\n",
-        encoding="utf-8",
     )
     args, _ = loop_module.load_args(["--config", str(path)])
     assert network_shape(args) == {
@@ -2051,7 +2102,7 @@ def test_the_file_sets_the_shape_of_the_network(tmp_path):
 def test_a_network_that_cannot_be_built_is_a_config_error(tmp_path, key):
     pytest.importorskip("torch")
     path = tmp_path / "c.toml"
-    path.write_text(f"{key} = 0\n", encoding="utf-8")
+    write_config(path, f"{key} = 0\n")
     with pytest.raises(loop_module.ConfigError, match=key):
         loop_module.load_args(["--config", str(path)])
 
@@ -2059,9 +2110,9 @@ def test_a_network_that_cannot_be_built_is_a_config_error(tmp_path, key):
 def test_zero_head_layers_is_a_network_and_a_negative_number_is_not(tmp_path):
     pytest.importorskip("torch")
     path = tmp_path / "c.toml"
-    path.write_text("head_layers = 0\n", encoding="utf-8")
+    write_config(path, "head_layers = 0\n")
     assert loop_module.load_args(["--config", str(path)])[0].head_layers == 0
-    path.write_text("head_layers = -1\n", encoding="utf-8")
+    write_config(path, "head_layers = -1\n")
     with pytest.raises(loop_module.ConfigError, match="head_layers"):
         loop_module.load_args(["--config", str(path)])
 
@@ -2069,7 +2120,7 @@ def test_zero_head_layers_is_a_network_and_a_negative_number_is_not(tmp_path):
 def test_the_file_sets_how_far_a_worker_moves(tmp_path):
     pytest.importorskip("torch")
     path = tmp_path / "c.toml"
-    path.write_text("hp_multipliers = [1.0]\n", encoding="utf-8")
+    write_config(path, "hp_multipliers = [1.0]\n")
     args, _ = loop_module.load_args(["--config", str(path)])
     assert args.hp_multipliers == [1.0]
 
@@ -2092,7 +2143,7 @@ def test_a_multiplier_that_would_break_an_axis_is_a_config_error(tmp_path):
 
     for bad in ("[0.8, 0, 1.2]", "[-1.0]"):
         path = tmp_path / "c.toml"
-        path.write_text(f"hp_multipliers = {bad}\n", encoding="utf-8")
+        write_config(path, f"hp_multipliers = {bad}\n")
         with pytest.raises(ConfigError, match="hp_multipliers"):
             loop_module.load_args(["--config", str(path)])
 
@@ -2100,16 +2151,16 @@ def test_a_multiplier_that_would_break_an_axis_is_a_config_error(tmp_path):
 def test_a_file_that_cannot_be_read_keeps_the_previous_values(tmp_path, capsys):
     pytest.importorskip("torch")
     path = tmp_path / "c.toml"
-    path.write_text("stack_max_bb = 50.0\n", encoding="utf-8")
+    write_config(path, "stack_max_bb = 50.0\n")
     argv = ["--config", str(path)]
     args, _ = loop_module.load_args(argv)
     assert args.stack_max_bb == 50.0
 
-    path.write_text("stack_max_bb = = 60\n", encoding="utf-8")  # saved halfway
+    write_config(path, "stack_max_bb = = 60\n")  # saved halfway
     kept = loop_module.refresh_args(args, lambda: loop_module.load_args(argv))
     assert kept is args and "valori precedenti" in capsys.readouterr().out
 
-    path.write_text("stack_max_bb = 60.0\n", encoding="utf-8")
+    write_config(path, "stack_max_bb = 60.0\n")
     fresh = loop_module.refresh_args(args, lambda: loop_module.load_args(argv))
     assert fresh.stack_max_bb == 60.0
     assert "stack_max_bb: 50.0 -> 60.0" in capsys.readouterr().out
@@ -2124,10 +2175,10 @@ def test_the_file_sets_the_draw_tiers_and_a_bad_one_is_an_error(tmp_path):
     from pokerlab.config import ConfigError
 
     path = tmp_path / "c.toml"
-    path.write_text('draw_tiers = "100, 1000, all"\n', encoding="utf-8")
+    write_config(path, 'draw_tiers = "100, 1000, all"\n')
     args, _ = loop_module.load_args(["--config", str(path)])
     assert args.draw_tiers == "100, 1000, all"
-    path.write_text('draw_tiers = "100, soon"\n', encoding="utf-8")
+    write_config(path, 'draw_tiers = "100, soon"\n')
     with pytest.raises(ConfigError):
         loop_module.load_args(["--config", str(path)])
 
@@ -2139,9 +2190,7 @@ def test_a_worker_is_handed_the_fleets_k_schedule(tmp_path, monkeypatch):
 
 def test_the_file_sets_the_parent_bands_and_the_k_schedule(tmp_path):
     path = tmp_path / "c.toml"
-    path.write_text(
-        'parent_tiers = "10, 10, all"\nk_schedule = "0:20, 50:5"\n', encoding="utf-8"
-    )
+    write_config(path, 'parent_tiers = "10, 10, all"\nk_schedule = "0:20, 50:5"\n')
     args, _ = loop_module.load_args(["--config", str(path)])
     assert args.parent_tiers == "10, 10, all"
     assert args.k_schedule == "0:20, 50:5"
@@ -2158,7 +2207,7 @@ def test_the_file_sets_the_parent_bands_and_the_k_schedule(tmp_path):
 )
 def test_a_bad_parent_band_or_k_schedule_in_the_file_is_an_error(tmp_path, line):
     path = tmp_path / "c.toml"
-    path.write_text(line + "\n", encoding="utf-8")
+    write_config(path, line + "\n")
     from pokerlab.config import ConfigError
 
     with pytest.raises(ConfigError):

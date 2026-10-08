@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from pokerlab.engine.stats import STATS
 from pokerlab.rl.global_arena import (
     Candidate,
     add_benchmark_candidates,
@@ -100,7 +101,7 @@ def test_delete_checkpoints_removes_every_listed_file(tmp_path):
         path.write_bytes(b"x")
 
     deleted = delete_checkpoints(
-        [PoolMember(label="doomed", kind="model", ref=str(a))], {"doomed": [a, b]}
+        [PoolMember(label="doomed", ref=str(a))], {"doomed": [a, b]}
     )
 
     assert deleted == 2
@@ -111,7 +112,7 @@ def test_delete_checkpoints_removes_every_listed_file(tmp_path):
 def test_delete_checkpoints_skips_a_label_with_no_known_copies(tmp_path):
     skipped = []
     deleted = delete_checkpoints(
-        [PoolMember(label="gone", kind="model", ref="nowhere.pt")],
+        [PoolMember(label="gone", ref="nowhere.pt")],
         {},
         on_skip=lambda label, why: skipped.append(label),
     )
@@ -124,8 +125,8 @@ def test_delete_checkpoints_skips_a_label_with_no_known_copies(tmp_path):
 
 
 def test_prune_ghost_members_drops_members_missing_from_the_existing_labels(tmp_path):
-    write_member(tmp_path, PoolMember(label="real", kind="model", ref="real.pt"))
-    write_member(tmp_path, PoolMember(label="ghost", kind="model", ref="ghost.pt", frozen=True))
+    write_member(tmp_path, PoolMember(label="real", ref="real.pt"))
+    write_member(tmp_path, PoolMember(label="ghost", ref="ghost.pt", frozen=True))
 
     dropped = prune_ghost_members(tmp_path, {"real"}, machine="a")
 
@@ -134,7 +135,7 @@ def test_prune_ghost_members_drops_members_missing_from_the_existing_labels(tmp_
 
 
 def test_prune_ghost_members_reports_zero_when_nothing_is_stale(tmp_path):
-    write_member(tmp_path, PoolMember(label="real", kind="model", ref="real.pt"))
+    write_member(tmp_path, PoolMember(label="real", ref="real.pt"))
 
     assert prune_ghost_members(tmp_path, {"real", "other"}, machine="a") == 0
     assert list_member_labels(tmp_path) == {"real"}
@@ -161,7 +162,7 @@ def test_a_model_published_during_the_merge_is_not_a_ghost(tmp_path):
     global_dir = tmp_path / "global"
     root = _store_with(tmp_path / "checkpoints", models=["old", "published_during_merge"])
     for label in ("old", "published_during_merge"):
-        write_member(global_dir, PoolMember(label=label, kind="model", ref="x.pt"))
+        write_member(global_dir, PoolMember(label=label, ref="x.pt"))
 
     # The snapshot predates the newcomer, exactly as a real merge's does.
     dropped = prune_ghost_members(global_dir, {"old"}, machine="a", root=root)
@@ -176,7 +177,7 @@ def test_an_anchor_is_found_in_its_series_not_only_in_the_store(tmp_path):
     anchor's rating is the fixed point the whole scale is measured against."""
     global_dir = tmp_path / "global"
     root = _store_with(tmp_path / "checkpoints", anchors=["anchor"])
-    write_member(global_dir, PoolMember(label="anchor", kind="model", ref="x.pt", frozen=True))
+    write_member(global_dir, PoolMember(label="anchor", ref="x.pt", frozen=True))
 
     assert prune_ghost_members(global_dir, set(), machine="a", root=root) == 0
     assert prune_ghost_members(global_dir, {"unrelated"}, machine="a", root=root) == 0
@@ -189,7 +190,7 @@ def test_a_checkpoint_really_gone_is_still_dropped(tmp_path):
     global_dir = tmp_path / "global"
     root = _store_with(tmp_path / "checkpoints", models=["alive"])
     for label in ("alive", "deleted"):
-        write_member(global_dir, PoolMember(label=label, kind="model", ref="x.pt"))
+        write_member(global_dir, PoolMember(label=label, ref="x.pt"))
 
     dropped = prune_ghost_members(global_dir, {"alive"}, machine="a", root=root)
 
@@ -200,7 +201,7 @@ def test_a_checkpoint_really_gone_is_still_dropped(tmp_path):
 def test_prune_ghost_members_does_nothing_when_the_disk_shows_no_models_at_all(tmp_path):
     """An empty listing means the volume could not be read, not that every
     model was deleted: wiping the whole ledger over it would be catastrophic."""
-    write_member(tmp_path, PoolMember(label="real", kind="model", ref="real.pt"))
+    write_member(tmp_path, PoolMember(label="real", ref="real.pt"))
 
     assert prune_ghost_members(tmp_path, set(), machine="a") == 0
     assert list_member_labels(tmp_path) == {"real"}
@@ -210,7 +211,7 @@ def test_prune_ghost_members_does_nothing_when_the_disk_shows_no_models_at_all(t
 
 
 def test_member_store_round_trips_a_member(tmp_path):
-    member = PoolMember(label="m1", kind="model", ref="x/m1.pt", rating=1612.5, games=7, frozen=True)
+    member = PoolMember(label="m1", ref="x/m1.pt", rating=1612.5, games=7, frozen=True)
     write_member(tmp_path, member)
 
     assert read_member(tmp_path, "m1") == member
@@ -219,12 +220,12 @@ def test_member_store_round_trips_a_member(tmp_path):
 
 
 def test_snapshot_mirrors_the_member_files_and_is_not_rewritten_while_fresh(tmp_path):
-    write_member(tmp_path, PoolMember(label="a", kind="model", ref="a.pt", rating=1600.0))
+    write_member(tmp_path, PoolMember(label="a", ref="a.pt", rating=1600.0))
 
     assert write_snapshot(tmp_path, machine="m") is True
     assert PoolRegistry.load(tmp_path).members["a"].rating == 1600.0
 
-    write_member(tmp_path, PoolMember(label="a", kind="model", ref="a.pt", rating=1650.0))
+    write_member(tmp_path, PoolMember(label="a", ref="a.pt", rating=1650.0))
     assert write_snapshot(tmp_path, machine="m") is False  # still fresh
     assert PoolRegistry.load(tmp_path).members["a"].rating == 1600.0
     assert write_snapshot(tmp_path, machine="m", force=True) is True
@@ -318,7 +319,7 @@ def test_repair_member_refs_follows_files_into_the_store_and_benchmark(tmp_path)
     _touch(root / "models/c.pt")
     for label, ref in (("a", "models/a.pt"), ("b", "exchange/b.pt"),
                        ("c", str(root / "models/c.pt")), ("gone", "x/gone.pt")):
-        write_member(root / "global", PoolMember(label=label, kind="model", ref=ref))
+        write_member(root / "global", PoolMember(label=label, ref=ref))
 
     assert repair_member_refs(root / "global", root, machine="m") == 2
 
@@ -388,7 +389,7 @@ def _store(tmp_path, anchors, models):
             write_member(
                 global_dir,
                 PoolMember(
-                    label=label, kind="model", ref=str(root / folder / f"{label}.pt"),
+                    label=label, ref=str(root / folder / f"{label}.pt"),
                     rating=rating, games=games, frozen=kind == "anchor",
                 ),
             )
@@ -451,14 +452,66 @@ def test_nothing_is_added_without_any_anchor(tmp_path):
     assert add_benchmark_candidates(global_dir=global_dir, root=root, machine="m") == []
 
 
+def test_the_first_anchors_are_the_models_whose_ratings_are_furthest_apart(tmp_path):
+    root, global_dir = _store(
+        tmp_path, anchors=[],
+        models=[(1500.0, 5), (1510.0, 6), (1650.0, 7), (1700.0, 8), (1710.0, 9), (1800.0, 10)],
+    )
+
+    added = add_benchmark_candidates(
+        global_dir=global_dir, root=root, machine="m", minimum_anchors=3
+    )
+
+    # The strongest, then the weakest, then the one furthest from both.
+    assert [m.rating for m in added] == [1800.0, 1500.0, 1650.0]
+    assert all(read_member(global_dir, m.label).frozen for m in added)
+    assert (global_dir / "benchmark_arena_request.json").exists()
+
+
+def test_the_missing_anchors_are_spread_away_from_the_ones_that_exist(tmp_path):
+    root, global_dir = _store(
+        tmp_path, anchors=[(1500.0, 500)],
+        models=[(1400.0, 10), (1520.0, 20), (1690.0, 30), (1700.0, 40), (1900.0, 50)],
+    )
+
+    added = add_benchmark_candidates(
+        global_dir=global_dir, root=root, machine="m", minimum_anchors=3
+    )
+
+    assert sorted(m.rating for m in added) == [1700.0, 1900.0]  # furthest from 1500
+
+
+def test_models_that_never_played_fill_in_only_when_the_played_ones_run_out(tmp_path):
+    root, global_dir = _store(
+        tmp_path, anchors=[], models=[(1600.0, 10), (1500.0, 0), (1500.0, 0)]
+    )
+    added = add_benchmark_candidates(
+        global_dir=global_dir, root=root, machine="m", minimum_anchors=3
+    )
+    assert len(added) == 3 and added[0].rating == 1600.0
+
+
+def test_the_bootstrap_stops_when_the_benchmark_is_full(tmp_path):
+    root, global_dir = _store(
+        tmp_path, anchors=[], models=[(1500.0, 5), (1501.0, 6), (1502.0, 7), (1503.0, 8)]
+    )
+    assert len(add_benchmark_candidates(
+        global_dir=global_dir, root=root, machine="m", minimum_anchors=2
+    )) == 2
+
+    # Two anchors now: the ordinary rule applies, and these ratings clear nothing.
+    assert add_benchmark_candidates(
+        global_dir=global_dir, root=root, machine="m", minimum_anchors=2
+    ) == []
+
+
 # ---- play_global_sessions / run_population_sessions (need real models) ------------
 
 torch = pytest.importorskip("torch")
 
-from support import fixed_mix
+from support import fixed_mix, tiny_model
 
 from pokerlab.rl.global_arena import play_global_sessions, run_population_sessions
-from pokerlab.rl.policy import PokerActorCritic
 from pokerlab.rl.ppo import save_checkpoint
 
 GAME = fixed_mix(3)
@@ -467,7 +520,7 @@ GAME = fixed_mix(3)
 def _make_checkpoint(path, seed=0):
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(seed)
-    save_checkpoint(path, PokerActorCritic(hidden=8, num_layers=1))
+    save_checkpoint(path, tiny_model(hidden=8, num_layers=1))
 
 
 def _four_candidates(tmp_path):
@@ -586,7 +639,8 @@ def test_run_population_sessions_never_moves_a_frozen_anchors_rating(small_popul
     registry = load_global_registry(global_dir)
 
     assert registry.members["bench0"].rating == anchor_rating_after_first
-    assert registry.members["bench0"].games > 0  # still counted, just not rated
+    # Nor counted: an anchor's games are the arena's alone. It was bootstrapped at 0.
+    assert registry.members["bench0"].games == 0
 
 
 def test_a_locked_participant_defers_its_session_instead_of_blocking_the_round(small_population):
@@ -627,6 +681,107 @@ def test_a_locked_participant_defers_its_session_instead_of_blocking_the_round(s
     assert report.sessions == 1
     assert read_member(global_dir, victim).games == games_before + 1
     assert not [p for p in pending.glob("*.json") if not p.name.startswith(".")]
+
+
+def test_a_pass_refreshes_the_style_of_every_model_it_seats(small_population):
+    global_dir = small_population / "global"
+    kwargs = {
+        "global_dir": global_dir, "root": small_population, "mix": GAME, "machine": "host-a",
+        "population_sample": 20, "benchmark_sample": 1, "sessions": 6,
+        "session_hands": 4, "trigger_size": 10**9,
+    }
+    run_population_sessions(seed=1, **kwargs)
+    members = load_global_registry(global_dir).members
+    seated = [m for m in members.values() if m.games > 0]
+    assert seated
+    for member in seated:
+        assert list(member.style) == list(STATS)
+        assert member.style_hands > 0
+
+    before = {m.label: m.style_hands for m in seated}
+    run_population_sessions(seed=2, **kwargs)
+    after = load_global_registry(global_dir).members
+    assert any(after[label].style_hands > hands for label, hands in before.items())
+
+
+def test_a_session_applied_later_still_brings_its_style(small_population):
+    global_dir = small_population / "global"
+    run_population_sessions(
+        global_dir=global_dir, root=small_population, mix=GAME, machine="host-a",
+        population_sample=20, benchmark_sample=1, sessions=2, session_hands=1,
+        seed=1, trigger_size=10**9,
+    )
+    victim, *others = sorted(load_global_registry(global_dir).members)[:3]
+    before = read_member(global_dir, victim)
+    assert acquire_locks(global_dir, [victim], machine="someone-else")
+    pending = global_dir / "pending"
+    style = {"hands": 7, "style": {name: [1, 2] for name in STATS}}
+    (pending / "host-b-20260101-000000-abc.json").write_text(json.dumps({
+        "population_draw": [], "benchmark_draw": [],
+        "sessions": [{victim: 10.0, others[0]: -5.0, others[1]: -5.0}],
+        "styles": [{victim: style}],
+    }))
+    apply_pending_population_sessions(
+        global_dir=global_dir, root=small_population, machine="host-a",
+        trigger_size=10**9, lock_wait=0.0,
+    )
+    assert read_member(global_dir, victim).style_hands == before.style_hands  # deferred, kept
+
+    release_locks(global_dir, [victim])
+    apply_pending_population_sessions(
+        global_dir=global_dir, root=small_population, machine="host-a", trigger_size=10**9
+    )
+    assert read_member(global_dir, victim).style_hands == before.style_hands + 7
+
+
+def test_a_member_without_a_style_gets_the_one_its_checkpoint_recorded(tmp_path):
+    from pokerlab.rl.global_arena import backfill_member_styles
+
+    root = tmp_path / "checkpoints"
+    for label in ("a", "b", "c"):
+        _make_checkpoint(root / f"models/{label}.pt")
+        write_member(root / "global", PoolMember(label=label, ref=f"{label}.pt"))
+    write_member(
+        root / "global", PoolMember(label="c", ref="c.pt", style={"vpip": [1, 2]}, style_hands=2)
+    )
+    metadata = {
+        "a": {"style": {"vpip": [30, 100], "pfr": [10, 100]}, "style_hands": 100},
+        "b": {"note": "trained before styles were measured"},
+    }
+    opened: list[str] = []
+
+    def read(path):
+        opened.append(path.stem)
+        return metadata.get(path.stem)
+
+    skip: set[str] = set()
+    filled = backfill_member_styles(
+        root / "global", root, machine="m", read_metadata=read, skip=skip
+    )
+
+    assert filled == 1
+    a = read_member(root / "global", "a")
+    assert (a.style, a.style_hands) == ({"vpip": [30, 100], "pfr": [10, 100]}, 100)
+    assert read_member(root / "global", "b").style_hands == 0  # nothing recorded: left for a pass
+    assert read_member(root / "global", "c").style == {"vpip": [1, 2]}  # already had one
+    assert sorted(opened) == ["a", "b"]  # c was never opened
+
+    backfill_member_styles(root / "global", root, machine="m", read_metadata=read, skip=skip)
+    assert sorted(opened) == ["a", "b"]  # and b is not opened again
+
+
+def test_play_global_sessions_reports_how_each_model_played(tmp_path):
+    candidates = _four_candidates(tmp_path)
+    styles: list = []
+
+    sessions = play_global_sessions(
+        candidates, GAME, sessions=3, session_hands=5, seed=1, styles=styles
+    )
+
+    assert len(styles) == len(sessions) == 3
+    for session, style in zip(sessions, styles):
+        assert set(style) == set(session)
+        assert all(entry["hands"] == 5 for entry in style.values())
 
 
 def test_a_pending_file_is_applied_exactly_once_however_many_mergers_run(small_population):
@@ -796,7 +951,7 @@ def test_run_population_sessions_does_not_trigger_below_the_real_disk_population
     registry = PoolRegistry(directory=global_dir, max_models=10**9)
     for i in range(50):
         registry.members[f"ghost{i:03d}"] = PoolMember(
-            label=f"ghost{i:03d}", kind="model", ref=f"/nowhere/ghost{i:03d}.pt", rating=1000.0, games=10
+            label=f"ghost{i:03d}", ref=f"/nowhere/ghost{i:03d}.pt", rating=1000.0, games=10
         )
     registry.save()
 
@@ -858,7 +1013,7 @@ def _doomed_set(tmp_path, ratings):
         path = tmp_path / f"{label}.pt"
         path.write_bytes(b"weights")
         paths[label] = [path]
-        doomed.append(PoolMember(label=label, kind="model", ref=str(path), rating=rating))
+        doomed.append(PoolMember(label=label, ref=str(path), rating=rating))
     return doomed, paths
 
 

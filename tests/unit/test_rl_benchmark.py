@@ -6,13 +6,13 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from support import fixed_mix
+from support import fixed_mix, tiny_model
 
+from pokerlab.engine.stats import STATS
 from pokerlab.rl.benchmark import (
     anchor_paths,
     rate_against_benchmark,
 )
-from pokerlab.rl.policy import PokerActorCritic
 from pokerlab.rl.ppo import save_checkpoint
 
 GAME = fixed_mix(3)
@@ -28,15 +28,13 @@ def make_series(root, series, per_series=3):
     opponents from the whole set -- but the layout is still what pruning creates,
     so the fixture keeps it.
     """
-    from pokerlab.rl.policy import PokerActorCritic
-
     for index in range(series):
         directory = root / f"benchmark_{index + 1}"
         directory.mkdir(parents=True, exist_ok=True)
         for n in range(per_series):
             save_checkpoint(
                 directory / f"s{index + 1}-m{n}.pt",
-                PokerActorCritic(hidden=16, num_layers=1),
+                tiny_model(hidden=16, num_layers=1),
             )
     return root
 
@@ -64,7 +62,7 @@ def test_the_pass_rates_the_model_over_every_session(tmp_path):
     make_series(tmp_path / "benchmark", series=3, per_series=2)
 
     rated = rate_against_benchmark(
-        PokerActorCritic(hidden=16, num_layers=1), tmp_path / "benchmark", game,
+        tiny_model(hidden=16, num_layers=1), tmp_path / "benchmark", game,
         label="fresh", rating=1500.0, sessions=6, hands=3, resident=4,
         rotate_every=2, seed=1,
     )
@@ -76,6 +74,21 @@ def test_the_pass_rates_the_model_over_every_session(tmp_path):
     assert rated.rating_after != 1500.0, "the rating must actually move"
 
 
+def test_the_pass_reports_how_the_model_played_over_all_its_hands(tmp_path):
+    game = fixed_mix(3)
+    make_series(tmp_path / "benchmark", series=3, per_series=2)
+
+    rated = rate_against_benchmark(
+        tiny_model(hidden=16, num_layers=1), tmp_path / "benchmark", game,
+        label="fresh", rating=1500.0, sessions=4, hands=3, resident=4, seed=1,
+    )
+
+    assert rated.style_hands == 12  # the learner sat in every hand of every session
+    assert list(rated.style) == list(STATS)
+    events, chances = rated.style["vpip"]
+    assert chances == 12 and 0 <= events <= chances
+
+
 def test_the_session_count_continues_from_training(tmp_path):
     """The K a session is rated at comes from how many rated sessions the learner
     has played *in total*, validation passes included -- that continuity is the
@@ -84,7 +97,7 @@ def test_the_session_count_continues_from_training(tmp_path):
     make_series(tmp_path / "benchmark", series=2, per_series=2)
 
     rated = rate_against_benchmark(
-        PokerActorCritic(hidden=16, num_layers=1), tmp_path / "benchmark", game,
+        tiny_model(hidden=16, num_layers=1), tmp_path / "benchmark", game,
         label="fresh", rating=1500.0, games=100, sessions=4, hands=3, seed=1,
     )
 
@@ -106,7 +119,7 @@ def test_a_frozen_set_too_small_to_seat_a_table_is_not_fatal(tmp_path):
     skipped = []
 
     rated = rate_against_benchmark(
-        PokerActorCritic(hidden=16, num_layers=1), tmp_path / "benchmark", game,
+        tiny_model(hidden=16, num_layers=1), tmp_path / "benchmark", game,
         label="fresh", rating=1500.0, sessions=1, hands=2, seed=1,
         on_skip=lambda path, why: skipped.append((path, why)),
     )
@@ -118,7 +131,7 @@ def test_a_frozen_set_too_small_to_seat_a_table_is_not_fatal(tmp_path):
 def test_an_empty_benchmark_directory_yields_nothing(tmp_path):
     game = fixed_mix(3)
     assert rate_against_benchmark(
-        PokerActorCritic(hidden=16, num_layers=1), tmp_path / "nope", game,
+        tiny_model(hidden=16, num_layers=1), tmp_path / "nope", game,
         label="fresh", rating=1500.0, sessions=1, hands=2,
     ) is None
 
@@ -131,7 +144,7 @@ def test_the_pass_reports_its_progress_session_by_session(tmp_path):
     seen = []
 
     rate_against_benchmark(
-        PokerActorCritic(hidden=16, num_layers=1), tmp_path / "benchmark", game,
+        tiny_model(hidden=16, num_layers=1), tmp_path / "benchmark", game,
         label="fresh", rating=1500.0, sessions=4, hands=2, seed=1,
         on_progress=lambda done, total, detail: seen.append((done, total)),
     )
@@ -149,7 +162,7 @@ def test_a_broken_checkpoint_is_struck_off_rather_than_reported_every_slice(tmp_
     skipped = []
 
     rated = rate_against_benchmark(
-        PokerActorCritic(hidden=16, num_layers=1), tmp_path / "benchmark", game,
+        tiny_model(hidden=16, num_layers=1), tmp_path / "benchmark", game,
         label="fresh", rating=1500.0, sessions=8, hands=2, resident=3,
         rotate_every=1, seed=1,
         on_skip=lambda path, why: skipped.append(path.name),
@@ -169,7 +182,7 @@ def test_the_pass_is_deliberately_not_queued_for_the_global_merge(tmp_path):
     make_series(tmp_path / "benchmark", series=2, per_series=2)
 
     rated = rate_against_benchmark(
-        PokerActorCritic(hidden=16, num_layers=1), tmp_path / "benchmark", game,
+        tiny_model(hidden=16, num_layers=1), tmp_path / "benchmark", game,
         label="fresh", rating=1500.0, games=100, sessions=3, hands=2, seed=1,
     )
 
@@ -234,7 +247,7 @@ def test_the_pass_draws_a_table_size_per_session_from_the_mixture(tmp_path):
     make_series(tmp_path / "benchmark", series=2, per_series=2)  # four anchors: enough for 4-handed
 
     rated = rate_against_benchmark(
-        PokerActorCritic(hidden=16, num_layers=1), tmp_path / "benchmark", mix,
+        tiny_model(hidden=16, num_layers=1), tmp_path / "benchmark", mix,
         label="fresh", rating=1500.0, sessions=30, hands=2, seed=3,
     )
 
@@ -254,7 +267,7 @@ def test_the_sizes_a_pass_plays_are_reproducible_from_the_seed(tmp_path):
 
     def sizes(seed):
         rated = rate_against_benchmark(
-            PokerActorCritic(hidden=16, num_layers=1), tmp_path / "benchmark", mix,
+            tiny_model(hidden=16, num_layers=1), tmp_path / "benchmark", mix,
             label="fresh", rating=1500.0, sessions=12, hands=1, seed=seed,
         )
         return [len(session) for session in rated.raw_sessions]
@@ -273,7 +286,7 @@ def test_a_frozen_set_that_cannot_seat_the_largest_table_is_not_rated(tmp_path):
     skipped = []
 
     rated = rate_against_benchmark(
-        PokerActorCritic(hidden=16, num_layers=1), tmp_path / "benchmark", mix,
+        tiny_model(hidden=16, num_layers=1), tmp_path / "benchmark", mix,
         label="fresh", rating=1500.0, sessions=2, hands=1, seed=1,
         on_skip=lambda path, why: skipped.append(why),
     )

@@ -12,7 +12,7 @@ import socket
 import statistics
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
@@ -25,11 +25,19 @@ from pokerlab.config import (
     resolved_settings,
 )
 from pokerlab.players.rl_agent import RLAgentPlayer
+from pokerlab.rl.allin_reward import DEFAULT_ALLIN_RUNOUTS
 from pokerlab.rl.benchmark import (
     DEFAULT_ANCHOR_ROTATE_EVERY,
     DEFAULT_BENCHMARK_DIR,
     DEFAULT_BENCHMARK_SESSIONS,
     DEFAULT_RESIDENT_ANCHORS,
+)
+from pokerlab.rl.device import resolve_device
+from pokerlab.rl.equity_net import (
+    encoder_config,
+    equity_net_from_checkpoint,
+    load_encoder_weights,
+    load_equity_checkpoint,
 )
 from pokerlab.rl.global_arena import (
     BENCHMARK_GAMES_PERCENTILE,
@@ -48,6 +56,7 @@ from pokerlab.rl.global_store import (
     publish_model,
     write_sidecar,
 )
+from pokerlab.rl.grad_log import ClipReading, GradientReading, format_gradient_line
 from pokerlab.rl.phases import (
     DONE,
     ELO_FILL,
@@ -65,6 +74,7 @@ from pokerlab.rl.policy import (
     DEFAULT_HIDDEN,
     DEFAULT_NUM_LAYERS,
     PokerActorCritic,
+    make_critic_fns,
     make_policy_fn,
 )
 from pokerlab.rl.pool_registry import (
@@ -92,6 +102,9 @@ from pokerlab.rl.ppo import (
     save_checkpoint,
 )
 from pokerlab.rl.rollout import (
+    DEFAULT_CONCURRENT_TABLES,
+    DEFAULT_TABLE_HANDS,
+    CriticFns,
     Opponent,
     OpponentPool,
     SelfPlayCollector,
@@ -99,7 +112,8 @@ from pokerlab.rl.rollout import (
     policy_opponent,
 )
 from pokerlab.rl.siblings import sibling_parsers
-from pokerlab.rl.style_log import format_style_line
+from pokerlab.rl.style_log import format_style_line, merge_style
+from pokerlab.rl.styles import StyleConfig, add_style_arguments, style_config_from_args
 from pokerlab.rl.sweep_log import SweepObservation, write_observation
 from pokerlab.rl.table_mix import (
     DEFAULT_SESSION_HANDS,
@@ -243,10 +257,6 @@ def registry_opponents(
         if member.label in built:
             opponents.append(built[member.label])
             continue
-        if not member.is_model:
-            if on_skip is not None:
-                on_skip(Path(member.ref), "not a model")
-            continue
         path = Path(registry.directory) / member.ref
         try:
             model, _checkpoint = build_model_from_checkpoint(path, device=device)
@@ -264,6 +274,15 @@ def registry_opponents(
 class TrainConfig:
     hands_per_iteration: int = 256
     opponent_probability: float = 0.5
+    # A table keeps its players for this many hands, and `concurrent_tables` of them
+    # are played in turn: see `rollout.DEFAULT_TABLE_HANDS`.
+    table_hands: int = DEFAULT_TABLE_HANDS
+    concurrent_tables: int = DEFAULT_CONCURRENT_TABLES
+    # Boards a hand closed before the river is averaged over for its training reward
+    # (`rl/allin_reward.py`); 0 trains on the chips that moved.
+    allin_runouts: int = DEFAULT_ALLIN_RUNOUTS
+    # How the pool models in the opponent seats are given a style (`rl/styles.py`).
+    styles: StyleConfig = field(default_factory=StyleConfig)
     # There is deliberately no knob for seating the run's own past selves: a
     # snapshot is a copy of the network being trained, so it drifts with it and
     # anchors nothing, and every seat it took would be a seat not facing an
@@ -284,7 +303,8 @@ class SelfPlayTrainer:
         *,
         device: str | torch.device = "cpu",
         rng: random.Random | None = None,
-        model: PokerActorCritic | None = None,
+        model: PokerActorCritic,
+        critic: CriticFns,
         extra_opponents: Sequence[Opponent] = (),
         registry: PoolRegistry | None = None,
         initial_rating: float = DEFAULT_RATING,
@@ -321,7 +341,7 @@ class SelfPlayTrainer:
         self._ppo = ppo_config if ppo_config is not None else PPOConfig()
         self._device = device
         self._rng = rng if rng is not None else random.Random()
-        self._model = (model if model is not None else PokerActorCritic()).to(device)
+        self._model = model.to(device)
         self._optimizer = torch.optim.Adam(self._model.parameters(), lr=self._ppo.learning_rate)
         self._iteration = 0
         self._value_diagnostics: ValueDiagnostics | None = None
@@ -341,6 +361,11 @@ class SelfPlayTrainer:
             opponent_pool=self._pool,
             opponent_probability=self._train.opponent_probability,
             reward_scale=self._reward_scale,
+            table_hands=self._train.table_hands,
+            concurrent_tables=self._train.concurrent_tables,
+            allin_runouts=self._train.allin_runouts,
+            styles=self._train.styles,
+            critic=critic,
         )
 
     @property
@@ -351,6 +376,11 @@ class SelfPlayTrainer:
     def style_hands(self) -> int:
         """Learner-seat hands behind `style_rates`."""
         return self._collector.style_hands
+
+    @property
+    def style_by_group(self) -> dict[str, tuple[int, dict[str, tuple[int, int]]]]:
+        """The learner's style per group of table sizes: `{group: (hands, rates)}`."""
+        return self._collector.style_by_group
 
     @property
     def style_rates(self) -> dict[str, tuple[int, int]]:
@@ -549,7 +579,12 @@ class SelfPlayTrainer:
         published.
         """
         save_checkpoint(path, self._model, iteration=iteration, metadata=metadata)
-        write_sidecar(path, rating=self._learner_rating, iteration=iteration)
+        write_sidecar(
+            path,
+            rating=self._learner_rating,
+            style=self.style_rates,
+            style_hands=self.style_hands,
+        )
 
     def train_iteration(self) -> dict[str, float]:
         self._iteration += 1
@@ -602,7 +637,8 @@ REPORTED_AXES = (
     "minibatch_size",
     "gae_lambda",
     "value_coef",
-    "max_grad_norm",
+    "policy_max_grad_norm",
+    "critic_max_grad_norm",
     "entropy_coef",
     "opponent_probability",
     # How strong a field this run drew. Reported like the rest, and worth
@@ -623,11 +659,11 @@ def add_network_arguments(parser: argparse.ArgumentParser) -> None:
     """
     parser.add_argument(
         "--hidden", type=int, default=DEFAULT_HIDDEN,
-        help="width of the shared trunk's layers",
+        help="width of the layers of each trunk (the policy's and the critic's)",
     )
     parser.add_argument(
         "--num-layers", type=int, default=DEFAULT_NUM_LAYERS,
-        help="number of layers in the shared trunk",
+        help="number of layers in each trunk (the policy's and the critic's)",
     )
     parser.add_argument(
         "--head-hidden", type=int, default=DEFAULT_HEAD_HIDDEN,
@@ -637,6 +673,12 @@ def add_network_arguments(parser: argparse.ArgumentParser) -> None:
         "--head-layers", type=int, default=DEFAULT_HEAD_LAYERS,
         help="hidden layers in each head before its output layer; 0 is a head that is "
         "the output layer alone",
+    )
+    parser.add_argument(
+        "--equity-model", type=str, default="",
+        help="checkpoint of an equity network (studies/equity_net), required: the policy reads "
+        "its per-player encoder in place of the card planes and the critic, a network of its "
+        "own, reads the equity of every player in place of them",
     )
 
 
@@ -650,8 +692,9 @@ def network_shape(args: argparse.Namespace) -> dict[str, int]:
     }
 
 
-def parent_shape_mismatch(path: str | Path, shape: dict[str, int]) -> dict[str, int] | None:
-    """The shape of the checkpoint at `path` if it is not `shape`, else None.
+def parent_shape_mismatch(path: str | Path, shape: dict[str, int], equity: dict[str, int]) -> dict | None:
+    """The shape of the checkpoint at `path` if it is not `shape` (with `equity`, the shape of
+    the equity encoder it is built with), else None.
 
     Raises `IncompatibleCheckpointError` for a checkpoint that is not this build's at
     all (another encoding or feature version): that is a broken parent, not a
@@ -660,7 +703,11 @@ def parent_shape_mismatch(path: str | Path, shape: dict[str, int]) -> dict[str, 
     parent = torch.load(path, map_location="cpu", weights_only=True)
     check_compatible(parent, str(path))
     found = checkpoint_shape(parent)
-    return None if found == shape else found
+    if found != shape:
+        return found
+    # The same shape, but built with another equity encoder: the weights cannot be exchanged.
+    found_equity = parent["equity"]
+    return None if found_equity == equity else {**found, "equity": found_equity}
 
 
 def check_network_arguments(args: argparse.Namespace) -> None:
@@ -668,6 +715,11 @@ def check_network_arguments(args: argparse.Namespace) -> None:
     for name, minimum in (("hidden", 1), ("num_layers", 1), ("head_hidden", 1), ("head_layers", 0)):
         if getattr(args, name) < minimum:
             raise ValueError(f"{name} must be at least {minimum}, got {getattr(args, name)}")
+    if not args.equity_model:
+        raise ValueError("--equity-model is required: set equity_model in config.toml or pass the flag")
+    if not Path(args.equity_model).is_file():
+        raise ValueError(f"--equity-model {args.equity_model}: no such file")
+    style_config_from_args(args)  # raises, naming the flag, on a style setting that cannot be used
 
 
 def run_metadata(args: argparse.Namespace) -> dict:
@@ -711,10 +763,13 @@ def run_metadata(args: argparse.Namespace) -> dict:
         "minibatch_size": args.minibatch_size,
         "gae_lambda": args.gae_lambda,
         "value_coef": args.value_coef,
-        "max_grad_norm": args.max_grad_norm,
+        "policy_max_grad_norm": args.policy_max_grad_norm,
+        "critic_max_grad_norm": args.critic_max_grad_norm,
         "entropy_coef": args.entropy_coef,
         "opponent_probability": args.opponent_probability,
         "pool_models": args.pool_models,
+        "table_hands": args.table_hands,
+        "concurrent_tables": args.concurrent_tables,
         "pool_top_share": args.pool_top_share,
         "pool_top_n": args.pool_top_n,
         # Everything else the run resolved to (evaluation, population pass,
@@ -975,8 +1030,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="weight of the value loss in the PPO loss",
     )
     parser.add_argument(
-        "--max-grad-norm", type=float, default=PPOConfig.max_grad_norm,
-        help="gradient clipping norm",
+        "--policy-max-grad-norm", type=float, default=PPOConfig.policy_max_grad_norm,
+        help="gradient clipping norm of the policy's weights",
+    )
+    parser.add_argument(
+        "--critic-max-grad-norm", type=float, default=PPOConfig.critic_max_grad_norm,
+        help="gradient clipping norm of the critic's weights: a clip of its own, since the two "
+        "networks share no weight and their gradients live on different scales",
     )
     parser.add_argument(
         "--entropy-coef", type=float, default=PPOConfig.entropy_coefficient,
@@ -985,7 +1045,10 @@ def build_parser() -> argparse.ArgumentParser:
         "it perturbs each decision independently while a bluff is a sequence. See "
         "PPOConfig.entropy_coefficient for the measurements behind that",
     )
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--device", default="auto",
+        help="cpu, cuda or auto (the default): the GPU if there is one",
+    )
     parser.add_argument("--checkpoint", type=Path, default=Path("checkpoints/agent.pt"))
     parser.add_argument("--resume", action="store_true", help="load --checkpoint before training")
     parser.add_argument(
@@ -1037,6 +1100,34 @@ def build_parser() -> argparse.ArgumentParser:
         "rather than to another copy of the learner. At 6-max the default 0.5 "
         "leaves 2.5 of 6 seats to opponents, every one of them a previously "
         "trained pool model; 1.0 doubles it",
+    )
+    parser.add_argument(
+        "--table-hands", type=int, default=TrainConfig.table_hands,
+        help="hands a training table keeps the same players: what the model reads about "
+        "an opponent (VPIP, 3-bet...) is then true of the one in front of it, and it "
+        "fills in over these hands. 1 redraws the table every hand and the statistics "
+        "never exist",
+    )
+    parser.add_argument(
+        "--concurrent-tables", type=int, default=TrainConfig.concurrent_tables,
+        help="tables played in turn, hand by hand, so a batch is not the same few "
+        "opponents repeated for --table-hands hands",
+    )
+    add_style_arguments(parser)
+    parser.add_argument(
+        "--allin-runouts", type=int, default=TrainConfig.allin_runouts,
+        help="a hand whose betting closed before the river is trained on its expected "
+        "result over this many boards instead of the one that came (unbiased, and it "
+        "drops the runout's luck from the value target); 0 trains on the chips that "
+        "moved. Training only: every reported and rated result is the real chips",
+    )
+    parser.add_argument(
+        "--critic-stack-power", type=float, default=PPOConfig.critic_stack_power,
+        help="weigh each decision in the critic's loss by its chips at stake in big "
+        "blinds to this power, negated (0: every decision alike). The target's spread "
+        "grows with the stake, so without it the critic learns the deep hands and "
+        "ignores the short ones; a weight on the state alone leaves the policy's "
+        "objective unchanged",
     )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
@@ -1191,6 +1282,7 @@ def main() -> None:
         args, report = parse_with_config(parser, siblings=_sibling_parsers)
     except ConfigError as error:
         parser.exit(2, f"{parser.prog}: config: {error}\n")
+    args.device = resolve_device(args.device)
     if args.print_config:
         print(format_config(vars(args), [k for k, v in report.applied.items() if vars(args)[k] == v]))
         return
@@ -1231,16 +1323,24 @@ def main() -> None:
     )
     check_network_arguments(args)
     shape = network_shape(args)
+    # The policy gets the equity network's per-player encoder (frozen, kept in the model's
+    # own weights) and the critic the full network's output (training only).
+    equity_saved = load_equity_checkpoint(args.equity_model)
+    equity_config = encoder_config(equity_saved)
+    model = PokerActorCritic(**shape, equity=equity_config)
+    load_encoder_weights(model.equity_encoder, equity_saved)
+    critic = make_critic_fns(model, equity_net_from_checkpoint(equity_saved), device=args.device)
     if args.resume:
         # A parent of another shape cannot be loaded into this network, and
         # `pick_parents` draws by rating, not by shape, so after the shape in
         # `config.toml` changes this is an ordinary event, not an error: the worker
         # trains the new shape from scratch (and, having taken no step from that
         # parent, records no sweep observation).
-        parent_shape = parent_shape_mismatch(args.checkpoint, shape)
+        parent_shape = parent_shape_mismatch(args.checkpoint, shape, equity_config)
         if parent_shape is not None:
             print(
-                f"parent has a different network ({parent_shape}), this run builds {shape}: "
+                f"parent has a different network ({parent_shape}), this run builds "
+                f"{ {**shape, 'equity': equity_config} }: "
                 "starting from scratch instead of resuming",
                 flush=True,
             )
@@ -1250,6 +1350,10 @@ def main() -> None:
         TrainConfig(
             hands_per_iteration=args.hands,
             opponent_probability=args.opponent_probability,
+            table_hands=args.table_hands,
+            concurrent_tables=args.concurrent_tables,
+            allin_runouts=args.allin_runouts,
+            styles=style_config_from_args(args),
             lam=args.gae_lambda,
         ),
         PPOConfig(
@@ -1259,11 +1363,14 @@ def main() -> None:
             clip_epsilon=args.clip_epsilon,
             minibatch_size=args.minibatch_size,
             value_coefficient=args.value_coef,
-            max_grad_norm=args.max_grad_norm,
+            policy_max_grad_norm=args.policy_max_grad_norm,
+            critic_max_grad_norm=args.critic_max_grad_norm,
+            critic_stack_power=args.critic_stack_power,
         ),
         device=args.device,
         rng=random.Random(args.seed),
-        model=PokerActorCritic(**shape),
+        model=model,
+        critic=critic,
         extra_opponents=archived,
         registry=registry,
         initial_rating=inherited_rating(args.checkpoint) if args.resume else DEFAULT_RATING,
@@ -1275,6 +1382,8 @@ def main() -> None:
     parent_rating = trainer.learner_rating
     if args.resume:
         resumed = load_checkpoint(args.checkpoint, trainer.model, device=args.device)
+        # the file is the source of truth for the frozen encoder
+        load_encoder_weights(trainer.model.equity_encoder, equity_saved)
         parent_settings = {
             axis: value
             for axis, value in (resumed.get("metadata") or {}).items()
@@ -1299,7 +1408,7 @@ def main() -> None:
         hyperparameters_marker({axis: recorded[axis] for axis in REPORTED_AXES if axis in recorded}),
         flush=True,
     )
-    models = registry.models()
+    models = registry.ranked()
     if models:
         print(f"pool: drew {len(models)} of {len(available_labels(args.models_dir))} models "
               f"from {args.models_dir}, seating {len(archived)}")
@@ -1329,6 +1438,23 @@ def main() -> None:
             f"kl {stats['approx_kl']:.4f}  "
             f"clip {stats['clip_fraction']:.3f}"
         )
+        # Every iteration, so the dashboard can draw it like the `iter` columns; a line
+        # of its own so the `iter` format the status parsers read does not change.
+        print(
+            format_gradient_line(
+                GradientReading(
+                    policy=ClipReading(
+                        stats["grad_norm_policy"], stats["grad_norm_policy_sd"],
+                        stats["grad_clipped_policy"], args.policy_max_grad_norm,
+                    ),
+                    critic=ClipReading(
+                        stats["grad_norm_critic"], stats["grad_norm_critic_sd"],
+                        stats["grad_clipped_critic"], args.critic_max_grad_norm,
+                    ),
+                    steps=int(stats["grad_steps"]),
+                )
+            )
+        )
         iteration = int(stats["iteration"])
         if trainer.value_diagnostics is not None and (
             iteration == 1 or iteration % VALUE_DIAGNOSTICS_EVERY == 0
@@ -1337,6 +1463,8 @@ def main() -> None:
                 print(line)
             if trainer.style_hands:
                 print(format_style_line(trainer.style_hands, trainer.style_rates))
+                for group, (hands, rates) in trainer.style_by_group.items():
+                    print(format_style_line(hands, rates, group=group))
             # Starts with "vantaggi", so the status parsers (which read only
             # `iter ` lines) are unaffected, like the `valore` lines.
             print(
@@ -1415,6 +1543,10 @@ def main() -> None:
     benchmark_bb100: float | None = None
     benchmark_by_size: dict[str, float] = {}
     benchmark_hands = 0
+    # How the model plays: what training measured, then refreshed by the benchmark
+    # pass below, whose half a million hands dwarf the training window.
+    final_style = {name: list(pair) for name, pair in trainer.style_rates.items()}
+    final_style_hands = trainer.style_hands
 
     if args.benchmark_sessions > 0:
         announce(SERIES)
@@ -1446,6 +1578,9 @@ def main() -> None:
             publish_rating = rated.rating_after
             publish_games = rated.games_after
             benchmark_bb100, benchmark_hands = rated.bb_per_100, rated.hands
+            final_style, final_style_hands = merge_style(
+                final_style, final_style_hands, rated.style, rated.style_hands
+            )
             print(
                 f"        benchmark: {rated.bb_per_100:+.1f} bb/100 su "
                 f"{rated.sessions} sessioni contro {rated.opponents} ancore, "
@@ -1485,8 +1620,8 @@ def main() -> None:
             "benchmark_hands": benchmark_hands,
             # How the model plays at the end of training (events, opportunities over
             # its last `STYLE_WINDOW` seat-hands), kept with the weights it describes.
-            "style": {name: list(counts) for name, counts in trainer.style_rates.items()},
-            "style_hands": trainer.style_hands,
+            "style": final_style,
+            "style_hands": final_style_hands,
         },
     )
     # The CPU this child cost, up to its publication: training, validation and the
@@ -1500,7 +1635,8 @@ def main() -> None:
         name=f"{args.machine}-{prefix}{archive_path.name}",
         rating=publish_rating,
         games=publish_games,
-        iteration=final_iteration,
+        style=final_style,
+        style_hands=final_style_hands,
         machine=args.machine,
         lock_ttl=args.global_lock_seconds,
     )
@@ -1581,6 +1717,7 @@ def main() -> None:
                 machine=args.machine,
                 games_percentile=args.benchmark_games_percentile,
                 margin=args.benchmark_margin,
+                minimum_anchors=mix.max_players - 1,
                 lock_ttl=args.global_lock_seconds,
                 on_skip=lambda path, why: print(f"  benchmark, saltato {path}: {why}"),
             ):

@@ -28,7 +28,6 @@ from pathlib import Path
 
 from pokerlab.rl.pool_registry import (
     DEFAULT_POOL_SIZE,
-    MODEL,
     PoolMember,
     PoolRegistry,
 )
@@ -49,7 +48,7 @@ def _known(label: str, ranking: Mapping[str, PoolMember]) -> PoolMember:
     """The ranking's view of a model, or a blank never-rated one if it has none."""
     member = ranking.get(label)
     if member is None:
-        return PoolMember(label=label, kind=MODEL, ref=f"{label}.pt")
+        return PoolMember(label=label, ref=f"{label}.pt")
     return member
 
 
@@ -95,11 +94,9 @@ def draw_training_pool(
     return [
         PoolMember(
             label=label,
-            kind=MODEL,
             ref=f"{label}.pt",
             rating=by_label[label].rating,
             games=by_label[label].games,
-            iteration=by_label[label].iteration,
             frozen=True,
         )
         for label in chosen

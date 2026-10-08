@@ -43,6 +43,7 @@ from pokerlab.config import (
     format_config,
     parse_with_config,
 )
+from pokerlab.rl.allin_reward import DEFAULT_ALLIN_RUNOUTS
 from pokerlab.rl.benchmark import (
     DEFAULT_ANCHOR_ROTATE_EVERY,
     DEFAULT_BENCHMARK_DIR,
@@ -57,6 +58,7 @@ from pokerlab.rl.global_arena import (
     DEFAULT_GLOBAL_SESSIONS,
     DEFAULT_POPULATION_SAMPLE,
     DRAW_TIERS,
+    backfill_member_styles,
     draw_tiers_text,
 )
 from pokerlab.rl.global_store import (
@@ -106,6 +108,7 @@ from pokerlab.rl.pool_registry import (
     k_schedule_text,
 )
 from pokerlab.rl.ppo import PPOConfig
+from pokerlab.rl.rollout import DEFAULT_CONCURRENT_TABLES, DEFAULT_TABLE_HANDS
 
 # The one thing the loop needs from `train.py`, which it otherwise only ever
 # launches as a subprocess: how many rated sessions a validation pass plays,
@@ -113,6 +116,7 @@ from pokerlab.rl.ppo import PPOConfig
 # uses cannot drift apart. No cycle -- train.py does not import loop.py -- and torch is already
 # here through `rl/benchmark.py`.
 from pokerlab.rl.siblings import sibling_parsers
+from pokerlab.rl.styles import add_style_arguments, style_arguments, style_config_from_args
 from pokerlab.rl.sweep_log import read_observations
 from pokerlab.rl.sweep_optimizer import (
     DEFAULT_EXPLORE,
@@ -244,15 +248,16 @@ def _salvage_archives(
         name = f"{machine}-{worker_dir.name}-{path.name}"
         if (models_dir / name).exists():
             continue
-        rating, iteration = read_sidecar(path)
+        sidecar = read_sidecar(path)
         try:
             publish_model(
                 path,
                 models_dir=models_dir,
                 global_dir=global_dir,
                 name=name,
-                rating=rating,
-                iteration=iteration,
+                rating=sidecar.rating,
+                style=sidecar.style,
+                style_hands=sidecar.style_hands,
                 machine=machine,
                 lock_ttl=lock_ttl,
             )
@@ -410,7 +415,8 @@ HP_AXES = (
     "minibatch_size",
     "gae_lambda",
     "value_coef",
-    "max_grad_norm",
+    "policy_max_grad_norm",
+    "critic_max_grad_norm",
     "entropy_coef",
     "pool_top_share",
     "pool_top_n",
@@ -500,7 +506,8 @@ class Hyperparameters:
     minibatch_size: int = PPOConfig.minibatch_size
     gae_lambda: float = TrainConfig.lam
     value_coef: float = PPOConfig.value_coefficient
-    max_grad_norm: float = PPOConfig.max_grad_norm
+    policy_max_grad_norm: float = PPOConfig.policy_max_grad_norm
+    critic_max_grad_norm: float = PPOConfig.critic_max_grad_norm
     entropy_coef: float = PPOConfig.entropy_coefficient
     arm: str = HP_ARM_SAMPLED
 
@@ -565,7 +572,8 @@ def starting_hyperparameters(args: argparse.Namespace) -> Hyperparameters:
         minibatch_size=args.minibatch_size,
         gae_lambda=args.gae_lambda,
         value_coef=args.value_coef,
-        max_grad_norm=args.max_grad_norm,
+        policy_max_grad_norm=args.policy_max_grad_norm,
+        critic_max_grad_norm=args.critic_max_grad_norm,
         entropy_coef=args.entropy_coef,
         arm=HP_ARM_SAMPLED,
     )
@@ -794,6 +802,7 @@ def launch_worker(
             for key, value in network_shape(args).items()
             for token in (f"--{key.replace('_', '-')}", str(value))
         ],
+        "--equity-model", args.equity_model,
         "--seed", str(seed),
         "--device", args.device,
         "--models-dir", str(args.models_dir),
@@ -801,6 +810,11 @@ def launch_worker(
         "--archive-prefix", worker_dir.name,
         "--machine", args.machine,
         "--pool-models", str(args.pool_models),
+        "--table-hands", str(args.table_hands),
+        "--concurrent-tables", str(args.concurrent_tables),
+        "--allin-runouts", str(args.allin_runouts),
+        *style_arguments(style_config_from_args(args)),
+        "--critic-stack-power", str(args.critic_stack_power),
         # Swept: these two decide how strong a field the worker draws. Only
         # `--pool-models`, the field's *size*, is still the fleet's own value.
         "--pool-top-share", str(hp.pool_top_share),
@@ -811,7 +825,8 @@ def launch_worker(
         "--minibatch-size", str(hp.minibatch_size),
         "--gae-lambda", str(hp.gae_lambda),
         "--value-coef", str(hp.value_coef),
-        "--max-grad-norm", str(hp.max_grad_norm),
+        "--policy-max-grad-norm", str(hp.policy_max_grad_norm),
+        "--critic-max-grad-norm", str(hp.critic_max_grad_norm),
         "--entropy-coef", str(hp.entropy_coef),
         # Recorded by the worker into the model it publishes, never acted on:
         # which arm drew these values is what separates the runs an analysis can
@@ -1192,6 +1207,25 @@ def run_loop(
                 flush=True,
             )
 
+    styles_tried: set[str] = set()
+
+    def backfill_styles() -> None:
+        # A member published before the ranking carried a style gets the one its own
+        # checkpoint recorded. Best effort: the passes fill the rest as they seat it.
+        try:
+            filled = backfill_member_styles(
+                global_dir,
+                models_dir.parent,
+                machine=args.machine,
+                read_metadata=read_run_metadata,
+                skip=styles_tried,
+            )
+        except Exception as error:  # noqa: BLE001 - a supervisor must not die on bookkeeping
+            print(f"  stili dei modelli: saltato per errore ({error})", flush=True)
+            return
+        if filled:
+            print(f"  stili dei modelli: {filled} aggiunti dai checkpoint", flush=True)
+
     while not stopping:
         if args.generations and state.generation >= args.generations:
             print(f"raggiunte {args.generations} generazioni, fine.")
@@ -1211,6 +1245,7 @@ def run_loop(
               f"x {args.iterations} iterazioni ===", flush=True)
 
         sweep("pulizia residui")
+        backfill_styles()
 
         state.phase = "starting"
         state.save(state_path)
@@ -1300,7 +1335,12 @@ def run_loop(
         state.save(state_path)
         sweep("recupero e pulizia")
         prefix = f"{args.machine}-gen{generation:04d}-w"
-        record.published_models = sum(1 for label in available_labels(models_dir) if label.startswith(prefix))
+        # A model rated well enough in its own run may already have been moved from the
+        # store into the benchmark, so both places are counted.
+        in_benchmark = (p.stem for p in Path(args.benchmark_dir).rglob("*.pt"))
+        record.published_models = sum(
+            1 for label in (*available_labels(models_dir), *in_benchmark) if label.startswith(prefix)
+        )
         print(f"  pubblicati {record.published_models} nuovi modelli", flush=True)
 
         ranking = load_global_registry(global_dir)
@@ -1405,7 +1445,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Elo a unit of relative cost is worth, at least: the objective is gain "
         "per compute, and with no average gain left it would otherwise reward cost",
     )
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--device", default="auto", help="cpu, cuda or auto (the default): the GPU if there is one"
+    )
     parser.add_argument(
         "--state-dir", type=Path, default=DEFAULT_STATE_DIR,
         help="this machine's own loop state (loop_state.json) and STOP file",
@@ -1428,7 +1470,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--minibatch-size", type=int, default=PPOConfig.minibatch_size)
     parser.add_argument("--gae-lambda", type=float, default=TrainConfig.lam)
     parser.add_argument("--value-coef", type=float, default=PPOConfig.value_coefficient)
-    parser.add_argument("--max-grad-norm", type=float, default=PPOConfig.max_grad_norm)
+    parser.add_argument("--policy-max-grad-norm", type=float, default=PPOConfig.policy_max_grad_norm)
+    parser.add_argument("--critic-max-grad-norm", type=float, default=PPOConfig.critic_max_grad_norm)
     parser.add_argument("--entropy-coef", type=float, default=PPOConfig.entropy_coefficient)
     parser.add_argument(
         "--opponent-probability", type=float, default=0.5,
@@ -1442,6 +1485,26 @@ def build_parser() -> argparse.ArgumentParser:
     # running it every 250 iterations instead of every 25 keeps the bill at ~13
     # minutes of a 170-minute run. Same trade as the rated sessions themselves:
     # bigger measurements, not more of them.
+    parser.add_argument(
+        "--table-hands", type=int, default=DEFAULT_TABLE_HANDS,
+        help="hands a training table keeps the same players (the opponent statistics "
+        "fill in over them); forwarded to every worker",
+    )
+    parser.add_argument(
+        "--concurrent-tables", type=int, default=DEFAULT_CONCURRENT_TABLES,
+        help="training tables played in turn; forwarded to every worker",
+    )
+    add_style_arguments(parser)
+    parser.add_argument(
+        "--allin-runouts", type=int, default=DEFAULT_ALLIN_RUNOUTS,
+        help="boards a hand closed before the river is averaged over for its training "
+        "reward (0: the chips that moved); forwarded to every worker",
+    )
+    parser.add_argument(
+        "--critic-stack-power", type=float, default=PPOConfig.critic_stack_power,
+        help="the critic's loss weighs a decision by its stake in big blinds to this "
+        "power, negated (0: off); forwarded to every worker",
+    )
     parser.add_argument("--eval-every", type=int, default=100)
     parser.add_argument(
         "--eval-sessions", type=int, default=DEFAULT_EVAL_SESSIONS,

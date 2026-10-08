@@ -21,10 +21,19 @@ pytest.importorskip("torch")
 
 
 def run_loop(tmp_path, *, generations, extra=()):
+    import torch
+    from support import TINY_EQUITY
+
+    from pokerlab.rl.equity_net import EquityNet
+
+    # Every network is built on an equity network, so every worker needs one to read.
+    equity = EquityNet(**TINY_EQUITY, arch="sets")
+    torch.save({"config": equity.config(), "state": equity.state_dict()}, tmp_path / "equity.pt")
     command = [
         sys.executable, "-m", "pokerlab.rl.loop",
         "--workers", "3", "--generations", str(generations),
         "--iterations", "2", "--hands", "8", "--table-weights", "1", "0", "0", "0", "0", "0", "0", "0",
+        "--equity-model", str(tmp_path / "equity.pt"),
         "--stack-min-bb", "50", "--stack-max-bb", "50", "--sb", "1", "--bb", "2",
         "--eval-every", "2", "--eval-sessions", "1",
         # The benchmark directory this points at is empty, so the pass against
@@ -59,11 +68,21 @@ def run_loop(tmp_path, *, generations, extra=()):
     )
 
 
+def _published(tmp_path):
+    """Every model the run published: in the store, or moved into the benchmark. With
+    this test's two-player tables a single anchor fills the benchmark, so the first
+    model to be rated is promoted out of `models/` (see `add_benchmark_candidates`)."""
+    return sorted(
+        [*(tmp_path / "models").glob("*.pt"), *(tmp_path / "benchmark").rglob("*.pt")],
+        key=lambda path: path.name,
+    )
+
+
 def test_two_generations_publish_rate_and_reuse_models(tmp_path):
     result = run_loop(tmp_path, generations=2)
     assert result.returncode == 0, result.stdout + result.stderr
 
-    models = sorted(p.name for p in (tmp_path / "models").glob("*.pt"))
+    models = sorted(p.name for p in _published(tmp_path))
     # Every worker of every generation published exactly its own model,
     # named for the machine, generation and worker that trained it.
     assert len(models) == 6
@@ -152,7 +171,7 @@ def test_the_network_shape_reaches_every_worker_and_survives_inheritance(tmp_pat
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
-    models = sorted((tmp_path / "models").glob("*.pt"))
+    models = _published(tmp_path)
     assert len(models) == 6
     for path in models:
         saved = torch.load(path, map_location="cpu", weights_only=True)

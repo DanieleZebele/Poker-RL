@@ -35,7 +35,7 @@ MAX_SEATS = 9
 # Checkpoints record it, so a model trained to read slot 340 as one thing is not
 # silently reused once that slot means another. Comparing dimensions alone would
 # not catch it: the position fix that reordered seats kept OBS_DIM identical.
-FEATURE_VERSION = 2
+FEATURE_VERSION = 3
 
 CARD_PLANES = 6
 CARDS_DIM = CARD_PLANES * 52
@@ -43,9 +43,9 @@ STREET_DIM = 4
 POT_SCALARS_DIM = 24
 FIELD_SCALARS_DIM = 8
 SEAT_BASE_FEATURES = 9
-# Room for opponent statistics per seat (`engine/stats.py`), after the nine
-# features every seat has. Optional: a seat with no statistics supplied is encoded
-# as all zeros in these slots, and most slots are reserved for later.
+# Opponent statistics per seat (`engine/stats.py`), after the nine features every
+# seat has. Optional: a seat with no statistics supplied is encoded as all zeros in
+# these slots.
 SEAT_FEATURES = SEAT_BASE_FEATURES + STAT_SLOTS
 SEATS_DIM = MAX_SEATS * SEAT_FEATURES
 HISTORY_STREETS = 4
@@ -86,6 +86,11 @@ def _card_index(card: Card) -> int:
     return _SUIT_INDEX[card.suit] * 13 + (int(card.rank) - 2)
 
 
+def card_index(card: Card) -> int:
+    """Where a card sits in a 52-long plane: `suit * 13 + rank - 2` (clubs, diamonds, hearts, spades)."""
+    return _card_index(card)
+
+
 def committed_by_seat(observation: Observation) -> dict[int, int]:
     """Chips each seat has put in over the whole hand.
 
@@ -102,6 +107,26 @@ def committed_by_seat(observation: Observation) -> dict[int, int]:
     for (seat, _street), amount in per_street.items():
         totals[seat] = totals.get(seat, 0) + amount
     return totals
+
+
+def chips_at_stake(observation: Observation) -> int:
+    """The most this seat can still win or lose from one opponent this hand, in chips:
+    its own chips for the hand (stack plus what it has put in) against the deepest
+    opponent still in it, measured the same way.
+
+    Not the effective stack the features carry, which is what is left *behind* and
+    reads 0 as soon as one opponent is all-in: this counts the chips already in too,
+    so it is what the size of the hand's result goes with. A function of the
+    Observation alone, which is what lets the critic's loss weigh a decision by it
+    (`rl/ppo.py`)."""
+    committed = committed_by_seat(observation)
+    mine = observation.my_stack + committed.get(observation.my_seat, 0)
+    opponents = [
+        seat.stack + committed.get(seat.seat, 0)
+        for seat in observation.seats
+        if seat.seat != observation.my_seat and seat.status is not PlayerStatus.FOLDED
+    ]
+    return min(mine, max(opponents)) if opponents else mine
 
 
 def _card_planes(observation: Observation) -> list[float]:

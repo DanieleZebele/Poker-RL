@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import math
 import random
 from pathlib import Path
@@ -9,7 +10,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from support import fixed_mix
+from support import fixed_mix, tiny_model, tiny_parts
 
 from pokerlab.engine.config import GameConfig
 from pokerlab.engine.table import Table
@@ -17,7 +18,7 @@ from pokerlab.players.rl_agent import DecisionRecord
 from pokerlab.rl.action_space import ACTION_DIM
 from pokerlab.rl.features import FEATURE_VERSION, OBS_DIM
 from pokerlab.rl.global_store import read_sidecar
-from pokerlab.rl.policy import PokerActorCritic
+from pokerlab.rl.policy import EQUITY_SLOTS, PokerActorCritic
 from pokerlab.rl.pool_registry import (
     DEFAULT_K_SCHEDULE,
     DEFAULT_RATING,
@@ -32,6 +33,7 @@ from pokerlab.rl.ppo import (
     TrainingBatch,
     build_batch,
     build_model_from_checkpoint,
+    critic_weights,
     load_checkpoint,
     ppo_update,
     save_checkpoint,
@@ -47,7 +49,7 @@ from pokerlab.rl.train import (
 @pytest.fixture
 def model() -> PokerActorCritic:
     torch.manual_seed(0)
-    return PokerActorCritic(hidden=64, num_layers=2)
+    return tiny_model(hidden=64, num_layers=2)
 
 
 def synthetic_trajectory(length: int, offset: float) -> HandTrajectory:
@@ -60,6 +62,8 @@ def synthetic_trajectory(length: int, offset: float) -> HandTrajectory:
             action_index=i % ACTION_DIM,
             log_prob=-float(i),
             value=0.0,
+            stake_bb=50.0,
+            critic_extra=[0.0] * EQUITY_SLOTS,
         )
         for i in range(length)
     ]
@@ -84,6 +88,8 @@ def constant_batch(model: PokerActorCritic, advantage: float, size: int = 32) ->
         old_log_probs=old_log_probs,
         advantages=torch.full((size,), advantage),
         returns=torch.zeros(size),
+        critic_extra=torch.rand(size, EQUITY_SLOTS),
+        stakes=torch.full((size,), 50.0),
     )
 
 
@@ -112,8 +118,9 @@ def test_update_returns_finite_diagnostics(model):
     stats = ppo_update(model, optimizer, batch, PPOConfig(epochs=2, minibatch_size=16))
 
     assert set(stats) == {
-        "policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction", "grad_norm",
-        "adv_mean", "adv_std",
+        "policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction", "grad_steps",
+        "adv_mean", "adv_std", "grad_norm_policy", "grad_norm_policy_sd", "grad_clipped_policy",
+        "grad_norm_critic", "grad_norm_critic_sd", "grad_clipped_critic",
     }
     for name, value in stats.items():
         assert math.isfinite(value), f"{name} was not finite"
@@ -122,6 +129,82 @@ def test_update_returns_finite_diagnostics(model):
     # Raw (pre-normalisation) advantage statistics: a constant batch of 1.0.
     assert stats["adv_mean"] == pytest.approx(1.0)
     assert stats["adv_std"] == pytest.approx(0.0, abs=1e-6)
+    # Two epochs of two minibatches: four steps, each a norm before the cut.
+    assert stats["grad_steps"] == 4
+    assert stats["grad_norm_policy_sd"] >= 0.0 and 0.0 <= stats["grad_clipped_policy"] <= 1.0
+
+
+def test_each_network_is_cut_against_its_own_threshold(model):
+    """A threshold no norm can reach cuts nothing; one every norm exceeds cuts every step;
+    and each network's clip answers to its own threshold only. The norm reported is the
+    one before the cut, not the threshold."""
+    batch = constant_batch(model, advantage=1.0)
+    batch.returns = torch.full_like(batch.returns, 5.0)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-6)
+
+    def update(policy: float, critic: float) -> dict[str, float]:
+        # Advantage normalisation would zero a constant advantage, and with it the policy's gradient.
+        config = PPOConfig(epochs=1, minibatch_size=8, policy_max_grad_norm=policy,
+                           critic_max_grad_norm=critic, normalize_advantages=False)
+        return ppo_update(model, optimizer, batch, config)
+
+    loose = update(1e9, 1e9)
+    assert loose["grad_clipped_policy"] == 0.0 and loose["grad_clipped_critic"] == 0.0
+    assert loose["grad_norm_policy"] > 0 and loose["grad_norm_critic"] > 0
+    policy_only = update(1e-9, 1e9)
+    assert policy_only["grad_clipped_policy"] == 1.0 and policy_only["grad_clipped_critic"] == 0.0
+    assert policy_only["grad_norm_policy"] > 1e-6
+    critic_only = update(1e9, 1e-9)
+    assert critic_only["grad_clipped_policy"] == 0.0 and critic_only["grad_clipped_critic"] == 1.0
+
+
+def test_the_critics_weights_fall_with_the_stake_and_average_one():
+    stakes = torch.tensor([0.2, 1.0, 10.0, 100.0])
+    assert torch.equal(critic_weights(stakes, 0.0), torch.ones(4))
+    weights = critic_weights(stakes, 1.4)
+    assert float(weights.mean()) == pytest.approx(1.0)
+    # Below a big blind a stake weighs as one big blind: the weight cannot grow without bound.
+    assert float(weights[0]) == pytest.approx(float(weights[1]))
+    assert float(weights[1]) > float(weights[2]) > float(weights[3])
+    assert float(weights[2] / weights[3]) == pytest.approx(10**1.4, rel=1e-4)
+
+
+def test_weighing_the_critic_by_the_stake_leaves_the_policy_untouched(model):
+    """The weight goes into the critic's loss only: a policy step is the same whatever
+    the power, and the critic's is not."""
+    batch = constant_batch(model, advantage=1.0)
+    batch.stakes = torch.linspace(1.0, 100.0, len(batch))
+    batch.returns = torch.linspace(-2.0, 2.0, len(batch))
+    start = copy.deepcopy(model.state_dict())
+
+    def step(power: float) -> dict[str, torch.Tensor]:
+        model.load_state_dict(start)
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
+        torch.manual_seed(3)
+        config = PPOConfig(epochs=2, minibatch_size=8, critic_stack_power=power,
+                           normalize_advantages=False)
+        ppo_update(model, optimizer, batch, config)
+        return {name: tensor.clone() for name, tensor in model.state_dict().items()}
+
+    flat, weighted = step(0.0), step(1.4)
+    policy = {id(p) for p in model.policy_parameters()}
+    names = {id(p): name for name, p in model.named_parameters() if p.requires_grad}
+    for parameter_id, name in names.items():
+        same = torch.equal(flat[name], weighted[name])
+        assert same == (parameter_id in policy), name
+
+
+def test_build_batch_carries_each_decisions_stake():
+    trajectory = synthetic_trajectory(3, 0.0)
+    for stake, decision in zip((2.0, 30.0, 90.0), trajectory.decisions, strict=True):
+        decision.stake_bb = stake
+    assert build_batch([trajectory]).stakes.tolist() == [2.0, 30.0, 90.0]
+
+
+def test_the_two_halves_cover_every_trainable_weight_once(model):
+    trainable = {id(p) for p in model.parameters() if p.requires_grad}
+    halves = [id(p) for p in model.policy_parameters()] + [id(p) for p in model.critic_parameters()]
+    assert sorted(halves) == sorted(trainable)
 
 
 def test_a_positive_advantage_makes_the_taken_action_more_likely(model):
@@ -178,7 +261,7 @@ def test_checkpoint_round_trips_weights_and_optimizer_state(model, tmp_path):
     path = tmp_path / "nested" / "agent.pt"
     save_checkpoint(path, model, optimizer, iteration=7, metadata={"note": "test"})
 
-    restored = PokerActorCritic(hidden=64, num_layers=2)
+    restored = tiny_model(hidden=64, num_layers=2)
     restored_optimizer = torch.optim.Adam(restored.parameters(), lr=1e-3)
     checkpoint = load_checkpoint(path, restored, restored_optimizer)
 
@@ -197,7 +280,7 @@ def test_a_checkpoint_from_a_different_encoding_is_rejected(model, tmp_path):
     torch.save(stale, path)
 
     with pytest.raises(ValueError, match="the encoding changed"):
-        load_checkpoint(path, PokerActorCritic(hidden=64, num_layers=2))
+        load_checkpoint(path, tiny_model(hidden=64, num_layers=2))
 
 
 def test_a_checkpoint_from_a_stale_feature_version_is_rejected(model, tmp_path):
@@ -210,11 +293,11 @@ def test_a_checkpoint_from_a_stale_feature_version_is_rejected(model, tmp_path):
     torch.save(stale, path)
 
     with pytest.raises(IncompatibleCheckpointError, match="different"):
-        load_checkpoint(path, PokerActorCritic(hidden=64, num_layers=2))
+        load_checkpoint(path, tiny_model(hidden=64, num_layers=2))
 
 
 def test_a_model_is_rebuilt_at_the_shape_it_was_trained_with(tmp_path):
-    original = PokerActorCritic(hidden=48, num_layers=1)
+    original = tiny_model(hidden=48, num_layers=1)
     path = tmp_path / "odd_shape.pt"
     save_checkpoint(path, original)
 
@@ -229,18 +312,18 @@ def test_a_model_is_rebuilt_at_the_shape_it_was_trained_with(tmp_path):
 def test_a_stale_or_unreadable_checkpoint_is_skipped_not_fatal(tmp_path):
     """The store is shared and long-lived; one bad file must not stop training."""
     game = fixed_mix(3)
-    save_checkpoint(tmp_path / "good.pt", PokerActorCritic(hidden=32, num_layers=1))
+    save_checkpoint(tmp_path / "good.pt", tiny_model(hidden=32, num_layers=1))
     (tmp_path / "garbage.pt").write_text("not a checkpoint at all")
 
     stale_path = tmp_path / "stale.pt"
-    save_checkpoint(stale_path, PokerActorCritic(hidden=32, num_layers=1))
+    save_checkpoint(stale_path, tiny_model(hidden=32, num_layers=1))
     stale = torch.load(stale_path, weights_only=True)
     stale["feature_version"] = FEATURE_VERSION + 1
     torch.save(stale, stale_path)
 
     registry = PoolRegistry(directory=tmp_path)
     for label in ("good", "garbage", "stale"):
-        registry.members[label] = PoolMember(label=label, kind="model", ref=f"{label}.pt")
+        registry.members[label] = PoolMember(label=label, ref=f"{label}.pt")
 
     skipped: list[str] = []
     opponents = registry_opponents(
@@ -253,16 +336,16 @@ def test_a_stale_or_unreadable_checkpoint_is_skipped_not_fatal(tmp_path):
 
 def test_drawn_opponents_join_the_trainer_pool(tmp_path):
     game = fixed_mix(3)
-    save_checkpoint(tmp_path / "veteran.pt", PokerActorCritic(hidden=32, num_layers=1))
+    save_checkpoint(tmp_path / "veteran.pt", tiny_model(hidden=32, num_layers=1))
     registry = PoolRegistry(directory=tmp_path)
-    registry.members["veteran"] = PoolMember(label="veteran", kind="model", ref="veteran.pt")
+    registry.members["veteran"] = PoolMember(label="veteran", ref="veteran.pt")
 
     config = TrainConfig(hands_per_iteration=10)
-    baseline = SelfPlayTrainer(game, config, model=PokerActorCritic(hidden=32, num_layers=1))
+    baseline = SelfPlayTrainer(game, config, **tiny_parts(hidden=32, num_layers=1))
     with_pool = SelfPlayTrainer(
         game,
         config,
-        model=PokerActorCritic(hidden=32, num_layers=1),
+        **tiny_parts(hidden=32, num_layers=1),
         extra_opponents=registry_opponents(registry, game, count=1),
     )
     assert len(with_pool._pool) == len(baseline._pool) + 1
@@ -275,7 +358,7 @@ def test_a_training_iteration_runs_end_to_end_and_updates_the_weights():
         TrainConfig(hands_per_iteration=20),
         PPOConfig(epochs=2, minibatch_size=64),
         rng=random.Random(0),
-        model=PokerActorCritic(hidden=32, num_layers=1),
+        **tiny_parts(hidden=32, num_layers=1),
     )
     before = [p.detach().clone() for p in trainer.model.parameters()]
     stats = trainer.train_iteration()
@@ -298,9 +381,9 @@ def small_game():
 def registry_with_models(tmp_path, count: int, *, max_models: int = 20) -> PoolRegistry:
     registry = PoolRegistry(directory=tmp_path, max_models=max_models)
     for i in range(count):
-        save_checkpoint(tmp_path / f"agent-{i}.pt", PokerActorCritic(hidden=32, num_layers=1))
+        save_checkpoint(tmp_path / f"agent-{i}.pt", tiny_model(hidden=32, num_layers=1))
         registry.members[f"agent-{i}"] = PoolMember(
-            label=f"agent-{i}", kind="model", ref=f"agent-{i}.pt"
+            label=f"agent-{i}", ref=f"agent-{i}.pt"
         )
     return registry
 
@@ -343,7 +426,7 @@ def test_registry_opponents_is_empty_with_no_models(tmp_path):
 def test_a_broken_checkpoint_in_the_pool_is_skipped_not_fatal(tmp_path):
     registry = registry_with_models(tmp_path, 1)
     (tmp_path / "garbage.pt").write_text("not a checkpoint")
-    registry.members["garbage"] = PoolMember(label="garbage", kind="model", ref="garbage.pt")
+    registry.members["garbage"] = PoolMember(label="garbage", ref="garbage.pt")
 
     skipped: list[str] = []
     opponents = registry_opponents(
@@ -359,7 +442,7 @@ def test_evaluating_against_the_pool_returns_a_finite_win_rate(tmp_path):
     trainer = SelfPlayTrainer(
         small_game(),
         TrainConfig(hands_per_iteration=10),
-        model=PokerActorCritic(hidden=32, num_layers=1),
+        **tiny_parts(hidden=32, num_layers=1),
         registry=registry,
     )
     assert math.isfinite(trainer.evaluate_against_pool(4, hands=10, seed=3))
@@ -370,7 +453,7 @@ def test_evaluating_against_the_pool_rates_every_participant(tmp_path):
     trainer = SelfPlayTrainer(
         small_game(),
         TrainConfig(hands_per_iteration=10),
-        model=PokerActorCritic(hidden=32, num_layers=1),
+        **tiny_parts(hidden=32, num_layers=1),
         registry=registry,
     )
     trainer.evaluate_against_pool(6, hands=10, seed=5)
@@ -384,7 +467,7 @@ def test_the_learner_rating_moves_with_its_results(tmp_path):
     trainer = SelfPlayTrainer(
         small_game(),
         TrainConfig(hands_per_iteration=10),
-        model=PokerActorCritic(hidden=32, num_layers=1),
+        **tiny_parts(hidden=32, num_layers=1),
         registry=registry,
     )
     before = trainer.learner_rating
@@ -406,7 +489,7 @@ def test_the_learner_is_rated_through_the_burn_in_schedule(tmp_path):
     trainer = SelfPlayTrainer(
         small_game(),
         TrainConfig(hands_per_iteration=10),
-        model=PokerActorCritic(hidden=32, num_layers=1),
+        **tiny_parts(hidden=32, num_layers=1),
         registry=registry,
     )
     assert trainer.learner_games == 0
@@ -430,7 +513,7 @@ def test_the_learner_burn_in_expires_within_a_run(tmp_path):
     trainer = SelfPlayTrainer(
         small_game(),
         TrainConfig(hands_per_iteration=10),
-        model=PokerActorCritic(hidden=32, num_layers=1),
+        **tiny_parts(hidden=32, num_layers=1),
         registry=registry,
     )
     burn_in_games = DEFAULT_K_SCHEDULE[1][0]
@@ -451,7 +534,7 @@ def test_the_learner_can_actually_reach_the_rating_of_the_pool_it_beats(tmp_path
     pool_rating = DEFAULT_RATING + 80.0
     for i in range(5):
         registry.members[f"m{i}"] = PoolMember(
-            label=f"m{i}", kind="model", ref=f"m{i}.pt", rating=pool_rating, frozen=True
+            label=f"m{i}", ref=f"m{i}.pt", rating=pool_rating, frozen=True
         )
 
     rating = DEFAULT_RATING
@@ -478,7 +561,7 @@ def test_evaluating_without_a_registry_is_a_clear_error():
     trainer = SelfPlayTrainer(
         small_game(),
         TrainConfig(hands_per_iteration=10),
-        model=PokerActorCritic(hidden=32, num_layers=1),
+        **tiny_parts(hidden=32, num_layers=1),
     )
     with pytest.raises(ValueError, match="registry"):
         trainer.evaluate_against_pool(1, hands=10)
@@ -488,13 +571,13 @@ def test_archiving_saves_the_weights_with_the_learners_rating_beside_them(tmp_pa
     trainer = SelfPlayTrainer(
         small_game(),
         TrainConfig(hands_per_iteration=10),
-        model=PokerActorCritic(hidden=32, num_layers=1),
+        **tiny_parts(hidden=32, num_layers=1),
     )
     trainer._learner_rating = 1712.0
     trainer.archive(tmp_path / "agent-new.pt", iteration=25)
 
     assert (tmp_path / "agent-new.pt").exists()
-    assert read_sidecar(tmp_path / "agent-new.pt") == (1712.0, 25)
+    assert read_sidecar(tmp_path / "agent-new.pt").rating == 1712.0
 
 
 def test_archiving_touches_no_registry_and_moves_nothing(tmp_path):
@@ -504,7 +587,7 @@ def test_archiving_touches_no_registry_and_moves_nothing(tmp_path):
     trainer = SelfPlayTrainer(
         small_game(),
         TrainConfig(hands_per_iteration=10),
-        model=PokerActorCritic(hidden=32, num_layers=1),
+        **tiny_parts(hidden=32, num_layers=1),
         registry=registry,
     )
     trainer.archive(tmp_path / "agent-new.pt", iteration=10)
@@ -523,7 +606,7 @@ def test_re_archiving_the_same_path_overwrites_in_place(tmp_path):
     trainer = SelfPlayTrainer(
         small_game(),
         TrainConfig(hands_per_iteration=10),
-        model=PokerActorCritic(hidden=32, num_layers=1),
+        **tiny_parts(hidden=32, num_layers=1),
     )
     path = tmp_path / "agent-run.pt"
     trainer._learner_rating = 1550.0
@@ -531,7 +614,7 @@ def test_re_archiving_the_same_path_overwrites_in_place(tmp_path):
     trainer._learner_rating = 1620.0
     trainer.archive(path, iteration=20)
 
-    assert read_sidecar(path) == (1620.0, 20)
+    assert read_sidecar(path).rating == 1620.0
     assert [p.name for p in tmp_path.glob("*.pt")] == ["agent-run.pt"]
 
 
@@ -545,7 +628,7 @@ def test_evaluating_against_frozen_opponents_moves_only_the_learner(tmp_path):
     trainer = SelfPlayTrainer(
         small_game(),
         TrainConfig(hands_per_iteration=10),
-        model=PokerActorCritic(hidden=32, num_layers=1),
+        **tiny_parts(hidden=32, num_layers=1),
         registry=registry,
     )
 
@@ -566,7 +649,7 @@ def test_a_checkpoint_can_be_seated_by_path(tmp_path):
     from pokerlab.cli.play import build_players, validate_bot_key
 
     path = tmp_path / "agent.pt"
-    save_checkpoint(path, PokerActorCritic(hidden=32, num_layers=1))
+    save_checkpoint(path, tiny_model(hidden=32, num_layers=1))
     game = GameConfig(num_players=3, starting_stack=100, small_blind=1, big_blind=2)
     spec = f"model:{path}"
     validate_bot_key(spec)
@@ -588,16 +671,24 @@ def test_seating_a_model_without_a_game_config_is_a_clear_error(tmp_path):
     from pokerlab.cli.play import build_players
 
     path = tmp_path / "agent.pt"
-    save_checkpoint(path, PokerActorCritic(hidden=32, num_layers=1))
+    save_checkpoint(path, tiny_model(hidden=32, num_layers=1))
     with pytest.raises(ValueError, match="GameConfig"):
         build_players(3, 0, random.Random(0), [f"model:{path}"])
+
+
+def test_seating_a_human_needs_a_factory_for_one():
+    """There is no terminal player to fall back on: whoever seats a human says how."""
+    from pokerlab.cli.play import build_players
+
+    with pytest.raises(ValueError, match="human_player_factory"):
+        build_players(3, 1, random.Random(0), ["model:unused.pt"])
 
 
 def test_a_table_of_trained_models_plays_without_errors(tmp_path):
     from pokerlab.cli.play import build_players
 
     for index in range(3):
-        save_checkpoint(tmp_path / f"a{index}.pt", PokerActorCritic(hidden=32, num_layers=1))
+        save_checkpoint(tmp_path / f"a{index}.pt", tiny_model(hidden=32, num_layers=1))
     game = GameConfig(num_players=3, starting_stack=100, small_blind=1, big_blind=2)
     keys = [f"model:{tmp_path / f'a{i}.pt'}" for i in range(3)]
 
@@ -625,7 +716,7 @@ def test_discovery_ranks_models_from_the_global_registry(tmp_path):
     for label, rating in (("vm-a-agent", 1500.0), ("vm-b-agent", 1900.0)):
         (tmp_path / "models" / f"{label}.pt").write_bytes(b"weights")
         registry.members[label] = PoolMember(
-            label=label, kind="model", ref=str(tmp_path / "models" / f"{label}.pt"), rating=rating
+            label=label, ref=str(tmp_path / "models" / f"{label}.pt"), rating=rating
         )
     registry.save()
 
@@ -640,7 +731,7 @@ def test_discovery_skips_registry_entries_whose_file_is_gone(tmp_path):
     global_dir = tmp_path / "global"
     global_dir.mkdir()
     registry = PoolRegistry(directory=global_dir, max_models=10**9)
-    registry.members["ghost"] = PoolMember(label="ghost", kind="model", ref="ghost.pt")
+    registry.members["ghost"] = PoolMember(label="ghost", ref="ghost.pt")
     registry.save()
     assert discover_trained_models(tmp_path, fallback_dir=None) == []
 
@@ -657,7 +748,7 @@ def test_discovery_finds_a_model_whose_ref_is_stale_by_looking_it_up_by_label(tm
     (tmp_path / "models" / "moved.pt").write_bytes(b"weights")
     registry = PoolRegistry(directory=global_dir, max_models=10**9)
     registry.members["moved"] = PoolMember(
-        label="moved", kind="model", ref="machines/old/pool/moved.pt", rating=1800.0
+        label="moved", ref="machines/old/pool/moved.pt", rating=1800.0
     )
     registry.save()
 
@@ -680,7 +771,7 @@ def test_discover_global_top_models_reads_the_one_shared_scale(tmp_path):
         path = elsewhere / f"{label}.pt"
         path.write_bytes(b"weights")
         registry.members[label] = PoolMember(
-            label=label, kind="model", ref=str(path), rating=rating
+            label=label, ref=str(path), rating=rating
         )
     registry.save()
 
@@ -700,10 +791,10 @@ def test_discover_global_top_models_skips_missing_files(tmp_path):
     present.write_bytes(b"weights")
     registry = PoolRegistry(directory=global_dir, max_models=10**9)
     registry.members["ghost"] = PoolMember(
-        label="ghost", kind="model", ref=str(tmp_path / "gone.pt"), rating=2000.0
+        label="ghost", ref=str(tmp_path / "gone.pt"), rating=2000.0
     )
     registry.members["present"] = PoolMember(
-        label="present", kind="model", ref=str(present), rating=1000.0
+        label="present", ref=str(present), rating=1000.0
     )
     registry.save()
 
@@ -747,7 +838,7 @@ def test_the_registry_wins_over_the_top_models_folder(tmp_path):
     global_dir.mkdir()
     (tmp_path / "live.pt").write_bytes(b"weights")
     registry = PoolRegistry(directory=global_dir, max_models=10**9)
-    registry.members["live"] = PoolMember(label="live", kind="model", ref=str(tmp_path / "live.pt"))
+    registry.members["live"] = PoolMember(label="live", ref=str(tmp_path / "live.pt"))
     registry.save()
     top = tmp_path / "top_models"
     top.mkdir()
@@ -775,8 +866,8 @@ def _train_args(**overrides):
         "stack_min_bb": 1.0, "stack_max_bb": 100.0, "sb": 50, "bb": 100,
         "lr": 3e-4, "ppo_epochs": 4, "clip_epsilon": 0.2, "entropy_coef": 0.0,
         "opponent_probability": 0.5,
-        "minibatch_size": 1024, "gae_lambda": 0.95, "value_coef": 0.5, "max_grad_norm": 0.5,
-        "pool_models": 20, "pool_top_share": 0.5, "pool_top_n": 100,
+        "minibatch_size": 1024, "gae_lambda": 0.95, "value_coef": 0.5, "policy_max_grad_norm": 0.5, "critic_max_grad_norm": 1.0,
+        "pool_models": 20, "table_hands": 200, "concurrent_tables": 8, "pool_top_share": 0.5, "pool_top_n": 100,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -793,7 +884,7 @@ def test_run_metadata_records_every_swept_axis():
     for axis in (
         "lr", "hands", "ppo_epochs", "clip_epsilon",
         "opponent_probability", "pool_top_share", "pool_top_n",
-        "minibatch_size", "gae_lambda", "value_coef", "max_grad_norm",
+        "minibatch_size", "gae_lambda", "value_coef", "policy_max_grad_norm", "critic_max_grad_norm",
     ):
         assert axis in recorded, axis
     assert (recorded["lr"], recorded["hands"], recorded["ppo_epochs"]) == (7e-4, 1024, 2)
@@ -816,7 +907,7 @@ def test_the_metadata_survives_the_round_trip_into_a_published_model(tmp_path):
     from pokerlab.rl.train import run_metadata
 
     path = tmp_path / "agent.pt"
-    save_checkpoint(path, PokerActorCritic(), metadata=run_metadata(_train_args(lr=9e-4)))
+    save_checkpoint(path, tiny_model(), metadata=run_metadata(_train_args(lr=9e-4)))
 
     reloaded = torch.load(path, map_location="cpu", weights_only=True)
 
@@ -1058,7 +1149,7 @@ def test_a_validation_pass_plays_the_sizes_of_the_mixture(tmp_path):
     trainer = SelfPlayTrainer(
         mix,
         TrainConfig(hands_per_iteration=10),
-        model=PokerActorCritic(hidden=32, num_layers=1),
+        **tiny_parts(hidden=32, num_layers=1),
         registry=registry,
     )
     assert math.isfinite(trainer.evaluate_against_pool(10, hands=5, seed=4))
