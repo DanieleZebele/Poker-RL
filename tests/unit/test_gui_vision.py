@@ -216,7 +216,7 @@ def test_player_zones_and_labels_are_their_own_kind(tmp_path):
     save_player_label(png, "player_6_4", "fuori")
     assert load_player_label(png)["state"] == "fuori"
     assert load_label(png) is None and load_dealer_label(png) is None
-    assert set(SEAT_STATES) == {"in_gioco", "fuori", "sit_out", "libero"}
+    assert set(SEAT_STATES) == {"in_gioco", "fuori", "sit_out", "libero", "reazione"}
     for zone, state in (("dealer_6_1", "fuori"), ("player_6_1", "seduto")):
         with pytest.raises(ValueError):
             save_player_label(png, zone, state)
@@ -302,7 +302,10 @@ def test_each_section_previews_only_its_own_zones_with_the_reading(app, monkeypa
 
     def grab(region):
         grabbed.append(region)
-        return felt(region.width, region.height, gold=(region.left == 40))
+        image = felt(region.width, region.height, gold=(region.left == 40))
+        if region.left == 300:  # the player zone: a reaction (an orange emoji) over the box
+            cv2.circle(image, (region.width // 2, region.height // 2), 50, (30, 140, 245), -1)
+        return image
 
     monkeypatch.setattr(capture, "grab_region", grab)
     frame = VisionFrame(app)
@@ -325,7 +328,7 @@ def test_each_section_previews_only_its_own_zones_with_the_reading(app, monkeypa
 
         grabbed.clear()
         window = frame._preview_players()
-        assert captions(window)[0] == "Giocatore 3" and len(captions(window)) == 2
+        assert captions(window) == ["Giocatore 3", "reazione"]
         assert grabbed == [Region(300, 0, 150, 110)]
         window.destroy()
 

@@ -4,6 +4,9 @@ What the client draws, measured on the labelled crops in `vision_data/players/`:
 
 - **in the hand** (an opponent): two card backs, bright pink-magenta, over the
   avatar. Measured magenta share up to 0.59; every other state has exactly 0.
+- **in the hand** (an opponent at a showdown): cards face up, read by their white
+  (0.109; out of the hand at most 0.023). Clubs are green in this deck: a big green area
+  is not the chair, whose outline is a thin line (`CHAIR_MAX`).
 - **in the hand** (you, seat 0): your cards face up, their white ranks and pips
   at full brightness (white share 0.08-0.09). Once you fold they are dimmed and
   the white goes (0.00-0.02). Brightness of the white, not the cards' colours:
@@ -16,9 +19,15 @@ What the client draws, measured on the labelled crops in `vision_data/players/`:
   is bare table (felt, or the "888 poker" logo), so it is recognised by being
   the same picture as a crop of that same zone labelled empty
   (`empty_backgrounds`) -- one labelled example per seat is enough.
+- **a reaction**: an animated emoji a player sends, drawn over the box, hiding cards
+  and avatar alike -- it says nothing about the seat, and the reader keeps the state
+  read before it (`ScreenReader`). The one labelled so far is a big orange face:
+  orange share 0.35, every other crop at most 0.07 (`REACTION_SHARE`); reactions of
+  other colours (a donkey) are recognised by being close to a crop labelled
+  "reazione", in any zone (`reaction_thumbnails`) -- label one of each as it shows up.
 - **out** otherwise: an avatar with nothing over it (folded, or waiting).
 
-Fixed rules plus two kinds of example, in this order: sit-out, then (seat 0) the
+Fixed rules plus three kinds of example, in this order: a reaction, sit-out, then (seat 0) the
 white of your cards, else magenta backs, else the chair or the zone's empty
 background, else out. `python -m
 pokerlab.vision.seats` checks them against the labels and lists every crop where
@@ -40,12 +49,19 @@ from pokerlab.vision.labels import (
     SEAT_EMPTY,
     SEAT_IN_HAND,
     SEAT_OUT,
+    SEAT_REACTION,
     SEAT_SIT_OUT,
 )
 
 YOUR_SEAT = 0
 MAGENTA_IN_HAND = 0.10  # card backs: up to 0.59 measured, 0 without them
 CHAIR_EMPTY = 0.01  # the empty-seat chair outline: 0.026 measured, 0 otherwise
+# ... and a thin outline, never a big area: face-up clubs (green in the four-colour deck)
+# measured 0.15-0.60 and read as an empty chair; the chair itself is 0.027-0.033.
+CHAIR_MAX = 0.08
+# An opponent's cards face up (a showdown): their white ranks and pips, 0.109 measured;
+# an opponent out of the hand at most 0.023.
+OPPONENT_WHITE_IN_HAND = 0.05
 YOUR_WHITE_IN_HAND = 0.05  # your live cards: 0.08-0.09; folded: 0.00-0.02
 SIT_OUT_MATCH = 0.6  # normalised correlation with a "SIT OUT" template
 # An empty seat the client draws as bare table (no chair): the crop is compared
@@ -53,6 +69,13 @@ SIT_OUT_MATCH = 0.6  # normalised correlation with a "SIT OUT" template
 # measured), while an occupied seat of the same zone is >= 14.1 away.
 EMPTY_MATCH = 6.0
 EMPTY_THUMBNAIL = (32, 24)  # width, height
+# The orange of the reaction emoji (H 5-25, S >= 120, V >= 150): 0.35 of the labelled
+# reaction crop, at most 0.07 of any other (an orange avatar).
+REACTION_SHARE = 0.20
+# Distance (as `empty_distance`) to a crop labelled "reazione" that makes one. The three
+# labelled so far (an orange face, a donkey, a fish) are >= 37.7 from every other crop; 20 leaves
+# room for another frame of the same animation, which is not measured.
+REACTION_MATCH = 20.0
 
 
 def _hsv(image: np.ndarray) -> np.ndarray:
@@ -70,6 +93,11 @@ def chair_share(image: np.ndarray) -> float:
     through a player box as a "chair" when the band was H 50-85, S > 150."""
     h, s, v = cv2.split(_hsv(image))
     return float(((h >= 58) & (h <= 72) & (s >= 195) & (v > 140)).mean())
+
+
+def reaction_share(image: np.ndarray) -> float:
+    h, s, v = cv2.split(_hsv(image))
+    return float(((h >= 5) & (h <= 25) & (s >= 120) & (v >= 150)).mean())
 
 
 def white_share(image: np.ndarray) -> float:
@@ -134,26 +162,32 @@ class SeatReading:
     white: float
     sit_out: float
     empty: float = float("inf")  # distance from this zone's empty background
+    reaction: float = 0.0  # orange share of a reaction emoji
 
 
 def read_seat(image: np.ndarray, seat: int, templates: list[np.ndarray],
-              backgrounds: list[np.ndarray] | None = None) -> SeatReading:
+              backgrounds: list[np.ndarray] | None = None,
+              reactions: list[np.ndarray] | None = None) -> SeatReading:
     """`backgrounds`: thumbnails of this same zone labelled empty
-    (`empty_backgrounds`), for clients that draw no chair on an empty seat."""
+    (`empty_backgrounds`), for clients that draw no chair on an empty seat;
+    `reactions`: thumbnails of crops labelled "reazione", in any zone."""
     magenta, chair, white = magenta_share(image), chair_share(image), white_share(image)
     sit_out = sit_out_score(image, templates)
     empty = empty_distance(image, backgrounds or [])
-    if sit_out >= SIT_OUT_MATCH:
+    reaction = reaction_share(image)
+    if reaction >= REACTION_SHARE or empty_distance(image, reactions or []) <= REACTION_MATCH:
+        state = SEAT_REACTION
+    elif sit_out >= SIT_OUT_MATCH:
         state = SEAT_SIT_OUT
     elif seat == YOUR_SEAT:
         state = SEAT_IN_HAND if white >= YOUR_WHITE_IN_HAND else SEAT_OUT
-    elif magenta >= MAGENTA_IN_HAND:
+    elif magenta >= MAGENTA_IN_HAND or white >= OPPONENT_WHITE_IN_HAND:
         state = SEAT_IN_HAND
-    elif chair >= CHAIR_EMPTY or empty <= EMPTY_MATCH:
+    elif CHAIR_EMPTY <= chair <= CHAIR_MAX or empty <= EMPTY_MATCH:
         state = SEAT_EMPTY
     else:
         state = SEAT_OUT
-    return SeatReading(state, magenta, chair, white, sit_out, empty)
+    return SeatReading(state, magenta, chair, white, sit_out, empty, reaction)
 
 
 @dataclass
@@ -190,6 +224,12 @@ def empty_backgrounds(seats: list[LabelledSeat], exclude: Path | None = None) ->
     return backgrounds
 
 
+def reaction_thumbnails(seats: list[LabelledSeat], exclude: Path | None = None) -> list[np.ndarray]:
+    """Thumbnails of every crop labelled "reazione", whatever its zone: the same emoji
+    is drawn over any seat."""
+    return [_thumbnail(seat.image) for seat in seats if seat.state == SEAT_REACTION and seat.path != exclude]
+
+
 def sit_out_templates(seats: list[LabelledSeat], exclude: Path | None = None) -> list[np.ndarray]:
     templates = []
     for seat in seats:
@@ -209,14 +249,15 @@ def main(argv: list[str] | None = None) -> None:
     for seat in seats:
         # leave-one-out for the data-driven parts: never its own template or background
         backgrounds = empty_backgrounds(seats, exclude=seat.path).get(seat.zone, [])
-        reading = read_seat(seat.image, seat.seat, sit_out_templates(seats, exclude=seat.path), backgrounds)
+        reading = read_seat(seat.image, seat.seat, sit_out_templates(seats, exclude=seat.path), backgrounds,
+                            reaction_thumbnails(seats, exclude=seat.path))
         if reading.state == seat.state:
             right += 1
         else:
             print(f"  {seat.path.name}: etichetta {seat.state}, regola {reading.state} "
                   f"(magenta {reading.magenta:.2f}, sedia {reading.chair:.3f}, "
                   f"bianco {reading.white:.3f}, sit-out {reading.sit_out:.2f}, "
-                  f"vuoto {reading.empty:.1f})")
+                  f"vuoto {reading.empty:.1f}, reazione {reading.reaction:.2f})")
     print(f"ritagli d'accordo con l'etichetta: {right}/{len(seats)}")
     print(json.dumps({"seats": len(seats), "right": right}))
 

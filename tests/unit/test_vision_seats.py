@@ -80,3 +80,39 @@ def test_an_empty_seat_drawn_as_bare_table_is_told_by_its_own_zone(tmp_path, tem
     # someone sitting down in that seat is no longer the empty background
     assert read_seat(box(), 4, templates, backgrounds["player_8_4"]).state == "fuori"
     assert read_seat(box(backs=True), 4, templates, backgrounds["player_8_4"]).state == "in_gioco"
+
+
+def test_a_reaction_over_the_box_is_a_reaction_whatever_is_under_it(tmp_path, templates):
+    """An orange emoji drawn over the box (a player's "reaction") hides cards and avatar:
+    it is told by its orange, and one of another colour by a labelled example."""
+    from pokerlab.vision.labels import save_player_label
+    from pokerlab.vision.seats import load_seats, reaction_thumbnails
+
+    def reacting(base, colour=(30, 140, 245)):  # BGR orange
+        image = base.copy()
+        cv2.circle(image, (75, 55), 45, colour, -1)
+        return image
+
+    assert read_seat(reacting(box(backs=True)), 3, templates).state == "reazione"
+    assert read_seat(reacting(box()), 3, templates).state == "reazione"
+    assert read_seat(reacting(box(my_cards="live")), 0, templates).state == "reazione"
+
+    blue = reacting(box(), colour=(230, 120, 40))
+    assert read_seat(blue, 3, templates).state != "reazione"  # not orange: needs an example
+    path = tmp_path / "player_6_2-a.png"
+    cv2.imwrite(str(path), blue)
+    save_player_label(path, "player_6_2", "reazione")
+    reactions = reaction_thumbnails(load_seats(tmp_path))
+    assert read_seat(blue, 3, templates, None, reactions).state == "reazione"  # any zone
+    assert read_seat(box(backs=True), 3, templates, None, reactions).state == "in_gioco"
+
+
+def test_an_opponent_showing_cards_is_in_the_hand_even_green_ones(templates):
+    """At a showdown an opponent's cards are face up; clubs are green in this deck, and a
+    big green area is not the thin outline of an empty chair."""
+    image = box()
+    cv2.rectangle(image, (25, 10), (125, 105), (40, 200, 40), -1)  # green club cards
+    cv2.putText(image, "A 4", (35, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
+    cv2.circle(image, (60, 80), 12, (255, 255, 255), -1)
+    cv2.circle(image, (100, 80), 12, (255, 255, 255), -1)
+    assert read_seat(image, 3, templates).state == "in_gioco"

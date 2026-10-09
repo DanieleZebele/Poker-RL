@@ -33,7 +33,10 @@ SEAT_IN_HAND = "in_gioco"  # dealt in and not folded
 SEAT_OUT = "fuori"  # seated but not in this hand: folded, or just joined and waiting
 SEAT_SIT_OUT = "sit_out"  # seated but sitting out: not dealt in until they come back
 SEAT_EMPTY = "libero"  # nobody sits there
-SEAT_STATES = (SEAT_IN_HAND, SEAT_OUT, SEAT_SIT_OUT, SEAT_EMPTY)
+# A "reaction" (an animated emoji a player sends) drawn over the player box: it hides the
+# cards and the avatar, so it says nothing about the seat; the state read before stands.
+SEAT_REACTION = "reazione"
+SEAT_STATES = (SEAT_IN_HAND, SEAT_OUT, SEAT_SIT_OUT, SEAT_EMPTY, SEAT_REACTION)
 # The turn-timer crops, labelled bar present (your turn) / absent.
 TURN_DIR = DEFAULT_REGIONS_PATH.parent / "turn"
 # The bet and pot crops, labelled with the amount as written on screen.

@@ -82,6 +82,9 @@ class ScreenReader:
         self._crop_count = -1
         self._sit_out_templates: list = []
         self._empty_backgrounds: dict = {}  # zone -> that zone's empty-seat thumbnails
+        self._reactions: list = []  # thumbnails of the crops labelled "reazione"
+        # Each seat's last state that was not a reaction, kept while one covers the seat.
+        self._seat_states: dict[int, str] = {}
         self._seat_crop_count = -1
         self._amount_reader = None
         self._amount_crop_count = -1
@@ -127,6 +130,8 @@ class ScreenReader:
         self._read_dealer(frames, reading)
         self._read_seats(frames, reading)
         self._read_amounts(frames, reading)
+        if reading.seats is not None and reading.stacks is not None:
+            reading.seats = empty_by_stack(reading.seats, reading.stacks)
         self._read_turn(frames, reading)
         return reading
 
@@ -191,7 +196,12 @@ class ScreenReader:
         """The "SIT OUT" lettering of the labelled seat crops, reloaded when
         their number changes; the empty-seat backgrounds are reloaded with it."""
         from pokerlab.vision.labels import PLAYERS_DIR
-        from pokerlab.vision.seats import empty_backgrounds, load_seats, sit_out_templates
+        from pokerlab.vision.seats import (
+            empty_backgrounds,
+            load_seats,
+            reaction_thumbnails,
+            sit_out_templates,
+        )
 
         count = len(list(PLAYERS_DIR.glob("*.png")))
         if count != self._seat_crop_count:
@@ -199,10 +209,12 @@ class ScreenReader:
             labelled = load_seats(PLAYERS_DIR)
             self._sit_out_templates = sit_out_templates(labelled)
             self._empty_backgrounds = empty_backgrounds(labelled)
+            self._reactions = reaction_thumbnails(labelled)
         return self._sit_out_templates
 
     def _read_seats(self, frames: dict, reading: ScreenReading) -> None:
         """The state of every seat whose player zone is set."""
+        from pokerlab.vision.labels import SEAT_REACTION
         from pokerlab.vision.seats import read_seat
 
         seats = {
@@ -212,10 +224,14 @@ class ScreenReader:
         if not seats:
             return
         templates = self._get_sit_out_templates()
-        reading.seats = {
-            seat: read_seat(frame, seat, templates, self._empty_backgrounds.get(name)).state
+        read = {
+            seat: read_seat(frame, seat, templates, self._empty_backgrounds.get(name), self._reactions).state
             for seat, (name, frame) in seats.items()
         }
+        reading.seats = keep_through_reactions(read, self._seat_states)
+        reacting = sorted(seat for seat, state in read.items() if state == SEAT_REACTION)
+        if reacting:
+            reading.problems.append(f"reazione sul posto {', '.join(map(str, reacting))}: tengo lo stato di prima")
 
 
     def _get_amount_reader(self):
@@ -311,13 +327,18 @@ def diff_reading(previous: ScreenReading | None, current: ScreenReading,
     manual correction stick: an unchanged screen changes nothing. A zone not
     known now (`None`) changes nothing either. `last_hand` is the last non-empty
     hand read, so a new hand is recognised even across a fold (cards, none,
-    other cards) -- and the same cards coming back after a flicker are not one."""
+    other cards) -- and the same cards coming back after a flicker are not one.
+
+    Nor is a hand that keeps a card of the last one: a card misread for a reading or two
+    (a queen read as a ten) changes the pair and changes it back, and each change counted
+    as a deal, so the statistics jumped by several hands. Two real deals share a card
+    about one time in thirteen, and then the button moving still marks the new hand."""
     change = ReadingChange()
     before_hole = previous.hole if previous else None
     before_board = previous.board if previous else None
     if current.hole is not None and current.hole != before_hole:
         change.hole = current.hole
-        change.new_hand = bool(current.hole) and current.hole != last_hand
+        change.new_hand = bool(current.hole) and not set(current.hole) & set(last_hand or ())
     if current.board is not None and current.board != before_board:
         change.board = current.board
     # No button seen (between hands, mid-animation) moves nothing, and the
@@ -330,6 +351,43 @@ def diff_reading(previous: ScreenReading | None, current: ScreenReading,
     if current.bets is not None and current.bets != (previous.bets if previous else None):
         change.bets = current.bets
     return change
+
+
+def keep_through_reactions(read: dict[int, str], last: dict[int, str]) -> dict[int, str]:
+    """The seats as read, with a seat covered by a reaction given the state it was last
+    read in; `last` is updated with every other seat. A reaction hides cards and avatar
+    alike, so read as itself it made a player in the hand look out of it (a fold) and
+    an empty seat look taken. A seat never read before gets "fuori": seated, and nothing
+    claimed about the hand."""
+    from pokerlab.vision.labels import SEAT_OUT, SEAT_REACTION
+
+    seats = {}
+    for seat, state in read.items():
+        if state == SEAT_REACTION:
+            seats[seat] = last.get(seat, SEAT_OUT)
+        else:
+            seats[seat] = last[seat] = state
+    return seats
+
+
+def empty_by_stack(seats: dict[int, str], stacks: dict[int, float]) -> dict[int, str]:
+    """`seats` with every opponent read out of the hand and *no stack written* (read as 0)
+    made an empty seat.
+
+    At the 8-max client an empty seat is bare table -- no chair outline -- so the player
+    zone tells it apart only by labelled examples of that very zone; where there are none
+    it reads "out", like a player who folded. Then whoever sat down there next inherited
+    the statistics of the one who left (never forgotten), and the seat was dealt in as a
+    player folding every hand. A seated player always has a stack written under them;
+    an empty seat has none. A stack not readable (letters, say "All-in") is missing from
+    `stacks`, not 0, and changes nothing, and so does a seat whose stack zone is not set.
+    Your own seat never: you are always at the table."""
+    from pokerlab.vision.labels import SEAT_EMPTY, SEAT_OUT
+
+    return {  # client seat 0 is you
+        seat: SEAT_EMPTY if (state == SEAT_OUT and seat != 0 and stacks.get(seat) == 0.0) else state
+        for seat, state in seats.items()
+    }
 
 
 def sit_out_blinds(seats: dict[int, str], bets: dict[int, float] | None) -> set[int]:

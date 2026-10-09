@@ -2247,6 +2247,12 @@ dependency (Flask, etc.) — it ships with Python. Architecture:
     goes to `StatsTracker.record_hand` as the engine's own records (`SpotState.records`: the
     blinds and the scripted actions only, not the passive ones the replayer plays to finish the
     hand). A spot built by hand is never recorded. Readings stay every 0.5 s.
+  - **One deal, two signs: recorded once** (`_hand_boundary`, `SAME_DEAL_SECONDS` 5). The
+    button moving and your new cards often arrive a reading or two apart; recorded at both,
+    every real hand counted twice -- the second time as what `action_sync` made of the deal
+    in between (players read "out" before their cards arrive, so folds). The other sign
+    within 5 s of the first clears the actions but records nothing; the same sign again
+    is a new hand.
   - **Identity is the chair** (`chair<N>`, what stays put between hands); a seat the screen
     shows empty (`libero`) is forgotten (`StatsTracker.forget`), since someone else sits there
     next -- **at any reading, not only when the seating is applied** (`_note_players_leaving`,
@@ -2257,10 +2263,19 @@ dependency (Flask, etc.) — it ships with Python. Architecture:
     the old player was in would be the newcomer's first. "Azzera statistiche" forgets
     everyone (another table).
   - **Into the models: `Spot.seat_stats`** (by engine seat, from `tracker.vectors`), handed to
-    the replay's `Table` through `_FixedStats`, which records nothing -- the replayed hand is
+    the replay's `Table` through `_FixedStats`, which records nothing. The top bar's
+    "Policy: avversari sempre nuovi" switch (`fresh_opponents_var`, kept on the app as
+    `spot_fresh_opponents`) hands the models no statistics at all, every opponent unseen,
+    while the tracker keeps counting and the chairs keep showing them -- the replayed hand is
     rebuilt at every edit and the real tracker must not count it. Each chair shows
-    all nine statistics once seen, three a line, each with the chances it is
-    counted over ("VPIP 25% (87)", `STAT_LABELS`), "-" for one with none yet.
+    all nine statistics, three a line, each with the chances it is counted over
+    ("VPIP 25% (87)", `STAT_LABELS`), "-" for one with none yet, and "nessuna mano
+    registrata" before the first. **Always on screen, for every seated chair, yours
+    included** (`_show_stats`, at the end of every `refresh`, whatever the state):
+    written inside `_show_state` they vanished whenever the rebuilt hand was over or
+    the table not playable. The two chairs in the middle of the top and bottom edges
+    (`WIDE_CHAIRS`) put their cards and actions to the right of these lines, not under
+    them: they have room sideways and none towards the felt.
   - **Limits, accepted.** WTSD is counted like the others: a player who saw the flop and never
     folded reached the showdown unless everyone else folded, and the board is the one last read
     or what the streets of the actions imply (`_board_reached`; the screen may clear the board
@@ -2271,14 +2286,33 @@ dependency (Flask, etc.) — it ships with Python. Architecture:
     actions of a hand can be missed, which leans the figures towards what is easy to see.
     Every seated player counts as dealt in. Pinned in `test_gui_screen_reader.py` and
     `test_gui_spot.py`.
-- **The likeliest action of the top model is bold** in the advice panel (`_write(bold_lines=)`).
+- **The action to take is drawn, and bold, on the advice panel's first line**, alone and
+  in capitals ("FOLD", "RAISE A 6 BB"; `.upper()`, `_sampled_action`): one bin of the best-rated model drawn by its
+  probabilities, as it would play at a table, not its likeliest one. **Drawn once per
+  decision** (key: model, hole cards, board, script, your seat) -- the advice is rewritten
+  at every 0.5 s reading, and a new draw each time flickered between actions. The models'
+  lines follow, unbolded: one line a model (its likeliest action), every option only for
+  the first. The panel is `ADVICE_LINES` (12) high at the bottom of the side column; the
+  list of actions takes the rest, with a scrollbar, and scrolls to its last line at
+  every rewrite (`_write_log`).
+- **The bold line** (`_write(bold_lines=)`).
   Two Tk traps made it show plain for a long time while the test (tag ranges only) passed:
   `tkfont.Font(font=..., weight="bold")` copies the font and *ignores* `weight`, and a `Font`
   deletes its Tk font when the Python object is collected. The bold font is built then
   `configure`d, and kept on the widget; the test checks the tag's font exists and is bold.
+  Every option is written as the action it is in this hand ("check", "bet 2,25 BB",
+  "raise a 6 BB", from `describe_action` of the bin's action), never the bin's generic
+  name ("check/call", "50% pot"), which does not say check or call, bet or raise. When
+  the screen shows a bet in front of someone that the rebuilt hand does not have
+  (`_bets_not_rebuilt`, against the last `TableView`), the status line warns that the
+  advice is for a different hand: a missing bet turns a call into a check and a raise
+  into a bet.
   The models are named there by their place in the global ranking, "#1", "#2", ...
   (`_model_ranks`, from the discovery order, so a model that failed to load does not
   renumber the rest), not by their labels.
+- **Each seat's bet is drawn on the felt** (`_show_bets`): a dark chip with the amount
+  in BB on the rail, in the direction of the chair (`_bet_position`, `BET_RADIUS`),
+  hidden when the seat has nothing in front this street.
 - **No default stack field**: a chair starts at `DEFAULT_STACK_BB` (100) and its own
   "inizio BB" field is what counts; with screen reading on, the stacks come from the
   screen.
@@ -2377,6 +2411,26 @@ collected in the vision screen; the accuracies quoted are against the crops in
     example; anything else is "fuori". Caveat: the two sit-out examples are the same seat, near-identical, so the
     template's reach to other seats is unverified (others score <= 0.26
     against a 0.6 threshold).
+  - **Reactions** (`labels.SEAT_REACTION` "reazione", a fifth state in the labeller): an
+    animated emoji a player sends covers the box -- cards and avatar -- so read as
+    itself it made a player in the hand look out (a fold, the rebuild stuck) or the
+    hero folded. `seats.read_seat` checks it first: an orange share >= `REACTION_SHARE`
+    (0.20; the orange face 0.35, every other crop <= 0.07), or a thumbnail within
+    `REACTION_MATCH` (20; the three labelled -- orange face, donkey, fish -- are >= 37.7 from any other crop) of a crop
+    labelled "reazione", any zone. `screen_reader.keep_through_reactions` gives the
+    seat the state it was last read in ("fuori" if never read), and the status line
+    says so. Label every new reaction as it shows up: only the orange is a rule.
+  - **Face-up cards of an opponent (a showdown) are "in gioco"**: white >=
+    `OPPONENT_WHITE_IN_HAND` (0.05; 0.109 measured, out <= 0.023). Green clubs used to
+    read as an empty chair: the chair is a thin outline (0.027-0.033), so a green share
+    above `CHAIR_MAX` (0.08) is not one.
+  - **An empty seat at the 8-max client is bare table**, no chair outline, so the
+    player zone recognises it only from labelled empty crops *of that zone*; where there
+    are none it read "fuori", the newcomer inherited the statistics of the one who left
+    and the seat was dealt in folding every hand. `screen_reader.empty_by_stack`: an
+    opponent read "fuori" with nothing written in their stack zone (read 0) is
+    `libero` -- a seated player always has a stack written. Unreadable (missing) changes
+    nothing; your seat never.
   - **Wired into the spot screen's 0.5 s scan** (`ScreenReader._read_seats`,
     `ScreenReading.seats`). Seated = every seat but `libero`/`sit_out`
     (`screen_reader.seated_seats`): a folded player is still at the table, and
@@ -2386,7 +2440,8 @@ collected in the vision screen; the accuracies quoted are against the crops in
     it would wipe the actions being typed every time someone stood up -- and
     only on the chairs mapped to client seats. **Folds show at once**:
     `_mark_seat_states` tags a seated player read `fuori`/`sit_out`/`libero`
-    ("fold", "sit-out", "uscito"; grey border, `SEAT_MARKS`); the FOLD itself goes
+    ("fold", "sit-out", "uscito"; grey border and a dark box, `SEAT_MARKS`, `_paint_box`,
+    which also darkens every seat that folded in the rebuilt hand); the FOLD itself goes
     into the actions when their turn comes (`action_sync`, `TableView.out`). A
     player who vanishes mid-hand (the seat read `libero`: left, disconnected) is
     one of them -- without it the rebuild waited on them for ever. The button is
@@ -2492,7 +2547,18 @@ collected in the vision screen; the accuracies quoted are against the crops in
     examples (`python -m pokerlab.vision.turn` checks it on the labelled ones). `ScreenReading.my_turn` feeds
     `TableView.my_turn`: while it is up and the engine still waits on a seat
     before yours, that seat acted -- a CHECK with chips unchanged, a FOLD if
-    out; facing a bet with nothing changed it is still not guessed.
+    out; facing a bet with nothing changed it is still not guessed. **Your own check
+    the same way**: when the engine waits on you and your bar, seen for that decision
+    (`SpotFrame._my_turn_mark`, `TableView.my_turn_seen`), is gone with nothing in front
+    of you and nothing to call, you checked -- before this the screen waited on you
+    until someone after you acted or the next card came. The bar has to have been seen:
+    a bar the client has not drawn yet would otherwise read as a check never made.
+    **A bar up means "you are deciding" only on the engine's street**: with the board
+    further on it is your turn on the next street, and the decision the engine waits on
+    was made -- CALL if you are still in (your cards say so better than your stack),
+    FOLD if out, CHECK with nothing to call. Heads-up, a call that closes the street
+    brings the card and your turn back at once, the bar never goes, and the screen
+    used to wait on that call for ever.
   - **No "Chiedi ai modelli" button inside the spot screen**: the models answer by themselves whenever it is your turn
     with both cards known. The main menu's "Chiedi ai modelli (spot)" button,
     which opens the screen, stays.
@@ -2501,10 +2567,41 @@ collected in the vision screen; the accuracies quoted are against the crops in
     `_pot_check` compares pot + bets in front with the engine's pot and prints
     "ATTENZIONE piatto" on a mismatch -- which is how a reconstruction gone
     wrong shows.
+  - **A screen behind the engine is no evidence**: the action that closes a street moves
+    the engine to the next one at once, while the client keeps the chips in front until
+    it deals the card. Until then the chips belong to the street just closed, and the
+    rebuild waits ("attendo la carta"). Read as the new street's, the big blind's call
+    that closed the preflop came back as a flop bet and call, over and over, and the
+    hand was lost from there -- it looked like the tracking stopped once you folded.
+  - **The stacks are evidence too** (`TableView.stacks`, chips behind, read every
+    0.5 s): a bet seen in front always wins, but when the table cannot show the chips
+    -- swept into the pot as the next card came, or a bet zone not read -- the drop in
+    a player's stack is what they put in (`_street_chips`), and a new card with a stack
+    that never moved is a check (nothing to call) or a fold (facing a bet) -- **unless
+    the player still has cards in front** (`TableView.in_hand`, seats read `in_gioco`):
+    then facing a bet they called, whatever the stack. The client updates a stack a
+    moment after the card, and a call swept into the pot used to become a fold that
+    ended the hand. One street
+    ahead the chips in front on the new street are taken off the drop; two or more
+    ahead it cannot be split and only "nothing at all" is used. Only chairs whose
+    starting stack this hand came from the screen (`SpotFrame._stacks_from_screen`):
+    against a default 100 BB, a stack read later would "drop" by a bet nobody made. A
+    stack read as 0 is not used (empty zone or all-in). Amounts within half of the
+    0,1 BB the screen writes count as equal (`TableView.tolerance`).
+  - **A wrong FOLD or ALL_IN is taken back** (`SpotFrame._heal_script`, before every
+    rebuild): one the screen contradicts for `HEAL_READINGS` (3) readings in a row --
+    the player still holding cards (`in_hand`), still chips behind -- goes, with all
+    that came after it, and `action_sync` rebuilds from there. Before, nothing scripted
+    was ever undone: one fold from a misread frame ended the rebuilt hand while the real
+    one went on, nobody lit up, your turn was not seen, until the next deal. A rebuilt
+    hand that is over now says "mano conclusa" on the status line instead of nothing.
+  - **Every reading that changed something is logged** while the screen is read
+    (`_log_reading`, `hand_histories/spot_screen.log`, gitignored, rolled to `.log.1` at
+    5 MB): what was read, the script, where the rebuild stands and its note. The place
+    to look when the rebuild gets stuck.
   - **Limits, by construction**: a raise swept into the pot before any reading
-    saw it is invisible (the street then reads as calls; the pot check flags
-    it); stacks are not read, so the spot's stack setting decides what an
-    all-in is; the hero's own action is taken the same way, from the screen.
+    saw it is visible only through the stacks (above); the hero's own action is
+    taken the same way, from the screen.
     Manual edits are overridden by the screen on the next reading, since the
     screen is the source of truth. Tests: `tests/unit/test_gui_action_sync.py`
     and the spot-frame test in `test_gui_screen_reader.py`.
@@ -2592,7 +2689,11 @@ collected in the vision screen; the accuracies quoted are against the crops in
     - **Different hole cards = new hand: the actions are cleared** (they belonged
       to the last hand); seats, stacks and dealer stay. Recognised across a fold
       (cards, none, other cards), and the same cards returning after a flicker
-      are not a new hand (`last_hand`).
+      are not a new hand (`last_hand`). **Nor are cards sharing one with the last
+      hand**: a card misread for a reading or two (Q read as 10) changed the pair and
+      changed it back, each change a "deal", and the statistics jumped by several
+      hands. Two real deals share a card ~1 time in 13; the button moving still
+      marks those.
     - **Doubtful readings are not applied**: a suit "?", a card read in both hand
       and board, a board of 1-2 cards (the flop mid-animation). The line under
       the situation shows the reading, the time and any such problem.

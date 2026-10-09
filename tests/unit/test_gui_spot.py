@@ -424,7 +424,7 @@ def replace_script(spot, script):
     return replace(spot, script=script)
 
 
-def test_the_likeliest_action_of_the_top_model_is_in_bold(app, monkeypatch):
+def test_the_action_to_take_is_drawn_from_the_top_model_and_shown_in_bold(app, monkeypatch):
     from pokerlab.gui import spot_view
     from pokerlab.gui.spot import BinAdvice, ModelAdvice
 
@@ -443,10 +443,10 @@ def test_the_likeliest_action_of_the_top_model_is_in_bold(app, monkeypatch):
         frame._consult(replay(spot), spot)
 
         text = frame.advice.get("1.0", "end")
-        assert text.splitlines()[0].startswith("#1 ") and "#3 " in text
+        assert text.splitlines()[2].startswith("#1 ") and "#3 " in text
         assert "primo" not in text and "secondo" not in text  # numbers only, no labels
         ranges = [str(r) for r in frame.advice.tag_ranges("bold")]
-        assert ranges == ["2.0", "2.end"] or (len(ranges) == 2 and ranges[0].startswith("2."))
+        assert len(ranges) == 2 and ranges[0] == "1.0"
         bold = frame.advice.get(*frame.advice.tag_ranges("bold"))
         # the tag's font must still exist once Python has collected its garbage: a font
         # object dropped deletes the Tk font, and the line then shows plain
@@ -454,8 +454,17 @@ def test_the_likeliest_action_of_the_top_model_is_in_bold(app, monkeypatch):
         font_name = frame.advice.tag_cget("bold", "font")
         assert str(font_name) in app.tk.call("font", "names")
         assert app.tk.call("font", "actual", font_name, "-weight") == "bold"
-        assert bold.strip().startswith("->") and "70%" in bold
-        assert "#3" not in bold
+        assert bold in ("CALL 1 BB", "FOLD")  # the action alone, nothing else
+
+        # the same decision keeps its draw however often the advice is rewritten
+        for _ in range(20):
+            frame._consult(replay(spot), spot)
+            assert frame.advice.get(*frame.advice.tag_ranges("bold")) == bold
+        # and over many decisions the draw follows the probabilities
+        drawn = [frame._sampled_action(opinion("primo", 1900), replace_script(spot, [Action(ActionType.CALL)] * n))
+                 for n in range(400)]
+        calls = sum(b.action.action_type is ActionType.CALL for b in drawn)
+        assert 230 < calls < 330  # 70% of 400 = 280
     finally:
         frame.destroy()
         gc.collect()
@@ -537,3 +546,81 @@ def test_a_model_is_normalised_by_the_stack_it_was_trained_with():
 
     assert feature_stack_bb({"metadata": {"stack_max_bb": 60.0}}) == 60.0
     assert feature_stack_bb({"metadata": {}}) == DEFAULT_STACK_MAX_BB == feature_stack_bb({})
+
+
+def test_each_option_is_named_as_the_action_it_is_in_this_hand(app, monkeypatch):
+    """First to act on the flop the options are a check and bets; the panel says so,
+    not "check/call" and "50% pot"."""
+    from pokerlab.gui import spot_view
+    from pokerlab.gui.spot import BinAdvice, ModelAdvice
+    from pokerlab.rl.action_space import action_index_to_action, legal_action_mask
+
+    call, check = Action(ActionType.CALL), Action(ActionType.CHECK)
+    board = (parse_card("Ks"), parse_card("8d"), parse_card("3h"))
+    spot = Spot(num_players=3, my_seat=1, small_blind=50, big_blind=100, starting_stack=10000,
+                script=[call, call, check], board=board)
+    state = replay(spot)
+    mask = legal_action_mask(state.observation, state.legal_actions)
+    bins = [BinAdvice(i, "x", action_index_to_action(i, state.observation, state.legal_actions), 0.9 if i == 1 else 0.1 / 7, True)
+            for i, legal in enumerate(mask) if legal]
+
+    frame = spot_view.SpotFrame(app)
+    try:
+        monkeypatch.setattr(spot_view, "advise", lambda *a, **k: [ModelAdvice("m", 1900, bins[0], bins, 0.0)])
+        frame.models = [object()]
+        frame._consult(state, spot)
+        options = frame.advice.get("1.0", "end").splitlines()[3]  # after the drawn action, a blank line and the model's
+        assert options.strip().startswith("check 90%") and "bet 1,5 BB" in options
+        assert "check/call" not in options and "pot" not in options
+    finally:
+        frame.destroy()
+        gc.collect()
+
+
+def test_the_panel_warns_when_the_screen_shows_a_bet_the_hand_does_not_have(app, monkeypatch):
+    from pokerlab.gui import spot_view
+    from pokerlab.gui.action_sync import TableView
+    from pokerlab.gui.spot import BinAdvice, ModelAdvice
+
+    call, check = Action(ActionType.CALL), Action(ActionType.CHECK)
+    board = (parse_card("Ks"), parse_card("8d"), parse_card("3h"))
+    spot = Spot(num_players=3, my_seat=1, small_blind=50, big_blind=100, starting_stack=10000,
+                script=[call, call, check], board=board)
+    state = replay(spot)  # my turn, first on the flop: the engine has no bet
+    best = BinAdvice(1, "x", check, 1.0, True)
+
+    frame = spot_view.SpotFrame(app)
+    try:
+        monkeypatch.setattr(spot_view, "advise", lambda *a, **k: [ModelAdvice("m", 1900, best, [best], 0.0)])
+        frame.models = [object()]
+        frame._last_view = TableView(bets={0: 0, 1: 0, 2: 0})
+        frame._consult(state, spot)
+        assert "ATTENZIONE" not in frame.status_var.get()
+        frame._last_view = TableView(bets={0: 300, 1: 0, 2: 0})  # the button bet 3 BB on screen
+        frame._consult(state, spot)
+        assert "ATTENZIONE" in frame.status_var.get() and "3 BB" in frame.status_var.get()
+    finally:
+        frame.destroy()
+        gc.collect()
+
+
+def test_each_bet_is_a_number_on_the_felt_in_front_of_its_chair(app):
+    from pokerlab.gui.spot_view import SpotFrame
+
+    frame = SpotFrame(app)
+    frame._consult = lambda state, spot: None
+    try:
+        seat(frame, 3, 6)  # chairs 0 (you, button), 3 (SB), 6 (BB)
+        frame._append(Action(ActionType.RAISE, 350))  # you raise to 3,5 BB
+
+        def shown(chair):
+            _chip, text = frame.bet_items[chair]
+            return frame.canvas.itemcget(text, "text") if frame.canvas.itemcget(text, "state") != "hidden" else ""
+
+        assert shown(0) == "3,5 BB" and shown(3) == "0,5 BB" and shown(6) == "1 BB"
+        assert shown(1) == ""  # nobody there: nothing drawn
+        _, _, x1, _ = frame.canvas.bbox(frame.bet_items[3][1])
+        assert x1 < frame.table_geom.center[0]  # chair 3 is on the left: its bet too
+    finally:
+        frame.destroy()
+        gc.collect()

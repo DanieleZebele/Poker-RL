@@ -44,7 +44,8 @@ CARD_ZONES = ((HOLE_CARDS, "Mie carte"), (BOARD, "Board"))
 # How many lines one wheel notch scrolls the sections.
 WHEEL_LINES = 3
 # How a seat state read off the screen is captioned in the preview.
-SEAT_STATE_TEXT = {"in_gioco": "in gioco", "fuori": "fuori", "sit_out": "sit-out", "libero": "libero"}
+SEAT_STATE_TEXT = {"in_gioco": "in gioco", "fuori": "fuori", "sit_out": "sit-out", "libero": "libero",
+                   "reazione": "reazione"}
 
 class CropLabeler(tk.Toplevel):
     """Say which cards a captured crop shows, left to right, then confirm.
@@ -905,6 +906,7 @@ class VisionFrame(ttk.Frame):
             SEAT_EMPTY,
             SEAT_IN_HAND,
             SEAT_OUT,
+            SEAT_REACTION,
             SEAT_SIT_OUT,
             save_player_label,
         )
@@ -932,7 +934,7 @@ class VisionFrame(ttk.Frame):
             self, shots=shots, title="Stato dei giocatori",
             question="Per ogni posto: com'è il giocatore?",
             options=[(SEAT_IN_HAND, "In gioco"), (SEAT_OUT, "Fuori"), (SEAT_SIT_OUT, "Sit-out"),
-                     (SEAT_EMPTY, "Libero")],
+                     (SEAT_EMPTY, "Libero"), (SEAT_REACTION, "Reazione")],
             write=save_player_label,
             defaults={zone: self.last_seat_states.get(seat) for seat, zone, _f, _p in shots},
             on_done=done,
@@ -1078,6 +1080,7 @@ class VisionFrame(ttk.Frame):
             from pokerlab.vision.seats import (
                 empty_backgrounds,
                 load_seats,
+                reaction_thumbnails,
                 read_seat,
                 sit_out_templates,
             )
@@ -1088,9 +1091,11 @@ class VisionFrame(ttk.Frame):
             labelled = load_seats()
             templates = sit_out_templates(labelled)
             backgrounds = empty_backgrounds(labelled)
+            reactions = reaction_thumbnails(labelled)
 
             def describe(seat, name, frame) -> str:
-                return SEAT_STATE_TEXT.get(read_seat(frame, seat, templates, backgrounds.get(name)).state, "")
+                state = read_seat(frame, seat, templates, backgrounds.get(name), reactions).state
+                return SEAT_STATE_TEXT.get(state, "")
         items = []
         for name, frame in sorted(frames.items(), key=lambda kv: int(kv[0].rsplit("_", 1)[1])):
             seat = int(name.rsplit("_", 1)[1])

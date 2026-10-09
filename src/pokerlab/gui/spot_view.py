@@ -17,8 +17,12 @@ engine reached rather than something this frame tracked.
 from __future__ import annotations
 
 import itertools
+import math
+import random
+import time
 import tkinter as tk
 from dataclasses import dataclass
+from pathlib import Path
 from tkinter import font as tkfont
 from tkinter import messagebox, ttk
 from types import SimpleNamespace
@@ -69,13 +73,31 @@ SCREEN_POLL_MS = 500
 # forgotten (one second at `SCREEN_POLL_MS`).
 EMPTY_READINGS_TO_FORGET = 2
 # How a seat state read off the screen is shown (`vision.labels.SEAT_STATES`).
-SEAT_STATE_LABELS = {"in_gioco": "in gioco", "fuori": "fold", "sit_out": "sit-out", "libero": "liberi"}
+SEAT_STATE_LABELS = {"in_gioco": "in gioco", "fuori": "fold", "sit_out": "sit-out", "libero": "liberi",
+                     "reazione": "reazioni"}
 # The states that put a seated player out of the hand: tagged on their chair, and taken
 # by `action_sync` as a fold when their turn comes. An empty seat ("libero") among them:
 # a player who vanishes mid-hand -- left the table, disconnected -- has folded as far as
 # the hand goes, and without it the rebuild waited on them for ever.
+# A new hand shows up twice: the button moves and your new cards come, often a reading
+# or two apart. The second sign within this many seconds of the first, of the other
+# kind, is the same hand starting, not another one (`_hand_boundary`).
+SAME_DEAL_SECONDS = 5.0
+# A scripted FOLD or ALL_IN the screen keeps contradicting for this many readings in a
+# row (the player still holds cards; still has chips behind) is taken out, with what
+# came after it, and the hand rebuilt from there (`_heal_script`). Not one: a stack is
+# updated a moment late, and a misread frame passes.
+HEAL_READINGS = 3
+# Every reading that changed something, written here for whoever has to find out why the
+# rebuild went wrong (only while the screen is read; `_log_reading`).
+SCREEN_LOG = Path("hand_histories") / "spot_screen.log"
+SCREEN_LOG_MAX_BYTES = 5_000_000
 SEAT_MARKS = {"fuori": "fold", "sit_out": "sit-out", "libero": "uscito"}
 OUT_OF_HAND = "#9e9e9e"
+# A chair's box, and the same box dark once its player is out of the hand.
+BOX_BG = "#f4f1ea"
+FOLDED_BG = "#3c3c3c"
+FOLDED_FG = "#e6e6e6"
 
 # The table at its smallest; `table_geometry` makes it fill the screen. The chairs
 # sit along its edges (`spot_table.chair_slot`), three a side, so it has to hold
@@ -104,6 +126,14 @@ STAT_LABELS = {
     "cbet": "Cbet", "fold_to_cbet": "FCbet", "wtsd": "WTSD",
 }
 STATS_PER_LINE = 3
+# Lines of the models' advice panel: the action drawn, every option of the first model
+# (two or three lines wrapped), then a line a model; the list of actions above it takes
+# the rest of the height.
+ADVICE_LINES = 12
+# The chairs in the middle of the top and bottom edges have room sideways and none
+# up and down (the felt is right there): their cards and actions go to the right of
+# the player's details instead of under them, or the box grew over the felt.
+WIDE_CHAIRS = (USER_CHAIR, 4)
 
 
 @dataclass(frozen=True)
@@ -134,6 +164,12 @@ FELT = "#1f6b3a"
 RAIL = "#5b3a1a"
 HIGHLIGHT = "#ffd43b"
 DEALER_BUTTON = "#f2c94c"
+# Each seat's bet on the felt: a dark chip with the amount, on the rail in the
+# direction of its chair.
+BET_CHIP_BG = "#1b1b1b"
+BET_CHIP_FG = "#ffd43b"
+# Where along the way from the centre to the rail the bets sit (1 = on the rail).
+BET_RADIUS = 0.97
 
 RANKS = "23456789TJQKA"
 SUITS = "shdc"
@@ -187,6 +223,20 @@ def _monitor_bounds(x: int, y: int, fallback: tuple[int, int, int, int]) -> tupl
 
 
 _raise_tags = itertools.count()
+
+
+def _paint_box(box: tk.Widget, *, folded: bool) -> None:
+    """A chair's box and everything in it but its buttons and fields, dark when its
+    player is out of the hand (FOLDED_BG, light text), in the usual colours otherwise."""
+    bg = FOLDED_BG if folded else BOX_BG
+    widgets = [box]
+    while widgets:
+        widget = widgets.pop()
+        widgets.extend(widget.winfo_children())
+        if widget.winfo_class() == "Frame":
+            widget.configure(bg=bg)
+        elif widget.winfo_class() == "Label":
+            widget.configure(bg=bg, fg=FOLDED_FG if folded else "black")
 
 
 def _raise_tag(holder: tk.Widget) -> str:
@@ -349,6 +399,11 @@ class SpotFrame(ttk.Frame):
         # Tournaments: what everyone pays before the blinds, in BB. Read off the
         # screen at every preflop reading (`_read_ante`), or typed.
         self.ante_var = tk.StringVar(value="0")
+        # On: the models are always shown every opponent as never seen before (no
+        # statistics), as if each hand were against new players. The statistics are
+        # still kept and shown; only what the policy reads changes. Kept on the app, so
+        # the screen reopens with it.
+        self.fresh_opponents_var = tk.BooleanVar(value=getattr(master, "spot_fresh_opponents", False))
         self.sb_var = tk.StringVar(value=str(ENGINE_SMALL_BLIND))
         self.bb_var = tk.StringVar(value=str(ENGINE_BIG_BLIND))
         self.name_vars = [
@@ -368,6 +423,13 @@ class SpotFrame(ttk.Frame):
         self._seat_states: dict[int, str] = {}  # chair -> state, from the last reading
         self._seating_read = False  # whether the seats have been taken off the screen yet
         self._sync_note = ""  # what the last action rebuild did, for the status line
+        self._last_view = None  # the last reading as `action_sync` saw it (engine seats, chips)
+        # Chairs whose starting stack this hand was read off the screen (`_apply_stacks`):
+        # only their stacks on screen are evidence of chips put in.
+        self._stacks_from_screen: set[int] = set()
+        # The script's length when your countdown bar was seen while the engine waited on
+        # you: that decision's bar has been seen, so its going away is your action.
+        self._my_turn_mark: int | None = None
         self._screen_stacks: dict[int, float] = {}  # chair -> stack read now, in BB
         self._screen_job: str | None = None
         # What the players at the table have done over the hands seen on the screen, read by
@@ -378,6 +440,16 @@ class SpotFrame(ttk.Frame):
         # on the screen: see `_note_players_leaving`.
         self._empty_readings: dict[int, int] = {}
         self._left_chairs: set[int] = set()
+        # Scripted actions the screen contradicts, and for how many readings in a row
+        # (`_heal_script`).
+        self._contradicted: dict[tuple, int] = {}
+        # The action drawn for the decision being advised (`_sampled_action`), and which one.
+        self._rng = random.Random()
+        self._draw = None
+        self._draw_key = None
+        # The signs of the last new hand seen ("dealer", "hole") and when the first came.
+        self._boundary_signs: set[str] = set()
+        self._boundary_time = float("-inf")
 
         self._build()
         self.refresh()
@@ -403,6 +475,10 @@ class SpotFrame(ttk.Frame):
         ttk.Button(top, text="Annulla ultima azione", command=self._undo).pack(side="left", padx=3)
         ttk.Button(top, text="Azzera azioni", command=self._clear).pack(side="left", padx=3)
         ttk.Button(top, text="Azzera statistiche", command=self.reset_stats).pack(side="left", padx=3)
+        ttk.Checkbutton(
+            top, text="Policy: avversari sempre nuovi (statistiche azzerate)",
+            variable=self.fresh_opponents_var, command=self._fresh_opponents_toggled,
+        ).pack(side="left", padx=6)
         ttk.Button(top, text="Torna al menu", command=self.app.show_setup).pack(side="right")
 
         main = ttk.Frame(self)
@@ -424,16 +500,24 @@ class SpotFrame(ttk.Frame):
         self.situation.pack(anchor="w", pady=(2, 4))
         ttk.Label(side, textvariable=self.screen_var, foreground="#555555", wraplength=300,
                   justify="left").pack(anchor="w", pady=(0, 4))
-        ttk.Label(side, text="Azioni").pack(anchor="w")
-        self.log = tk.Text(side, height=8, width=36, state="disabled")
-        self.log.pack(fill="x")
+        # The models' advice keeps a fixed height at the bottom (packed first, from the
+        # bottom, so a short window squeezes the actions, not it); the list of actions
+        # takes every line left above it, and always shows its last ones (`_write_log`).
         advisors = ttk.LabelFrame(side, text=f"Consiglio dei top {DEFAULT_ADVISORS}", padding=6)
-        advisors.pack(fill="both", expand=True, pady=(8, 0))
+        advisors.pack(side="bottom", fill="x", pady=(8, 0))
         # No "ask" button: the models answer by
         # themselves whenever it is your turn with both your cards known.
         ttk.Label(advisors, textvariable=self.status_var, wraplength=300).pack(anchor="w", pady=2)
-        self.advice = tk.Text(advisors, width=36, state="disabled", wrap="word")
-        self.advice.pack(fill="both", expand=True)
+        self.advice = tk.Text(advisors, width=36, height=ADVICE_LINES, state="disabled", wrap="word")
+        self.advice.pack(fill="x")
+        ttk.Label(side, text="Azioni").pack(anchor="w")
+        log_box = ttk.Frame(side)
+        log_box.pack(fill="both", expand=True)
+        log_scroll = ttk.Scrollbar(log_box, orient="vertical")
+        log_scroll.pack(side="right", fill="y")
+        self.log = tk.Text(log_box, height=8, width=34, state="disabled", yscrollcommand=log_scroll.set)
+        self.log.pack(side="left", fill="both", expand=True)
+        log_scroll.configure(command=self.log.yview)
 
     def _draw_table(self) -> None:
         cx, cy = self.table_geom.center
@@ -454,6 +538,38 @@ class SpotFrame(ttk.Frame):
         self.street_item = self.canvas.create_text(
             cx, cy + 52, text="", fill="white", font=("TkDefaultFont", 11)
         )
+        # Every chair's bet, drawn on the rail facing it (`_show_bets`).
+        self.bet_items: dict[int, tuple[int, int]] = {}
+        for chair in range(CHAIRS):
+            x, y = self._bet_position(chair)
+            chip = self.canvas.create_rectangle(x, y, x, y, fill=BET_CHIP_BG, outline=BET_CHIP_FG,
+                                                width=2, state="hidden")
+            text = self.canvas.create_text(x, y, text="", fill=BET_CHIP_FG,
+                                           font=("TkDefaultFont", 12, "bold"), state="hidden")
+            self.bet_items[chair] = (chip, text)
+
+    def _bet_position(self, chair: int) -> tuple[float, float]:
+        """On the rail, in the direction of the chair's box from the centre of the felt."""
+        cx, cy = self.table_geom.center
+        a, b = self.table_geom.table_radii
+        x, y, _anchor = chair_slot(chair, self.table_geom.canvas, CANVAS_MARGIN)
+        angle = math.atan2((y - cy) / b, (x - cx) / a)
+        return cx + BET_RADIUS * a * math.cos(angle), cy + BET_RADIUS * b * math.sin(angle)
+
+    def _show_bets(self, bets: dict[int, int]) -> None:
+        """Each chair's chips in front this street (`bets` by chair, in chips), as a
+        number on the felt; nothing for a chair with none."""
+        for chair, (chip, text) in self.bet_items.items():
+            amount = bets.get(chair, 0)
+            if amount <= 0:
+                self.canvas.itemconfigure(chip, state="hidden")
+                self.canvas.itemconfigure(text, state="hidden", text="")
+                continue
+            self.canvas.itemconfigure(text, text=self._bb(amount), state="normal")
+            x0, y0, x1, y1 = self.canvas.bbox(text)
+            self.canvas.coords(chip, x0 - 6, y0 - 3, x1 + 6, y1 + 3)
+            self.canvas.itemconfigure(chip, state="normal")
+            self.canvas.tag_raise(text, chip)
 
     def _build_chair(self, chair: int) -> None:
         x, y, anchor = chair_slot(chair, self.table_geom.canvas, CANVAS_MARGIN)
@@ -467,7 +583,16 @@ class SpotFrame(ttk.Frame):
         )
         box = tk.Frame(holder, bd=2, relief="ridge", bg="#f4f1ea", highlightthickness=3,
                        highlightbackground="#f4f1ea")
-        head = tk.Frame(box, bg="#f4f1ea")
+        if chair in WIDE_CHAIRS:
+            columns = tk.Frame(box, bg="#f4f1ea")
+            columns.pack(fill="x")
+            details = tk.Frame(columns, bg="#f4f1ea")
+            details.pack(side="left", anchor="n")
+            play = tk.Frame(columns, bg="#f4f1ea")
+            play.pack(side="left", anchor="n", padx=(6, 0))
+        else:
+            details = play = box
+        head = tk.Frame(details, bg="#f4f1ea")
         head.pack(fill="x")
         tk.Entry(head, textvariable=self.name_vars[chair], width=10).pack(side="left")
         dealer = tk.Button(head, text="D", width=2, command=lambda c=chair: self.set_dealer(c))
@@ -476,7 +601,7 @@ class SpotFrame(ttk.Frame):
             tk.Button(head, text="x", width=2, command=lambda c=chair: self.remove_player(c)).pack(
                 side="left"
             )
-        row = tk.Frame(box, bg="#f4f1ea")
+        row = tk.Frame(details, bg="#f4f1ea")
         row.pack(fill="x", pady=1)
         # The stack this hand *started* with: the engine takes every bet off it
         # itself, which is why it is not rewritten from the screen mid-hand. What
@@ -488,10 +613,10 @@ class SpotFrame(ttk.Frame):
         # action buttons under the mouse whenever one entry is clicked after
         # another, and the click on the second would be lost.
         entry.bind("<Return>", lambda _e: self.refresh())
-        info = tk.Label(box, text="", bg="#f4f1ea", justify="left", font=("TkDefaultFont", 9))
+        info = tk.Label(details, text="", bg="#f4f1ea", justify="left", font=("TkDefaultFont", 9))
         info.pack(fill="x")
         if chair == USER_CHAIR:
-            cards = tk.Frame(box, bg="#f4f1ea")
+            cards = tk.Frame(play, bg="#f4f1ea")
             cards.pack(pady=2)
             for slot in range(2):
                 button = tk.Button(
@@ -500,7 +625,7 @@ class SpotFrame(ttk.Frame):
                 )
                 button.pack(side="left", padx=2)
                 self.hole_buttons.append(button)
-        actions = tk.Frame(box, bg="#f4f1ea")
+        actions = tk.Frame(play, bg="#f4f1ea")
         actions.pack(fill="x")
         self.chair_ui[chair] = SimpleNamespace(
             plus=plus, box=box, dealer=dealer, info=info, actions=actions, holder=holder
@@ -620,7 +745,7 @@ class SpotFrame(ttk.Frame):
             text = self.stack_vars[chair].get().strip()
             stacks[seat] = self._chips(self.stack_vars[chair], "Stack") if text else default
         hole = tuple(self.hole) if all(card is not None for card in self.hole) else None
-        seat_stats = self.stats.vectors(
+        seat_stats = {} if self.fresh_opponents_var.get() else self.stats.vectors(
             {seat: self._stats_id(chair) for seat, chair in enumerate(self.layout.order())}
         )
         return Spot(
@@ -636,6 +761,10 @@ class SpotFrame(ttk.Frame):
             stacks=stacks,
             seat_stats=seat_stats,
         )
+
+    def _fresh_opponents_toggled(self) -> None:
+        self.app.spot_fresh_opponents = self.fresh_opponents_var.get()
+        self.refresh()
 
     @staticmethod
     def _stats_id(chair: int) -> str:
@@ -697,20 +826,51 @@ class SpotFrame(ttk.Frame):
             player_ids=ids,
         )
 
+    def _hand_boundary(self, change, now: float) -> bool:
+        """Whether this reading ends the hand the screen was showing.
+
+        A deal is announced by two signs, the button moving and your new cards, and they
+        often land in different readings. Recorded at each, every real hand counted twice:
+        the second time as whatever `action_sync` had made of the new deal in between (the
+        players read "out" before their cards arrive, so folds). So the other sign within
+        `SAME_DEAL_SECONDS` of the first is the same deal: it clears the actions, as before,
+        but records nothing. The same sign again, or after that, is a new hand."""
+        signs = {"dealer"} if change.dealer is not None else set()
+        if change.new_hand:
+            signs.add("hole")
+        if not signs:
+            return False
+        if now - self._boundary_time <= SAME_DEAL_SECONDS and not signs & self._boundary_signs:
+            self._boundary_signs |= signs
+            return False
+        self._boundary_signs, self._boundary_time = signs, now
+        return True
+
     def _board_reached(self, records) -> int:
         """How many board cards the hand had: the board last read, or what the streets of the
         recorded actions imply if the screen had already cleared it by the next deal."""
         by_street = {Street.FLOP: 3, Street.TURN: 4, Street.RIVER: 5}
         return max([len(self.board), *(by_street.get(record.street, 0) for record in records)])
 
+    def _show_stats(self) -> None:
+        """Every seated player's statistics under their chair, yours included, whatever
+        state the spot is in: added at the end of every refresh, so they stay on screen
+        when the rebuilt hand is over or the table is not playable, which used to leave
+        them out."""
+        for chair in self.layout.chairs:
+            info = self.chair_ui[chair].info
+            text = info.cget("text")
+            stats = self._stats_text(chair)
+            info.configure(text=f"{text}\n{stats}" if text else stats)
+
     def _stats_text(self, chair: int) -> str:
-        """Every statistic of the player on this chair, once they have been seen: the rate
-        and, in brackets, the chances it is counted over -- 50% of 2 and 50% of 200 are
-        not the same fact. "-" for a statistic with no chance yet."""
+        """Every statistic of the player on this chair: the rate and, in brackets, the
+        chances it is counted over -- 50% of 2 and 50% of 200 are not the same fact. "-"
+        for a statistic with no chance yet; a line saying so before the first hand."""
         player = self._stats_id(chair)
         hands = self.stats.hands(player)
         if not hands:
-            return ""
+            return "statistiche: nessuna mano registrata"
         rates = self.stats.rates(player)
         cells = []
         for name, label in STAT_LABELS.items():
@@ -731,6 +891,7 @@ class SpotFrame(ttk.Frame):
             if self.state is not None and not self.state.finished and self.state.to_act is not None:
                 # Whoever acts goes in front, so their actions are never hidden.
                 self.chair_ui[self.layout.chair_of(self.state.to_act)].holder.lift()
+            self._show_stats()
             self._mark_seat_states()
             self._fit_canvas()
 
@@ -802,6 +963,7 @@ class SpotFrame(ttk.Frame):
             else:
                 ui.plus.pack()
             ui.box.configure(highlightbackground="#f4f1ea")
+            _paint_box(ui.box, folded=False)
             ui.info.configure(text="")
             for widget in ui.actions.winfo_children():
                 widget.destroy()
@@ -813,6 +975,7 @@ class SpotFrame(ttk.Frame):
         self.warning.configure(text="")
         self.canvas.itemconfigure(self.pot_item, text="")
         self.canvas.itemconfigure(self.street_item, text="")
+        self._show_bets({})
         try:
             spot = self.build_spot()
             self.state = replay(spot)
@@ -857,6 +1020,7 @@ class SpotFrame(ttk.Frame):
         )
         self.canvas.itemconfigure(self.pot_item, text=f"Piatto {self._bb(state.pot)}")
         self.canvas.itemconfigure(self.street_item, text=state.street.name.lower())
+        self._show_bets({self.layout.chair_of(seat): chips for seat, chips in state.bets.items()})
         self.chair_ui[turn_chair].box.configure(highlightbackground=HIGHLIGHT)
         folded = {
             info.seat for info in state.observation.seats if info.status is PlayerStatus.FOLDED
@@ -874,8 +1038,6 @@ class SpotFrame(ttk.Frame):
                     # The screen disagrees with what the rebuilt actions leave:
                     # a missed or misread action, worth a look.
                     text += f"  ≠ schermo {self._bb(round(shown * self._big_blind()))}"
-            if seat != spot.my_seat and (stats := self._stats_text(chair)):
-                text += f"\n{stats}"
             self.chair_ui[chair].info.configure(text=text)
         if len(state.board) > len(spot.board):
             self.warning.configure(
@@ -976,6 +1138,7 @@ class SpotFrame(ttk.Frame):
         self._empty_readings = {}
         self._seating_read = False
         self._screen_stacks = {}
+        self._stacks_from_screen = set()
         self.refresh()
         return True
 
@@ -1015,16 +1178,15 @@ class SpotFrame(ttk.Frame):
         seating a player there if the chair was empty -- the button is always in
         front of someone -- and, being a new hand too, clears the actions.
         Returns whether anything was applied."""
-        import time
-
         from pokerlab.gui.screen_reader import diff_reading
         from pokerlab.vision.labels import SEAT_EMPTY
 
         change = diff_reading(self._last_reading, reading, self._last_hand, self._last_dealer)
         self._last_reading = reading
-        if change.new_hand or change.dealer is not None:
+        if self._hand_boundary(change, time.monotonic()):
             # The hand on the screen is over: count it while the seating still describes it.
             self._record_finished_hand()
+            self._my_turn_mark = None  # a bar seen in the last hand says nothing about this one
             # ... and then forget whoever left during it, or the hand they played would be
             # the first one of the player sitting there next.
             for chair in self._left_chairs:
@@ -1087,19 +1249,29 @@ class SpotFrame(ttk.Frame):
         )
         if change.any or synced or stacks_moved or ante_changed:
             self.refresh()
+        self._log_reading(reading, change.any or synced or ante_changed)
         return change.any or synced or ante_changed
 
     def _table_view(self, reading):
         """The reading in the engine's seat numbers and chips, for `action_sync`."""
         from pokerlab.gui.action_sync import TableView
+        from pokerlab.vision.labels import SEAT_IN_HAND
 
         try:
             big_blind = int(self.bb_var.get())
         except ValueError:
             return None
         view = TableView(
-            board_cards=None if reading.board is None else len(reading.board), my_turn=reading.my_turn
+            board_cards=None if reading.board is None else len(reading.board), my_turn=reading.my_turn,
+            tolerance=max(1, round(0.05 * big_blind)),  # half of the 0,1 BB the screen writes
         )
+        for client_seat, amount in (reading.stacks or {}).items():
+            chair = chair_for_client_seat(self.table_size, client_seat)
+            # Only a chair whose starting stack this hand came from the screen: against a
+            # default 100 BB, a stack read later would "drop" by a bet nobody made.
+            # 0 is left out too: an empty zone and an all-in look the same.
+            if chair in self._stacks_from_screen and chair in self.layout.chairs and amount > 0:
+                view.stacks[self.layout.seat_of(chair)] = round(amount * big_blind)
         for client_seat, amount in (reading.bets or {}).items():
             chair = chair_for_client_seat(self.table_size, client_seat)
             if chair in self.layout.chairs:
@@ -1108,6 +1280,8 @@ class SpotFrame(ttk.Frame):
             chair = chair_for_client_seat(self.table_size, client_seat)
             if chair in self.layout.chairs and state in SEAT_MARKS:
                 view.out.add(self.layout.seat_of(chair))
+            elif chair in self.layout.chairs and state == SEAT_IN_HAND:
+                view.in_hand.add(self.layout.seat_of(chair))
         return view
 
     def _sync_actions(self, reading) -> bool:
@@ -1117,18 +1291,24 @@ class SpotFrame(ttk.Frame):
         from pokerlab.gui.action_sync import sync_actions
 
         self._sync_note = ""
+        self._last_view = None
         if reading.bets is None and not reading.my_turn:
             return False  # neither amounts nor your timer read: nothing to go on
         view = self._table_view(reading)
         if view is None:
             return False
+        view.my_turn_seen = self._my_turn_mark == len(self.script)
+        self._last_view = view
         try:
+            healed = self._heal_script(view)
             spot = self.build_spot()
             synced, result = sync_actions(spot, view)
         except ValueError:
             return False  # the table is not playable yet (one player, say)
         if result.actions:
             self.script = list(synced.script)
+        if result.waiting_for == synced.my_seat and reading.my_turn:
+            self._my_turn_mark = len(self.script)
         names = position_names(synced.num_players)
         added = ", ".join(
             f"{names[seat]} {describe_action(action, None, synced.big_blind)}"
@@ -1136,9 +1316,66 @@ class SpotFrame(ttk.Frame):
         )
         waiting = "" if result.waiting_for is None else f"tocca a {names[result.waiting_for]}"
         parts = [p for p in (f"+ {added}" if added else "", waiting) if p]
+        if result.waiting_for is None:
+            parts.append(result.note)  # "mano conclusa": said, not left blank
+        if healed:
+            parts.insert(0, healed)
         self._sync_note = f" | azioni: {'; '.join(parts)}" if parts else ""
         self._sync_note += self._pot_check(synced, reading, view)
-        return bool(result.actions)
+        return bool(result.actions) or bool(healed)
+
+    def _heal_script(self, view) -> str:
+        """Take back a FOLD or an ALL_IN the screen has kept contradicting for
+        `HEAL_READINGS` readings in a row, with every action after it; what it says, or "".
+
+        An action is never taken back otherwise, so one wrong fold (a player read "out" for
+        a frame) or a wrong all-in (a starting stack read short) ended the rebuilt hand, or
+        changed it, while the real one went on: nobody lit up, your turn was not seen, and
+        the screen waited for the next deal. The proof against a FOLD is the player still
+        holding cards (`TableView.in_hand`); against an ALL_IN, chips still behind on
+        screen. The next rebuild (`action_sync`) puts back whatever the screen does prove."""
+        state = replay(self.build_spot())
+        now: dict[tuple, str] = {}
+        for index, (seat, action) in enumerate(state.taken[: len(self.script)]):
+            if action.action_type is ActionType.FOLD and seat in view.in_hand:
+                now[(index, seat, action)] = "ha ancora le carte"
+            elif action.action_type is ActionType.ALL_IN and view.stacks.get(seat, 0) > view.tolerance:
+                now[(index, seat, action)] = "ha ancora chips"
+        self._contradicted = {key: self._contradicted.get(key, 0) + 1 for key in now}
+        due = sorted(key for key, count in self._contradicted.items() if count >= HEAL_READINGS)
+        if not due:
+            return ""
+        index, seat, action = due[0]
+        self.script = self.script[:index]
+        self._contradicted = {}
+        name = position_names(len(state.stacks))[seat]
+        return f"tolto {name} {describe_action(action, None, self._big_blind())} ({now[due[0]]})"
+
+    def _log_reading(self, reading, changed: bool) -> None:
+        """One line per reading that changed something, in `SCREEN_LOG`: what was read and
+        what the rebuild made of it. Never lets a failure to write stop the reading."""
+        if not changed or self._reader is None:
+            return
+        try:
+            SCREEN_LOG.parent.mkdir(parents=True, exist_ok=True)
+            if SCREEN_LOG.exists() and SCREEN_LOG.stat().st_size > SCREEN_LOG_MAX_BYTES:
+                SCREEN_LOG.replace(SCREEN_LOG.with_suffix(".log.1"))
+            script = " ".join(
+                f"{a.action_type.name.lower()}{'' if not a.amount else a.amount}" for a in self.script
+            )
+            state = self.state
+            where = ("-" if state is None else "finita" if state.finished
+                     else f"tocca seat {state.to_act} {state.street.name.lower()}")
+            line = (
+                f"{time.strftime('%H:%M:%S')} hole={reading.hole} board={reading.board} "
+                f"dealer={reading.dealer} seats={reading.seats} bets={reading.bets} "
+                f"stacks={reading.stacks} pot={reading.pot} my_turn={reading.my_turn} "
+                f"| script[{len(self.script)}]={script} | {where}{self._sync_note}\n"
+            )
+            with SCREEN_LOG.open("a", encoding="utf-8") as out:
+                out.write(line)
+        except OSError:
+            pass
 
     def _pot_check(self, spot, reading, view) -> str:
         """A warning when the pot the actions add up to is not the one shown:
@@ -1247,6 +1484,7 @@ class SpotFrame(ttk.Frame):
         when a changed starting stack would rewrite a hand already rebuilt. A
         seat whose stack was not read keeps the one it had."""
 
+        self._stacks_from_screen = set()
         if not reading.stacks:
             return
         try:
@@ -1259,14 +1497,23 @@ class SpotFrame(ttk.Frame):
                 in_front = (reading.bets or {}).get(client_seat, 0.0)
                 chips = round((stack + in_front) * ENGINE_BIG_BLIND) + ante
                 self.stack_vars[chair].set(bb_number(chips, ENGINE_BIG_BLIND))
+                self._stacks_from_screen.add(chair)
 
     def _mark_seat_states(self) -> None:
-        """Grey out and tag the seated players the screen shows as out of the
-        hand ("fold"), sitting out, or gone ("uscito") -- information only: the FOLD
-        goes into the actions when their turn comes (`action_sync`), not here."""
+        """Darken the box of every player out of the hand: folded in the rebuilt hand,
+        or shown by the screen as out ("fold"), sitting out, or gone ("uscito"), which
+        is also tagged -- information only: the FOLD goes into the actions when their
+        turn comes (`action_sync`), not here."""
         acting = None
         if self.state is not None and not self.state.finished and self.state.to_act is not None:
             acting = self.layout.chair_of(self.state.to_act)
+        if self.state is not None:
+            order = self.layout.order()
+            for seat, action in self.state.taken:
+                if action.action_type is ActionType.FOLD and seat < len(order):
+                    box = self.chair_ui[order[seat]].box
+                    box.configure(highlightbackground=OUT_OF_HAND)
+                    _paint_box(box, folded=True)
         for chair, state in self._seat_states.items():
             if chair not in self.layout.chairs or state not in SEAT_MARKS or chair == acting:
                 continue
@@ -1274,6 +1521,7 @@ class SpotFrame(ttk.Frame):
             text = ui.info.cget("text")
             ui.info.configure(text=f"{text} · {SEAT_MARKS[state]}" if text else SEAT_MARKS[state])
             ui.box.configure(highlightbackground=OUT_OF_HAND)
+            _paint_box(ui.box, folded=True)
 
     def destroy(self) -> None:
         if self._screen_job is not None:
@@ -1300,6 +1548,7 @@ class SpotFrame(ttk.Frame):
             name = self._player_name(self.layout.chair_of(seat))
             lines.append(f"{number}. {name} ({names[seat]}): {describe_action(action, None, self._big_blind())}")
         self._write(self.log, "\n".join(lines))
+        self.log.see("end")  # the latest actions always in view
 
     @staticmethod
     def _write(widget: tk.Text, text: str, bold_lines: tuple[int, ...] = ()) -> None:
@@ -1336,28 +1585,71 @@ class SpotFrame(ttk.Frame):
         except Exception as exc:  # noqa: BLE001 - shown, not fatal
             self.status_var.set(f"Errore: {exc}")
             return
-        self.status_var.set(f"{len(advice)} modelli consultati.")
+        missing = self._bets_not_rebuilt(state)
+        self.status_var.set(
+            f"ATTENZIONE: {missing}: il consiglio è per una mano diversa da quella sullo schermo."
+            if missing else f"{len(advice)} modelli consultati."
+        )
         lines = []
         bold_lines: tuple[int, ...] = ()
+        if advice:
+            # The action to take, alone and in capitals, in bold on the first line: drawn
+            # from the best-rated model's probabilities, as it would play at a table, not
+            # its likeliest action. `upper`, never `capitalize`, which lowercases "BB".
+            chosen = self._sampled_action(advice[0], spot)
+            lines += [describe_action(chosen.action, state.observation, spot.big_blind).upper(), ""]
+            bold_lines = (1,)
         for index, item in enumerate(advice, start=1):
-            if not lines:
-                # The best-rated model's likeliest action, on the line after its name.
-                bold_lines = (2,)
             # The model by its place in the global ranking (#1 is the best-rated), not by
             # its long label, which only took room.
             rank = self._model_ranks.get(item.label, index)
+            # One line a model, its likeliest action; every option only for the first, the
+            # one the action is drawn from -- all five in full did not fit the panel.
             lines.append(
-                f"#{rank}  (elo {item.rating:.0f})\n"
-                f"  -> {describe_action(item.best.action, state.observation, spot.big_blind)}"
-                f"  {item.best.probability:.0%}"
+                f"#{rank} (elo {item.rating:.0f}) -> "
+                f"{describe_action(item.best.action, state.observation, spot.big_blind)}"
+                f" {item.best.probability:.0%}"
             )
+            if index > 1:
+                continue
+            # Every option as the action it is in this hand ("check", "bet 2,25 BB", "raise a
+            # 6 BB"), not the bin's generic name ("check/call", "50% pot"), which does not
+            # say whether it is a check or a call, a bet or a raise.
             lines.append(
                 "     "
                 + ", ".join(
-                    f"{b.label} {b.probability:.0%}" for b in item.bins if b.probability >= 0.01
+                    f"{describe_action(b.action, state.observation, spot.big_blind)} {b.probability:.0%}"
+                    for b in item.bins if b.probability >= 0.01
                 )
             )
         self._write(self.advice, "\n".join(lines), bold_lines)
+
+    def _sampled_action(self, item, spot: Spot):
+        """One of the model's bins drawn by its probabilities, once per decision: the advice
+        is rewritten at every reading, and a new draw each time would flicker between
+        actions. A decision is the hand and the actions so far; a new one draws again."""
+        key = (item.label, spot.hole_cards, tuple(spot.board), tuple(spot.script), spot.my_seat)
+        if self._draw_key != key or self._draw is None:
+            options = [b for b in item.bins if b.legal and b.probability > 0] or [item.best]
+            self._draw = self._rng.choices(options, weights=[b.probability for b in options])[0]
+            self._draw_key = key
+        return self._draw
+
+    def _bets_not_rebuilt(self, state: SpotState) -> str:
+        """The bets the screen shows in front of players that the rebuilt hand does not
+        have, as text, or "" when they agree. The advice is asked of the engine's hand: a
+        bet missing from it turns a call into a check and a raise into a bet."""
+        view = self._last_view
+        if view is None or state.observation is None:
+            return ""
+        names = position_names(len(state.stacks))
+        big_blind = self._big_blind()
+        missing = [
+            f"{names[seat]} ha {self._bb(chips)} davanti"
+            for seat, chips in sorted(view.bets.items())
+            if chips > state.bets.get(seat, 0) + big_blind // 100  # a chip of rounding
+        ]
+        return "; ".join(missing)
 
     def _load_models(self) -> bool:
         if self.models is not None:

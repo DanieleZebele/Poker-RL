@@ -305,7 +305,7 @@ class _FixedStats:
         return None
 
 
-def _table(spot: Spot, replayer: "_Replayer") -> Table:
+def _table(spot: Spot, replayer: _Replayer) -> Table:
     """One shared Replayer in every seat: it is the engine that decides whose turn it is, so
     the script is consumed in the engine's own order and a caller cannot describe a sequence
     out of turn."""
