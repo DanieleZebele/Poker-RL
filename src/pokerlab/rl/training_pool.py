@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import argparse
 import random
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 from pokerlab.rl.pool_registry import (
@@ -167,9 +167,12 @@ def pick_parents(
     *,
     rng: random.Random,
     tiers: Sequence[int | None] = PARENT_TIERS,
+    accept: Callable[[str], bool] | None = None,
 ) -> list[str]:
     """`count` distinct parents to inherit weights from; cycling only if there are
-    fewer rated models than `count`.
+    fewer rated models than `count`. With `accept`, only the models it accepts are in the
+    ranking at all, so the bands (top 10, 100, ...) are those of the accepted models. The frozen benchmark anchors are eligible like any
+    other rated model: pinning a rating says nothing against training from the weights.
 
     Every parent first draws a band of the ranking (the top 10, 100, 1000 or all
     rated models, equally likely) and then a model uniformly inside it, so the
@@ -181,10 +184,10 @@ def pick_parents(
     if count <= 0:
         return []
     rated = sorted(
-        (m for m in (_known(label, ranking) for label in labels) if m.games > 0 and not m.frozen),
+        (m for m in (_known(label, ranking) for label in labels) if m.games > 0),
         key=lambda m: (-m.rating, m.label),
     )
-    ranked = [m.label for m in rated]
+    ranked = [m.label for m in rated if accept is None or accept(m.label)]
     if not ranked or not tiers:
         return []
     picked: list[str] = []

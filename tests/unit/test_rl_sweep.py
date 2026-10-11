@@ -24,7 +24,6 @@ from pokerlab.rl.sweep_log import (
 )
 from pokerlab.rl.sweep_optimizer import (
     MIN_FIT,
-    SEED_STEP,
     build_policy,
     fit_estimate,
     log_step,
@@ -136,11 +135,6 @@ def test_a_step_is_the_log_ratio_and_a_lambda_step_is_taken_on_its_complement():
     assert log_step("lr", 1e-3, 1.2e-3, COMPLEMENT) == pytest.approx(math.log(1.2))
     # 0.95 -> 0.94 is a x1.2 step in 1 - lambda (0.05 -> 0.06), not a 1% one.
     assert log_step("gae_lambda", 0.95, 0.94, COMPLEMENT) == pytest.approx(math.log(1.2))
-
-
-def test_a_move_off_zero_has_a_finite_recorded_step():
-    assert log_step("entropy_coef", 0.0, 1e-3, frozenset()) == SEED_STEP
-    assert log_step("entropy_coef", 0.0, 0.0, frozenset()) == 0.0
 
 
 # ---- the estimate ------------------------------------------------------------
@@ -327,7 +321,7 @@ def test_the_plan_with_a_policy_still_has_every_axis_and_every_worker():
         Namespace(
             lr=3e-4, hands=512, opponent_probability=0.5, ppo_epochs=4, clip_epsilon=0.2,
             pool_top_share=0.5, pool_top_n=100, minibatch_size=1024, gae_lambda=0.95,
-            value_coef=0.5, policy_max_grad_norm=0.5, critic_max_grad_norm=1.0, entropy_coef=0.0,
+            value_coef=0.5, policy_max_grad_norm=0.5, critic_max_grad_norm=1.0,
         )
     )
     plan = hyperparameter_plan(5, [None] * 5, start, rng=random.Random(1), policy=policy)

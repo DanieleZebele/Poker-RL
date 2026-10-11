@@ -34,6 +34,7 @@ from pokerlab.rl.ppo import (
     build_batch,
     build_model_from_checkpoint,
     critic_weights,
+    entropy_coefficient_at,
     load_checkpoint,
     ppo_update,
     save_checkpoint,
@@ -42,6 +43,7 @@ from pokerlab.rl.rollout import HandTrajectory
 from pokerlab.rl.train import (
     SelfPlayTrainer,
     TrainConfig,
+    entropy_settings,
     registry_opponents,
 )
 
@@ -864,7 +866,7 @@ def _train_args(**overrides):
         "hp_arm": "sampled", "parent_label": "", "hidden": 512, "num_layers": 3, "head_hidden": 256, "head_layers": 1, "machine": "host-a", "seed": 7, "resume": False,
         "iterations": 1000, "hands": 512, "table_weights": [25.0, 20.0, 15.0, 10.0, 10.0, 10.0, 5.0, 5.0],
         "stack_min_bb": 1.0, "stack_max_bb": 100.0, "sb": 50, "bb": 100,
-        "lr": 3e-4, "ppo_epochs": 4, "clip_epsilon": 0.2, "entropy_coef": 0.0,
+        "lr": 3e-4, "ppo_epochs": 4, "clip_epsilon": 0.2,
         "opponent_probability": 0.5,
         "minibatch_size": 1024, "gae_lambda": 0.95, "value_coef": 0.5, "policy_max_grad_norm": 0.5, "critic_max_grad_norm": 1.0,
         "pool_models": 20, "table_hands": 200, "concurrent_tables": 8, "pool_top_share": 0.5, "pool_top_n": 100,
@@ -937,7 +939,7 @@ def _fill_args(tmp_path, **overrides):
         "global_dir": tmp_path / "global",
         "global_root": tmp_path,
         "global_sample": 50,
-        "global_benchmark_sample": 5,
+        "global_benchmark_sample": 5, "session_workers": 1,
         "session_hands": 1000,
         "global_lock_seconds": 120,
         "k_schedule": "0:16, 100:2",
@@ -1154,3 +1156,199 @@ def test_a_validation_pass_plays_the_sizes_of_the_mixture(tmp_path):
     )
     assert math.isfinite(trainer.evaluate_against_pool(10, hands=5, seed=4))
     assert trainer.learner_games == 10
+
+
+def test_the_entropy_bonus_falls_geometrically_and_then_stays_at_the_final_value():
+    config = PPOConfig(entropy_coefficient=0.1, entropy_coefficient_final=0.0001,
+                       entropy_anneal_iterations=300)
+    assert entropy_coefficient_at(config, 1) == pytest.approx(0.1)
+    # Halfway in iterations is halfway in orders of magnitude, not in value.
+    assert entropy_coefficient_at(config, 151) == pytest.approx(math.sqrt(0.1 * 0.0001))
+    assert entropy_coefficient_at(config, 301) == pytest.approx(0.0001)
+    assert entropy_coefficient_at(config, 5000) == pytest.approx(0.0001)
+
+
+def test_without_annealing_the_entropy_bonus_is_the_constant():
+    config = PPOConfig(entropy_coefficient=0.02)
+    assert [entropy_coefficient_at(config, i) for i in (1, 50, 900)] == [0.02] * 3
+
+
+def test_annealing_the_entropy_bonus_needs_positive_ends():
+    for start, final in ((0.0, 0.001), (0.1, 0.0)):
+        with pytest.raises(ValueError):
+            PPOConfig(entropy_coefficient=start, entropy_coefficient_final=final,
+                      entropy_anneal_iterations=10)
+    with pytest.raises(ValueError):
+        PPOConfig(entropy_anneal_iterations=-1)
+
+
+def test_the_fleets_curve_replaces_the_workers_own_constant_when_annealing_is_on():
+    args = SimpleNamespace(entropy_anneal_iterations=0,
+                           entropy_anneal_start=0.1, entropy_anneal_final=0.0001)
+    # Without annealing the bonus is the final value, from the first update.
+    assert entropy_settings(args) == {"entropy_coefficient": 0.0001}
+    args.entropy_anneal_iterations = 400
+    assert PPOConfig(**entropy_settings(args)).entropy_coefficient == 0.1
+    assert entropy_settings(args)["entropy_coefficient_final"] == 0.0001
+
+
+def test_every_iteration_updates_with_that_iterations_entropy_bonus(monkeypatch):
+    import pokerlab.rl.train as train_module
+
+    seen = []
+    real = train_module.ppo_update
+    monkeypatch.setattr(
+        train_module, "ppo_update",
+        lambda model, optimizer, batch, config: (seen.append(config.entropy_coefficient),
+                                                 real(model, optimizer, batch, config))[1],
+    )
+    trainer = SelfPlayTrainer(
+        fixed_mix(3),
+        TrainConfig(hands_per_iteration=10),
+        PPOConfig(epochs=1, minibatch_size=64, entropy_coefficient=0.1,
+                  entropy_coefficient_final=0.001, entropy_anneal_iterations=2),
+        rng=random.Random(0),
+        **tiny_parts(hidden=32, num_layers=1),
+    )
+    for _ in range(4):
+        trainer.train_iteration()
+    assert seen == pytest.approx([0.1, math.sqrt(0.1 * 0.001), 0.001, 0.001])
+
+
+def test_a_training_iteration_with_forked_collectors_runs_and_updates_the_weights():
+    trainer = SelfPlayTrainer(
+        fixed_mix(3),
+        TrainConfig(hands_per_iteration=24, table_hands=8, collect_workers=2),
+        PPOConfig(epochs=1, minibatch_size=64),
+        rng=random.Random(0),
+        **tiny_parts(hidden=32, num_layers=1),
+    )
+    before = [p.detach().clone() for p in trainer.model.parameters()]
+    stats = trainer.train_iteration()
+    assert stats["decisions"] > 0 and math.isfinite(stats["policy_loss"])
+    assert any(not torch.equal(b, a) for b, a in zip(before, trainer.model.parameters()))
+
+
+def test_forked_collectors_need_the_cpu_and_at_least_one_worker():
+    with pytest.raises(ValueError, match="cpu"):
+        SelfPlayTrainer(fixed_mix(3), TrainConfig(collect_workers=2), device="cuda",
+                        **tiny_parts(hidden=32, num_layers=1))
+    with pytest.raises(ValueError, match="at least 1"):
+        SelfPlayTrainer(fixed_mix(3), TrainConfig(collect_workers=0),
+                        **tiny_parts(hidden=32, num_layers=1))
+
+
+def two_device_trainer(**kwargs):
+    # "cpu" and "cpu:0" are two devices to the trainer, which is what splits the network:
+    # the master that trains (cpu:0) and the copy that plays (cpu), with nothing but a CPU
+    # to run on. (Only the playing device is ever a `map_location`, which cpu:0 is not.)
+    return SelfPlayTrainer(
+        fixed_mix(3),
+        TrainConfig(hands_per_iteration=12, table_hands=6),
+        PPOConfig(epochs=1, minibatch_size=64),
+        device="cpu",
+        update_device="cpu:0",
+        rng=random.Random(0),
+        **tiny_parts(hidden=32, num_layers=1),
+        **kwargs,
+    )
+
+
+def test_with_two_devices_the_network_that_plays_is_a_copy_kept_in_step_with_the_trained_one():
+    trainer = two_device_trainer()
+    assert trainer.play_model is not trainer.model
+    same = lambda: all(
+        torch.equal(a, b)
+        for a, b in zip(trainer.model.state_dict().values(), trainer.play_model.state_dict().values())
+    )
+    assert same()
+    trainer.train_iteration()  # trains the master, then refreshes the copy
+    assert same()
+
+
+def test_on_one_device_the_network_that_plays_is_the_trained_one():
+    trainer = SelfPlayTrainer(fixed_mix(3), TrainConfig(hands_per_iteration=6),
+                              rng=random.Random(0), **tiny_parts(hidden=32, num_layers=1))
+    assert trainer.play_model is trainer.model
+
+
+def test_weights_loaded_into_the_trained_network_reach_the_one_that_plays_after_a_sync():
+    trainer = two_device_trainer()
+    with torch.no_grad():
+        for parameter in trainer.model.parameters():
+            parameter.add_(1.0)
+    stale = any(not torch.equal(a, b) for a, b in zip(trainer.model.parameters(), trainer.play_model.parameters()))
+    trainer.sync_play_model()
+    fresh = all(torch.equal(a, b) for a, b in zip(trainer.model.parameters(), trainer.play_model.parameters()))
+    assert stale and fresh
+
+
+def test_a_split_trainer_plays_its_rated_pass_with_the_copy_not_the_trained_network(tmp_path):
+    from pokerlab.rl.table_mix import TableMix
+
+    mix = TableMix(weights=(1, 1, 0, 0, 0, 0, 0, 0), stack_min_bb=5.0, stack_max_bb=50.0,
+                   small_blind=1, big_blind=2)
+    trainer = SelfPlayTrainer(
+        mix,
+        TrainConfig(hands_per_iteration=10),
+        device="cpu",
+        update_device="cpu:0",
+        registry=registry_with_models(tmp_path, 2),
+        **tiny_parts(hidden=32, num_layers=1),
+    )
+    assert trainer.play_model is not trainer.model
+    assert math.isfinite(trainer.evaluate_against_pool(2, hands=4, seed=2))
+
+
+def test_a_saved_checkpoint_holds_cpu_tensors(tmp_path):
+    trainer = two_device_trainer()
+    path = tmp_path / "m.pt"
+    save_checkpoint(path, trainer.model, iteration=0)
+    state = torch.load(path, map_location="cpu", weights_only=True)["model"]
+    assert all(t.device.type == "cpu" for t in state.values())
+
+
+def test_update_device_resolution():
+    from pokerlab.rl.device import resolve_update_device
+
+    assert resolve_update_device("same", "cpu") == "cpu"
+    assert resolve_update_device("cuda", "cpu") == "cuda"
+    assert resolve_update_device("auto", "cpu") in ("cpu", "cuda")
+
+
+def test_only_checkpoints_of_the_same_network_are_accepted_as_parents(tmp_path):
+    from pokerlab.rl.train import same_network_filter
+
+    wide = tiny_model(hidden=64, num_layers=2)
+    narrow = tiny_model(hidden=32, num_layers=1)
+    for name, model in (("wide", wide), ("narrow", narrow)):
+        save_checkpoint(tmp_path / f"{name}.pt", model, None, iteration=0)
+    (tmp_path / "broken.pt").write_bytes(b"not a checkpoint")
+
+    accepts = same_network_filter(wide.shape, wide.equity)
+
+    assert accepts(tmp_path / "wide.pt")
+    assert not accepts(tmp_path / "narrow.pt")  # another trunk
+    assert not accepts(tmp_path / "broken.pt")  # unreadable
+    assert not accepts(tmp_path / "missing.pt")
+    assert not same_network_filter(wide.shape, {**wide.equity, "hidden": 9999})(tmp_path / "wide.pt")
+
+
+def test_a_validation_pass_gives_the_same_result_whether_forked_copies_play_it_or_not(tmp_path):
+    from pokerlab.rl.table_mix import TableMix
+
+    mix = TableMix(weights=(1, 1, 1, 0, 0, 0, 0, 0), stack_min_bb=5.0, stack_max_bb=50.0,
+                   small_blind=1, big_blind=2)
+
+    def run(workers, name):
+        torch.manual_seed(0)
+        trainer = SelfPlayTrainer(
+            mix,
+            TrainConfig(hands_per_iteration=10, session_workers=workers),
+            registry=registry_with_models(tmp_path / name, 3),
+            **tiny_parts(hidden=32, num_layers=1),
+        )
+        rate = trainer.evaluate_against_pool(8, hands=6, seed=3)
+        return rate, trainer.learner_rating, trainer.learner_games
+
+    assert run(1, "serial") == run(3, "forked")

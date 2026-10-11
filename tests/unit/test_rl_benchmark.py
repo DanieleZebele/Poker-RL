@@ -292,3 +292,25 @@ def test_a_frozen_set_that_cannot_seat_the_largest_table_is_not_rated(tmp_path):
     )
 
     assert rated is None and skipped
+
+
+def test_forked_copies_rate_the_model_exactly_as_one_process_does(tmp_path):
+    """The sessions are decided and seeded before anyone plays, so who plays them changes
+    nothing: same chips, same rating, same style, session by session."""
+    import torch
+
+    game = fixed_mix(3)
+    make_series(tmp_path / "benchmark", series=3, per_series=2)
+
+    def run(workers):
+        torch.manual_seed(0)
+        return rate_against_benchmark(
+            tiny_model(hidden=32, num_layers=1), tmp_path / "benchmark", game, label="fresh",
+            rating=1500.0, sessions=8, hands=5, resident=4, rotate_every=4, seed=2, workers=workers,
+        )
+
+    serial, forked = run(1), run(3)
+    assert forked.raw_sessions == serial.raw_sessions
+    assert forked.rating_after == serial.rating_after
+    assert forked.bb_per_100 == serial.bb_per_100
+    assert forked.style == serial.style and forked.style_hands == serial.style_hands

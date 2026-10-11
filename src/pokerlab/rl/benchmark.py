@@ -22,6 +22,7 @@ from pathlib import Path
 import torch
 
 from pokerlab.players.rl_agent import RLAgentPlayer
+from pokerlab.rl.forking import run_in_copies, torch_seeded
 from pokerlab.rl.policy import PokerActorCritic, make_policy_fn
 from pokerlab.rl.pool_registry import (
     DEFAULT_K_SCHEDULE,
@@ -122,6 +123,7 @@ def rate_against_benchmark(
     schedule: Sequence[tuple[int, float]] = DEFAULT_K_SCHEDULE,
     device: str | torch.device = "cpu",
     seed: int = 0,
+    workers: int = 1,
     on_skip: Callable[[Path, str], None] | None = None,
     on_progress: Callable[[int, int, str], None] | None = None,
 ) -> BenchmarkRating | None:
@@ -144,6 +146,12 @@ def rate_against_benchmark(
     an error: a fresh installation has no anchors yet and the run still publishes
     at the rating its validation measured.
 
+    **The sessions of a slice are decided first, played, and then rated in order.** Who sits
+    where and the seed of each are drawn before anyone plays, so a session plays the same
+    hands wherever it runs and `workers` forked copies (`rl/forking.py`) can share the
+    slice's sessions; the rating, which does depend on the order, is applied here after.
+    The anchors of the slice are loaded once, before the copies are made, and shared.
+
     `raw_sessions` carries the per-session chip deltas in the exact shape
     `global_arena` merges, for a caller that wants to queue them; `main()`
     deliberately does not, because these sessions are already in the rating and
@@ -164,9 +172,7 @@ def rate_against_benchmark(
         return None
 
     rng = random.Random(seed)
-    bot_rng = random.Random(rng.random())
     size_rng = random.Random(rng.random())
-    bank = TableBank(mix, rng)
     tally = StyleTally(track=[label])
     learners = [
         RLAgentPlayer(
@@ -217,55 +223,75 @@ def rate_against_benchmark(
             if len(opponents) < needed:
                 continue
 
-        # Drawn per session and held for all of it (see `table_mix`).
-        num_players = mix.draw_size(size_rng)
-        proxies = bank.seats(num_players)
-        learner_seat = rng.randrange(num_players)
-        drawn = rng.sample(opponents, num_players - 1)
-        occupants: dict[int, str] = {}
-        draw_iter = iter(drawn)
-        for seat, proxy in enumerate(proxies):
-            if seat == learner_seat:
-                proxy.inner = learners[seat]
-                proxy.name = label
-                occupants[seat] = label
-            else:
-                opponent = next(draw_iter)
-                proxy.inner = opponent.factory(proxy.player_id, opponent.label, bot_rng)
-                proxy.name = opponent.label
-                occupants[seat] = opponent.label
+        # The rest of this slice's sessions, decided before anyone plays. The size is
+        # drawn per session and held for all of it (see `table_mix`).
+        batch = min(rotate - played % rotate, sessions - played)
+        plan: list[tuple[int, int, list[int], int]] = []
+        for _ in range(batch):
+            num_players = mix.draw_size(size_rng)
+            learner_seat = rng.randrange(num_players)
+            drawn = rng.sample(range(len(opponents)), num_players - 1)
+            plan.append((num_players, learner_seat, drawn, rng.getrandbits(62)))
 
-        deltas = bank.play_session(
-            num_players, hands, on_hand=partial(tally.add_hand, labels=occupants)
-        )
-        won += deltas[learner_seat]
-        won_by_size[num_players] = won_by_size.get(num_players, 0) + deltas[learner_seat]
-        hands_by_size[num_players] = hands_by_size.get(num_players, 0) + hands
+        def play(index: int, plan=plan, opponents=opponents):
+            num_players, learner_seat, drawn, session_seed = plan[index]
+            with torch_seeded(session_seed):
+                session_rng = random.Random(session_seed)
+                bot_rng = random.Random(session_rng.random())
+                bank = TableBank(mix, session_rng)
+                proxies = bank.seats(num_players)
+                occupants: dict[int, str] = {}
+                draw_iter = iter(drawn)
+                for seat, proxy in enumerate(proxies):
+                    if seat == learner_seat:
+                        proxy.inner = learners[seat]
+                        proxy.name = label
+                        occupants[seat] = label
+                    else:
+                        opponent = opponents[next(draw_iter)]
+                        proxy.inner = opponent.factory(proxy.player_id, opponent.label, bot_rng)
+                        proxy.name = opponent.label
+                        occupants[seat] = opponent.label
+                session_tally = StyleTally(track=[label])
+                deltas = bank.play_session(
+                    num_players, hands, on_hand=partial(session_tally.add_hand, labels=occupants)
+                )
+                return deltas, occupants, session_tally.export()
 
-        session: dict[str, float] = {}
-        for seat, who in occupants.items():
-            session[who] = session.get(who, 0.0) + deltas[seat]
-        raw.append(session)
+        outcomes = run_in_copies(play, batch, workers)
 
-        ratings = {
-            who: current if who == label else anchor_ratings.get(who, DEFAULT_ANCHOR_RATING)
-            for who in session
-        }
-        # Read before the increment: a session is rated at the experience its
-        # player had when it sat down.
-        k = k_for_games(played_games, schedule)
-        current += pairwise_elo_delta(
-            session, ratings, k_factors=dict.fromkeys(session, k)
-        ).get(label, 0.0)
-        played_games += 1
-        played += 1
-        if on_progress is not None:
-            # The running figures ride in the detail so the watcher can show
-            # them while the pass is still playing: until it ends, the
-            # `ancore/100` and `elo ancore` cells would otherwise stay empty
-            # for hours. Read by `monitor._SERIES_DETAIL`.
-            running = won / mix.big_blind / (played * hands) * 100
-            on_progress(played, sessions, f"rating {current:.0f}, {running:+.1f} bb/100")
+        for (num_players, learner_seat, _drawn, _seed), (deltas, occupants, exported) in zip(
+            plan, outcomes
+        ):
+            tally.merge(exported)
+            won += deltas[learner_seat]
+            won_by_size[num_players] = won_by_size.get(num_players, 0) + deltas[learner_seat]
+            hands_by_size[num_players] = hands_by_size.get(num_players, 0) + hands
+
+            session: dict[str, float] = {}
+            for seat, who in occupants.items():
+                session[who] = session.get(who, 0.0) + deltas[seat]
+            raw.append(session)
+
+            ratings = {
+                who: current if who == label else anchor_ratings.get(who, DEFAULT_ANCHOR_RATING)
+                for who in session
+            }
+            # Read before the increment: a session is rated at the experience its
+            # player had when it sat down.
+            k = k_for_games(played_games, schedule)
+            current += pairwise_elo_delta(
+                session, ratings, k_factors=dict.fromkeys(session, k)
+            ).get(label, 0.0)
+            played_games += 1
+            played += 1
+            if on_progress is not None:
+                # The running figures ride in the detail so the watcher can show
+                # them while the pass is still playing: until it ends, the
+                # `ancore/100` and `elo ancore` cells would otherwise stay empty
+                # for hours. Read by `monitor._SERIES_DETAIL`.
+                running = won / mix.big_blind / (played * hands) * 100
+                on_progress(played, sessions, f"rating {current:.0f}, {running:+.1f} bb/100")
 
     if played == 0:
         return None

@@ -67,8 +67,7 @@ PRIOR_SD = 15.0
 NUISANCE_PRECISION = 1e-6  # the intercept and the parent's rating are left free
 NOISE_FLOOR = 1.0  # Elo squared: the noise estimate never claims to be exact
 COST_RIDGE = 0.5  # shrinks the elasticities toward 0, in sums of squared log-levels
-LEVEL_FLOOR = 1e-3  # an axis that lives at 0 (entropy) has a level of ln(LEVEL_FLOOR)
-SEED_STEP = math.log(1.2)  # the step recorded for a move off (or onto) exactly 0
+LEVEL_FLOOR = 1e-3  # an axis that lives at 0 has a level of ln(LEVEL_FLOOR)
 MIN_FIT = 20  # fewer usable children than this and there is nothing to fit
 
 DEFAULT_EXPLORE = 0.35
@@ -95,10 +94,6 @@ def log_step(axis: str, parent: float, child: float, complement_axes: frozenset[
     after = _effective(axis, child, complement_axes)
     if before > 0 and after > 0:
         return math.log(after / before)
-    if after > 0:
-        return SEED_STEP
-    if before > 0:
-        return -SEED_STEP
     return 0.0
 
 

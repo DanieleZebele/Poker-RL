@@ -157,13 +157,13 @@ def test_parents_are_distinct_rated_models_from_the_top():
     assert all(label.startswith("top") for label in parents)
 
 
-def test_parents_exclude_unrated_and_frozen_models():
+def test_parents_exclude_unrated_models_but_not_frozen_ones():
     ranking = ranking_of(good=(2, 1800.0, 50))
     ranking["anchor"] = PoolMember(label="anchor", ref="a.pt", rating=2500.0, games=99, frozen=True)
 
-    parents = pick_parents(ranking, [*ranking, "unrated"], 4, rng=random.Random(0))
+    parents = pick_parents(ranking, [*ranking, "unrated"], 3, rng=random.Random(0))
 
-    assert set(parents) <= {"good000", "good001"}
+    assert set(parents) == {"good000", "good001", "anchor"}
 
 
 def test_parents_cycle_when_there_are_fewer_models_than_requested():
@@ -293,3 +293,20 @@ def test_the_parent_bands_round_trip_through_their_text_form():
 def test_a_parent_band_that_is_not_a_size_or_all_is_refused(text):
     with pytest.raises(ValueError):
         parse_parent_tiers(text)
+
+
+def test_parents_come_only_from_the_models_that_are_accepted_and_the_bands_follow_them():
+    ranking = ranking_of(a=(20, 2000.0, 50), b=(20, 1500.0, 50))
+    labels = list(ranking)
+    accepted = {label for label in labels if label.startswith("b")}
+
+    parents = pick_parents(ranking, labels, 3, rng=random.Random(0), tiers=(3,),
+                           accept=lambda label: label in accepted)
+
+    # The top 3 *of the accepted*, though every "a" model outranks every "b".
+    assert set(parents) == {"b000", "b001", "b002"}
+
+
+def test_when_nothing_is_accepted_there_is_no_parent():
+    ranking = ranking_of(a=(5, 2000.0, 50))
+    assert pick_parents(ranking, list(ranking), 3, rng=random.Random(0), accept=lambda _label: False) == []

@@ -431,6 +431,31 @@ def test_an_empty_store_means_everyone_starts_from_scratch(tmp_path):
     assert inheritance_plan(ranking, tmp_path / "models", 4, rng=random.Random(0)) == [None] * 4
 
 
+def test_a_benchmark_anchor_can_be_a_parent_and_its_file_stays_where_it_is(tmp_path):
+    models, ranking = store_with_ranking(tmp_path, 1)
+    anchors = tmp_path / "benchmark"
+    anchors.mkdir()
+    (anchors / "anchor-a.pt").write_bytes(b"a")
+    ranking.members["anchor-a"] = PoolMember(
+        label="anchor-a", ref="a.pt", rating=2400.0, games=500, frozen=True
+    )
+
+    plan = inheritance_plan(
+        ranking, models, 2, rng=random.Random(0), tiers=(10,), benchmark_dir=anchors
+    )
+
+    assert sorted(p.name for p in plan) == ["anchor-a.pt", "m00.pt"]
+    assert (anchors / "anchor-a.pt").read_bytes() == b"a"
+
+
+def test_without_a_benchmark_folder_the_store_alone_supplies_parents(tmp_path):
+    models, ranking = store_with_ranking(tmp_path, 3)
+    plan = inheritance_plan(
+        ranking, models, 3, rng=random.Random(0), benchmark_dir=tmp_path / "missing"
+    )
+    assert all(p is not None and p.parent == models for p in plan)
+
+
 def test_a_model_that_was_never_rated_is_not_a_parent(tmp_path):
     models, ranking = store_with_ranking(tmp_path, 3, games=0)
     assert inheritance_plan(ranking, models, 4, rng=random.Random(0)) == [None] * 4
@@ -446,10 +471,10 @@ def launch_args(tmp_path, **overrides):
         "sb": 1, "bb": 2, "lr": 3e-4, "device": "cpu",
         "hidden": 512, "num_layers": 3, "head_hidden": 256, "head_layers": 1, "equity_model": "e.pt",
         "models_dir": tmp_path / "models",
-        "machine": "host-a", "pool_models": 20, "table_hands": 200, "concurrent_tables": 8, "allin_runouts": 20, "style_share": 0.0, "style_spread": 0.5, "style_temperature_spread": 0.2, "style_jitter": 0.1, "style_scales": [1.0] * 5, "critic_stack_power": 1.4, "pool_top_share": 0.5, "pool_top_n": 100,
+        "machine": "host-a", "pool_models": 20, "table_hands": 200, "concurrent_tables": 8, "allin_runouts": 20, "style_share": 0.0, "style_spread": 0.5, "style_temperature_spread": 0.2, "style_jitter": 0.1, "style_scales": [1.0] * 5, "critic_stack_power": 1.4, "collect_workers": 1, "session_workers": 1, "update_device": "same", "entropy_anneal_iterations": 0, "entropy_anneal_start": 0.1, "entropy_anneal_final": 0.0001, "pool_top_share": 0.5, "pool_top_n": 100,
         "ppo_epochs": 4, "clip_epsilon": 0.2, "eval_every": 10,
         "minibatch_size": 1024, "gae_lambda": 0.95, "value_coef": 0.5, "policy_max_grad_norm": 0.5, "critic_max_grad_norm": 1.0,
-        "entropy_coef": 0.0, "k_schedule": "0:16, 100:2", "draw_tiers": "10, 100, 1000, all",
+        "k_schedule": "0:16, 100:2", "draw_tiers": "10, 100, 1000, all",
         "eval_sessions": 2,
         "benchmark_dir": tmp_path / "benchmark",
         "global_dir": tmp_path / "global", "global_lock_seconds": 120, "global_elo": False,
@@ -492,6 +517,22 @@ def test_a_worker_is_told_where_the_store_is_and_where_to_keep_its_scratch(tmp_p
     # The old per-machine pool is gone from the interface entirely.
     assert "--pool-dir" not in command and "--pool-size" not in command
     assert "--no-global-elo" in command
+
+
+def test_a_worker_is_told_how_many_copies_collect_its_hands_and_how_its_entropy_bonus_falls(
+    tmp_path, monkeypatch
+):
+    command, _ = capture_launch(tmp_path, monkeypatch)
+
+    def value(flag):
+        return command[command.index(flag) + 1]
+
+    assert value("--collect-workers") == "1"
+    assert value("--session-workers") == "1"
+    assert value("--update-device") == "same"
+    assert value("--entropy-anneal-iterations") == "0"
+    assert value("--entropy-anneal-start") == "0.1"
+    assert value("--entropy-anneal-final") == "0.0001"
 
 
 def test_an_inheriting_worker_resumes_from_a_copy_of_its_parent(tmp_path, monkeypatch):
@@ -569,7 +610,6 @@ def a_parent(**overrides):
         "gae_lambda": 0.95,
         "value_coef": 0.5,
         "policy_max_grad_norm": 0.5, "critic_max_grad_norm": 1.0,
-        "entropy_coef": 0.0,
     }
     values.update(overrides)
     return values
@@ -614,8 +654,6 @@ def test_an_inheriting_worker_multiplies_every_axis_by_one_of_the_multipliers():
                 allowed = [1 - (1 - was) * m for m in HP_MULTIPLIERS]
             if axis in loop_module._HP_PROBABILITY_AXES:
                 allowed = [min(v, 1.0) for v in allowed]
-            if was == 0:
-                allowed.append(loop_module._HP_SEED_FROM_ZERO[axis])
             assert any(got == pytest.approx(value) for value in allowed), (axis, got, allowed)
         assert child.arm == HP_ARM_INHERITED
 
@@ -828,7 +866,7 @@ def test_the_settings_are_read_back_out_of_a_real_checkpoint(tmp_path):
     args = SimpleNamespace(
         hp_arm=HP_ARM_SAMPLED, parent_label="", hidden=512, num_layers=3, head_hidden=256, head_layers=1, equity_model="e.pt", machine="host-a", seed=7, resume=True, iterations=100,
         hands=640, table_weights=[25.0, 20.0, 15.0, 10.0, 10.0, 10.0, 5.0, 5.0], stack_min_bb=1.0, stack_max_bb=100.0, sb=50, bb=100, lr=3.8e-4, ppo_epochs=5,
-        clip_epsilon=0.25, entropy_coef=0.0, opponent_probability=0.62,
+        clip_epsilon=0.25, opponent_probability=0.62,
         pool_models=20, table_hands=200, concurrent_tables=8, pool_top_share=0.5, pool_top_n=100,
         minibatch_size=1024, gae_lambda=0.95, value_coef=0.5, policy_max_grad_norm=0.5, critic_max_grad_norm=1.0,
     )
@@ -1979,14 +2017,6 @@ def test_the_newest_axes_are_inherited_from_a_parent_that_has_them():
     assert seen <= {1600, 2000, 2400}
 
 
-def test_entropy_coefficient_can_leave_zero_but_only_upwards():
-    """Zero is where the fleet lives and a multiplier alone never leaves it."""
-    up = {perturb_hyperparameters(a_parent(entropy_coef=0.0), random.Random(s)).entropy_coef for s in range(60)}
-    assert up == {0.0, 1e-3}
-    down = {perturb_hyperparameters(a_parent(entropy_coef=1e-3), random.Random(s)).entropy_coef for s in range(60)}
-    assert down == {0.8e-3, 1e-3, 1.2e-3}
-
-
 def test_the_gae_lambda_moves_through_its_complement():
     """x0.8 / x1.2 on lambda would jump 0.95 to 0.76 or past 1; on 1 - lambda it
     stays near the parent and can never reach 1."""
@@ -2213,3 +2243,22 @@ def test_a_bad_parent_band_or_k_schedule_in_the_file_is_an_error(tmp_path, line)
     with pytest.raises(ConfigError):
         loop_module.load_args(["--config", str(path)])
 
+
+
+def test_parents_are_taken_only_from_files_the_worker_can_resume_from(tmp_path):
+    models, ranking = store_with_ranking(tmp_path, 6)
+    usable = {models / "m02.pt", models / "m04.pt"}
+
+    plan = inheritance_plan(
+        ranking, models, 2, rng=random.Random(0), tiers=(10,), accept_path=lambda path: path in usable
+    )
+
+    assert set(plan) == usable
+
+
+def test_a_worker_has_no_parent_when_no_file_has_its_network(tmp_path):
+    models, ranking = store_with_ranking(tmp_path, 4)
+    plan = inheritance_plan(
+        ranking, models, 3, rng=random.Random(0), accept_path=lambda _path: False
+    )
+    assert plan == [None] * 3

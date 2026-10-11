@@ -142,14 +142,15 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
   Checkpoints record all four and the encoder's shape, `build_model_from_checkpoint`
   rebuilds at the recorded shape (so models of different shapes coexist at a table), and
   a checkpoint without the head keys or the encoder is refused by `check_compatible`
-  with a clear message. **A worker whose
-  parent has another shape starts from scratch** (`train.parent_shape_mismatch`, the
-  message "parent has a different network ... starting from scratch", `args.resume`
-  turned off, so no sweep observation is written either): `pick_parents` draws by
-  rating, not shape, so after the shape in the file changes this is an ordinary event,
-  not a crash. **Change the shape with a fleet reset when you can**: until the old
-  shape's models are pruned, every worker that draws one as a parent throws its weights
-  away. The sweep does not touch the shape.
+  with a clear message. **Parents are chosen among the models of the worker's own
+  network** (`inheritance_plan(accept_path=)`, see "Every worker inherits weights"), so after
+  the shape in the file changes the workers start from scratch until the store holds a model
+  of the new shape, and then inherit from it: the new shape's lineage grows on its own, and
+  its rating is judged among the best of *its* shape. A parent that still turns out to have
+  another shape (a hand-run `poker-train --resume`) is thrown away by the worker
+  (`train.parent_shape_mismatch`, "parent has a different network ... starting from
+  scratch", `args.resume` turned off, so no sweep observation is written). The sweep does
+  not touch the shape.
 - **One policy network, not one per street.** The street arrives as a one-hot
   input feature; there is a single policy trunk and head, and a single critic. Four independent per-street networks were explicitly rejected: preflop
   sees ~100% of decisions and the river 10-15%, so splitting the data four ways
@@ -450,10 +451,11 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
   each, re-drawing the opponents from the pool and re-seating the learner before
   every one. At `--eval-every 100` over a 1000-iteration run that is **100 rated
   sessions**, which then continue into the pass against the frozen anchors on one
-  count. Seats are swapped through `SeatProxy` (made public for this) so one
-  `Table` lives across the whole pass and the button keeps rotating; rebuilding
-  it per session would reset the button to the same seat every time and hand
-  whoever sits there a systematic positional edge.
+  count. **Every session has a `Table` and a seed of its own** (below, "Rated sessions can be
+  played by forked copies"): its button starts where every table's does, which favours nobody
+  since the learner's seat and the opponents are drawn at random. (It used to be one `Table`
+  across the whole pass, so the button kept rotating; the difference is at most one hand of
+  position per session.)
   - **A pass is a session count, full stop** (`--eval-sessions`), not a hand
     count that has to be a multiple of a block size: how many rated results a
     pass produces is what a reader wants to know.
@@ -515,6 +517,64 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
   iteration, a moderate `clip` fraction, and `entropy` drifting slowly down
   (ln 11 ≈ 2.4 is the uniform-over-all-bins ceiling). A climbing value loss or a
   `kl` above ~0.05 per iteration means the step size is too large.
+- **The entropy bonus is a curve the whole fleet follows, not a swept setting**
+  (`ppo.entropy_coefficient_at`, `train.entropy_settings`, `[training]` in `config.toml`:
+  `entropy_anneal_start` 0.1, `entropy_anneal_final` 0.0001, `entropy_anneal_iterations` 500).
+  It falls geometrically from the start to the final value over the first N iterations *of a
+  worker's own run*, then stays there; N = 0 is no annealing, the bonus being the final value
+  throughout. Every worker follows it, an inheriting one included, so a child restarts at the high
+  end however trained its parent is. `--entropy-coef` no longer exists: it was a sweep axis, and
+  an inherited 0 stayed 0 under any multiplier, so it could not be the start for everyone (that
+  also removed `_HP_SEED_FROM_ZERO` and the seed step in `sweep_optimizer.log_step`). A parent's
+  metadata may still carry the old key; nothing reads it. Pinned in `test_rl_ppo.py`
+  (`test_the_entropy_bonus_falls_geometrically...`, `test_every_iteration_updates_with...`).
+- **Hands can be collected by forked copies of the worker** (`--collect-workers N`,
+  `collect_workers` in `[fleet]`, default 1 = none; `SelfPlayCollector.collect(workers=)`,
+  `_play_in_copies`). The parent draws the iteration's tables up front (`ceil(hands /
+  table_hands)` of them: a size and a seed each, `table_hands` hands apiece, the last one
+  shorter), N `fork`ed copies take them off a shared counter, biggest first, play each to its
+  end and send back the trajectories and their style counts through a pipe; the critic, GAE and
+  the PPO update stay in the parent. Whole tables are the unit because a hand costs about as
+  many seats as the table has: a fixed share of hands per copy was tried first and a copy that
+  drew two nine-handed tables took four times as long as one with two heads-up ones (1.7x
+  with 4 copies at 1,024 hands); with tables taken from a queue it is ~3x with 4 copies at
+  4,096 hands. Measured memory: a copy adds ~120-135 MB while it runs and exits with its
+  tables, and shares the rest (torch, the models) copy-on-write with the parent. Rules:
+  **CPU only** (a CUDA context does not survive a fork: `SelfPlayTrainer` refuses it), the
+  copy reseeds python's streams from the table's seed and torch's through
+  `child_setup` (`train._prepare_collector_copy`, also `torch.set_num_threads(1)`), no table
+  outlives an iteration (the serial collector's carry over), tables are played one after
+  another in a copy instead of `concurrent_tables` in turn, and at most `ceil(hands /
+  table_hands)` copies have work. Tests: the last block of `test_rl_rollout.py` and the two
+  at the end of `test_rl_ppo.py`.
+- **The hands and the PPO update can run on different devices** (`--update-device`,
+  `update_device` in `[fleet]`: `same` = as `--device`, the default; `auto` = the GPU if the
+  machine has one, else as `--device`; or `cpu`/`cuda`). With `device = "cpu"` and
+  `update_device = "cuda"` a worker plays on the CPU (a batch-1 decision is no faster on a GPU)
+  and trains and runs the critic on the GPU. `SelfPlayTrainer` keeps the *master* network on
+  `update_device` (optimizer, critic, `trainer.model`, what is loaded and saved) and a *copy*
+  that plays on `device` (`trainer.play_model`), refreshed after every update
+  (`sync_play_model`, also called after `load_checkpoint`); on one device they are the same
+  object. Anything that plays hands takes `play_model`, because `make_policy_fn` moves the
+  network it is given. `save_checkpoint` writes CPU tensors, so a model published by a GPU
+  worker loads anywhere. Each worker on a GPU opens its own CUDA context. Tested with
+  `cpu`/`cpu:0` as the two devices in `test_rl_ppo.py`; **not run on a real GPU yet**.
+- **Rated sessions can be played by forked copies too** (`--session-workers N`,
+  `session_workers` in `[fleet]`, default 1; `rl/forking.py::run_in_copies`). It covers every
+  phase that plays sessions for a rating: the validation (`evaluate_against_pool`), the pass
+  against the anchors (`rate_against_benchmark(workers=)`) and the cross-machine Elo passes,
+  end-of-run and fill-in (`play_global_sessions(fork_workers=)`, via `run_population_sessions`).
+  In each, **who sits where and the seed of every session are drawn first, in the parent**;
+  the sessions are then played (here, or by N copies taking them off a shared counter) from a
+  fresh `TableBank` and `torch_seeded(seed)`; and the parent applies the ratings **in order**
+  afterwards, because the rating is the only part that depends on the order. So the result is
+  *identical* whatever the number of copies (pinned by `test_forked_copies_*` in
+  `test_rl_ppo.py`, `test_rl_benchmark.py`, `test_rl_global_arena.py`). The benchmark loads a
+  slice of anchors once, in the parent, and the copies share it copy-on-write. Measured on 16
+  sessions of 300 hands: 54 s -> 8 s with 8 copies (6.5x), same chips and rating. The progress
+  callbacks keep their meaning (a step per session; the benchmark's arrive in bursts after each
+  slice). **CPU only**, like the collection. The `workers` of `play_sharded`/`poker-elo
+  --workers` (subprocesses that each reload every model) is another thing and unchanged.
 - **Two gradient-norm clips, one per network** (`ppo.py`): `policy_max_grad_norm` (the old
   `max_grad_norm`) on the policy's trunk and head, `critic_max_grad_norm` on the critic's;
   both are axes of the sweep, starting from `config.toml` `[starting-point]`. A parent
@@ -1007,9 +1067,19 @@ and run at the speed of one), organised into generations.
   differ by their *settings*, which costs nothing, rather than by throwing away a
   trained network. Inheritors take **distinct parents drawn at random from the
   `--pool-top-n` best-rated models on disk** (`training_pool.pick_parents`:
-  rated, non-frozen, cycling only if there are fewer than needed), a different
+  rated, cycling only if there are fewer than needed), a different
   set every generation, so the population is competing lineages rather than
-  copies. A model that has never been rated is not a parent.
+  copies. A model that has never been rated is not a parent. **Only models of the worker's own
+  network can be parents** (`inheritance_plan(accept_path=)`, `train.same_network_filter`: the
+  same trunk and head sizes, the same equity encoder, this build's encoding; read with
+  `mmap` at ~7 ms a file and remembered for the life of the supervisor, since a published
+  checkpoint never changes). The bands (top 10, 100, ...) are those of the *accepted* models;
+  with none, the worker has no parent and trains from scratch, which the supervisor says in
+  one line. `launch_worker`/`poker-train` keep the `parent_shape_mismatch` check as a net.
+  **The frozen benchmark
+  anchors are parents too** (`inheritance_plan(benchmark_dir=)`): they are ranked like any
+  model and the child resumes from a *copy* of the checkpoint in `checkpoints/benchmark/`,
+  which is only read, so the anchor and its pinned rating are untouched.
   - `--resume` reads `--checkpoint`, so the loop copies the chosen parent from the
     store into the worker's checkpoint path first (the store's file is only read).
     **Only weights carry over**: published models store no optimizer state, so
@@ -1042,7 +1112,7 @@ and run at the speed of one), organised into generations.
   attributed afterwards to the settings that produced it.
   - **The axes** (`HP_AXES`): `--lr`, `--hands`, `--opponent-probability`,
     `--ppo-epochs`, `--clip-epsilon`, `--minibatch-size`, `--gae-lambda`,
-    `--value-coef`, `--policy-max-grad-norm`, `--critic-max-grad-norm`, `--entropy-coef` and the two that decide
+    `--value-coef`, `--policy-max-grad-norm`, `--critic-max-grad-norm` and the two that decide
     how strong a field the worker draws, `--pool-top-share` and `--pool-top-n`.
     **`--pool-models`, `--global-sample` and `--global-sessions` are held fixed**:
     the first is the field's *size*, which is also what a run's cost scales with,
@@ -3219,26 +3289,8 @@ do the numbers.
     **A cell is the row model's own bb/100 per seat, which is half the head-to-head
     margin `duel_power` reports.** The cost grows with the square of the anchor
     count, so `--max-models` exists for a first look.
-- **Parents of the worker's own network shape (`pick_parents` by shape).** The shape is
-  configurable (`[network]`), checkpoints record it, models of any shape sit at the same
-  table, and a worker whose parent has another shape starts from scratch instead of
-  crashing (`parent_shape_mismatch`). What is missing is a `pick_parents` that draws only
-  parents of the worker's own shape: today a shape change throws away the weights of
-  every worker that draws an old-shape parent until those models are pruned, which is why
-  a change of shape goes with a fleet reset. Filtering keeps each lineage at its own
-  size, which is also what would make two shapes in one fleet a readable experiment (a
-  768 lineage with a 512 ancestor in it measures nothing). Two consequences to size
-  before running mixed shapes: the population pass loads ~55 models per worker, so bigger
-  models multiply the transient allocation when many workers reach that phase together;
-  and **the pruning trigger counts files, not bytes**, so a bigger shape fills the disk
-  several times faster for the same trigger.
-
-## Where to extend each future section
-
 - **RL**: implemented end to end (see the "RL" section above). Natural next
-  steps, roughly in order of value: multi-process rollout collection (N `Table`s in
-  N workers — note `make_policy_fn` returns a closure, which is not picklable, so
-  this needs `fork` or a module-level callable); duplicate/mirror deals (replay a
+  steps, roughly in order of value: duplicate/mirror deals (replay a
   seeded deck with rotated seats and average) for variance reduction; and the
   per-action history encoder specified in the TODO section. (Suit-isomorphic
   canonicalisation is done where the cards are read: the equity encoder puts the suits

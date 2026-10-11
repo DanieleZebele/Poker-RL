@@ -31,6 +31,10 @@ class PPOConfig:
     clip_epsilon: float = 0.2
     value_coefficient: float = 0.5
     entropy_coefficient: float = 0.0
+    # The entropy bonus falls from `entropy_coefficient` to this over `entropy_anneal_iterations`
+    # iterations and stays there (see `entropy_coefficient_at`); 0 iterations = constant.
+    entropy_coefficient_final: float = 0.0
+    entropy_anneal_iterations: int = 0
     epochs: int = 4
     minibatch_size: int = 1024
     # The gradient-norm clip, one per network: the policy and the critic share no weight,
@@ -49,6 +53,33 @@ class PPOConfig:
     # any state-only critic is still an unbiased baseline, so the policy's gradient
     # keeps its objective. Never weigh the policy's loss this way: that would change it.
     critic_stack_power: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.entropy_anneal_iterations < 0:
+            raise ValueError("entropy_anneal_iterations cannot be negative")
+        if self.entropy_anneal_iterations and (
+            self.entropy_coefficient <= 0 or self.entropy_coefficient_final <= 0
+        ):
+            raise ValueError(
+                "annealing the entropy bonus needs a positive start and a positive final value: "
+                "it falls geometrically, and a geometric curve never leaves or reaches 0"
+            )
+
+
+def entropy_coefficient_at(config: PPOConfig, iteration: int) -> float:
+    """The entropy bonus of a run's `iteration`-th update (1-based).
+
+    Geometric from `entropy_coefficient` at the first iteration to
+    `entropy_coefficient_final` after `entropy_anneal_iterations` more, then flat: the
+    bonus spans orders of magnitude, so a straight line would spend nearly all the time
+    near the start value. The iteration is the run's own, so every worker follows the
+    same curve whatever it inherited: a child that resumed a trained parent starts its
+    run at the high end again."""
+    steps = config.entropy_anneal_iterations
+    if steps == 0:
+        return config.entropy_coefficient
+    progress = min(max(iteration - 1, 0) / steps, 1.0)
+    return config.entropy_coefficient * (config.entropy_coefficient_final / config.entropy_coefficient) ** progress
 
 
 @dataclass
@@ -250,7 +281,9 @@ def save_checkpoint(
             # weights are in `model`'s state, frozen.
             "equity": model.equity,
             "iteration": iteration,
-            "model": model.state_dict(),
+            # On the CPU whatever the device it was trained on, so a model published by a GPU
+            # worker loads anywhere.
+            "model": {name: tensor.detach().cpu() for name, tensor in model.state_dict().items()},
             "optimizer": None if optimizer is None else optimizer.state_dict(),
             "metadata": metadata or {},
         },

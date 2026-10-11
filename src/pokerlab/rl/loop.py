@@ -50,6 +50,7 @@ from pokerlab.rl.benchmark import (
     DEFAULT_BENCHMARK_SESSIONS,
     DEFAULT_RESIDENT_ANCHORS,
 )
+from pokerlab.rl.equity_net import encoder_config, load_equity_checkpoint
 from pokerlab.rl.global_arena import (
     BENCHMARK_GAMES_PERCENTILE,
     BENCHMARK_MARGIN,
@@ -137,6 +138,7 @@ from pokerlab.rl.train import (
     add_network_arguments,
     check_network_arguments,
     network_shape,
+    same_network_filter,
 )
 from pokerlab.rl.training_pool import (
     DEFAULT_TOP_N,
@@ -417,7 +419,6 @@ HP_AXES = (
     "value_coef",
     "policy_max_grad_norm",
     "critic_max_grad_norm",
-    "entropy_coef",
     "pool_top_share",
     "pool_top_n",
 )
@@ -427,11 +428,6 @@ HP_AXES = (
 # be added: both arms build a `Hyperparameters` from the dict generically, and
 # the type is the one thing the axis list itself cannot say (0.0 and 0 look alike).
 _HP_INT_AXES = frozenset({"hands", "ppo_epochs", "pool_top_n", "minibatch_size"})
-
-# Zero is absorbing under a multiplier, and 0.0 is where this axis lives, so an
-# upward draw from exactly zero lands on this value instead of staying put.
-# Downward draws from zero stay zero; from a positive value they decay as usual.
-_HP_SEED_FROM_ZERO: dict[str, float] = {"entropy_coef": 1e-3}
 
 # What a worker multiplies its starting value by (its parent's, or the fleet's
 # own when it has none), one independent draw per axis. This is the *default*:
@@ -508,7 +504,6 @@ class Hyperparameters:
     value_coef: float = PPOConfig.value_coefficient
     policy_max_grad_norm: float = PPOConfig.policy_max_grad_norm
     critic_max_grad_norm: float = PPOConfig.critic_max_grad_norm
-    entropy_coef: float = PPOConfig.entropy_coefficient
     arm: str = HP_ARM_SAMPLED
 
 
@@ -574,7 +569,6 @@ def starting_hyperparameters(args: argparse.Namespace) -> Hyperparameters:
         value_coef=args.value_coef,
         policy_max_grad_norm=args.policy_max_grad_norm,
         critic_max_grad_norm=args.critic_max_grad_norm,
-        entropy_coef=args.entropy_coef,
         arm=HP_ARM_SAMPLED,
     )
 
@@ -614,8 +608,6 @@ def _perturbed(
             moved[axis] = max(0.0, 1.0 - complement * multiplier)
             continue
         value = float(before) * multiplier
-        if before == 0 and multiplier > 1.0 and axis in _HP_SEED_FROM_ZERO:
-            value = _HP_SEED_FROM_ZERO[axis]
         if axis in _HP_PROBABILITY_AXES:
             value = min(value, 1.0)
         if axis in _HP_INT_AXES:
@@ -742,6 +734,8 @@ def inheritance_plan(
     *,
     rng: random.Random,
     tiers: Sequence[int | None] = PARENT_TIERS,
+    benchmark_dir: Path | None = None,
+    accept_path: Callable[[Path], bool] | None = None,
 ) -> list[Path | None]:
     """Which model each worker starts from: every worker inherits.
 
@@ -757,13 +751,33 @@ def inheritance_plan(
     (`pick_parents`: top 10/100/1000/all, a quarter each), so the population is
     competing lineages rather than copies of one, and a different set every
     generation.
+
+    **The frozen benchmark anchors (`benchmark_dir`) are parents too**: they are ranked like
+    any model, and their checkpoint is read, never moved, so a child of one starts from its
+    weights while the anchor itself stays pinned. A label found in both places is the store's.
+
+    **`accept_path` keeps the parents to models the worker can actually resume from** (the
+    supervisor passes the test for its own network shape): a parent of another shape
+    would be thrown away by the worker, which would then train from scratch with its
+    settings. The bands are those of the accepted models, and with none the worker has no
+    parent and starts from scratch, as with an empty store.
     """
+    paths = {label: Path(models_dir) / f"{label}.pt" for label in available_labels(models_dir)}
+    if benchmark_dir is not None and Path(benchmark_dir).is_dir():
+        for path in sorted(Path(benchmark_dir).rglob("*.pt")):
+            if not path.name.startswith("."):
+                paths.setdefault(path.stem, path)
     parents = pick_parents(
-        ranking.members, available_labels(models_dir), workers, rng=rng, tiers=tiers
+        ranking.members,
+        sorted(paths),
+        workers,
+        rng=rng,
+        tiers=tiers,
+        accept=None if accept_path is None else (lambda label: accept_path(paths[label])),
     )
     plan: list[Path | None] = [None] * workers
     for index, label in enumerate(parents):
-        plan[index] = Path(models_dir) / f"{label}.pt"
+        plan[index] = paths[label]
     return plan
 
 
@@ -815,6 +829,12 @@ def launch_worker(
         "--allin-runouts", str(args.allin_runouts),
         *style_arguments(style_config_from_args(args)),
         "--critic-stack-power", str(args.critic_stack_power),
+        "--collect-workers", str(args.collect_workers),
+        "--session-workers", str(args.session_workers),
+        "--update-device", args.update_device,
+        "--entropy-anneal-iterations", str(args.entropy_anneal_iterations),
+        "--entropy-anneal-start", str(args.entropy_anneal_start),
+        "--entropy-anneal-final", str(args.entropy_anneal_final),
         # Swept: these two decide how strong a field the worker draws. Only
         # `--pool-models`, the field's *size*, is still the fleet's own value.
         "--pool-top-share", str(hp.pool_top_share),
@@ -827,7 +847,6 @@ def launch_worker(
         "--value-coef", str(hp.value_coef),
         "--policy-max-grad-norm", str(hp.policy_max_grad_norm),
         "--critic-max-grad-norm", str(hp.critic_max_grad_norm),
-        "--entropy-coef", str(hp.entropy_coef),
         # Recorded by the worker into the model it publishes, never acted on:
         # which arm drew these values is what separates the runs an analysis can
         # read a response curve from.
@@ -1261,7 +1280,18 @@ def run_loop(
             args.workers,
             rng=plan_rng,
             tiers=parse_parent_tiers(args.parent_tiers),
+            benchmark_dir=Path(args.benchmark_dir),
+            accept_path=same_network_filter(
+                network_shape(args), encoder_config(load_equity_checkpoint(args.equity_model))
+            ),
         )
+        if None in plan:
+            print(
+                f"  {plan.count(None)} worker senza genitore: nessun modello con la rete "
+                f"{args.hidden}x{args.num_layers} (testa {args.head_hidden}x{args.head_layers}) "
+                f"nello store, partono da zero",
+                flush=True,
+            )
         # Read once per generation, off the very checkpoints the workers are
         # about to resume from: at most `--workers` files, and only for the
         # workers that have a parent at all.
@@ -1472,7 +1502,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--value-coef", type=float, default=PPOConfig.value_coefficient)
     parser.add_argument("--policy-max-grad-norm", type=float, default=PPOConfig.policy_max_grad_norm)
     parser.add_argument("--critic-max-grad-norm", type=float, default=PPOConfig.critic_max_grad_norm)
-    parser.add_argument("--entropy-coef", type=float, default=PPOConfig.entropy_coefficient)
     parser.add_argument(
         "--opponent-probability", type=float, default=0.5,
         help="chance that a non-learner seat gets an opponent instead of another "
@@ -1505,6 +1534,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="the critic's loss weighs a decision by its stake in big blinds to this "
         "power, negated (0: off); forwarded to every worker",
     )
+    parser.add_argument(
+        "--update-device", default="same",
+        help="where each worker's PPO update and critic run: same (as --device), auto (the GPU "
+        "if the worker's machine has one, else as --device), cpu or cuda; the hands are played "
+        "on --device. Forwarded as given, so `auto` is resolved on each machine",
+    )
+    parser.add_argument(
+        "--session-workers", type=int, default=1,
+        help="forked copies of each worker that play the sessions of its rated passes at once "
+        "(1: none); forwarded to every worker",
+    )
+    parser.add_argument(
+        "--collect-workers", type=int, default=1,
+        help="forked copies of each worker that play its iteration's hands at once (1: none); "
+        "every copy takes ~120 MB while it runs; forwarded to every worker",
+    )
+    parser.add_argument(
+        "--entropy-anneal-iterations", type=int, default=0,
+        help="iterations over which every worker's entropy bonus falls from "
+        "--entropy-anneal-start to --entropy-anneal-final, from the start of its own run "
+        "(0: no annealing, the bonus is --entropy-anneal-final throughout); forwarded to every worker",
+    )
+    parser.add_argument("--entropy-anneal-start", type=float, default=0.1,
+                        help="the bonus at a run's first iteration, when annealing")
+    parser.add_argument("--entropy-anneal-final", type=float, default=0.0001,
+                        help="the bonus once the annealing is over")
     parser.add_argument("--eval-every", type=int, default=100)
     parser.add_argument(
         "--eval-sessions", type=int, default=DEFAULT_EVAL_SESSIONS,

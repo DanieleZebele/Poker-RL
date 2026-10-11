@@ -492,3 +492,84 @@ def test_a_player_reports_the_probabilities_of_the_decision_it_will_face():
     without = RLAgentPlayer("u", "U", policy_fn=uniform_masked_policy(random.Random(0)), big_blind=2,
                             starting_stack=200)
     assert without.action_probabilities(observation, legal_actions) is None
+
+
+# ---- hands played by forked copies -------------------------------------------------------
+
+
+def make_copying_collector(**kwargs) -> SelfPlayCollector:
+    """Three seats, all the learner, a table lasting ten hands: 40 hands are four tables."""
+    kwargs.setdefault("allin_runouts", 0)
+    return make_collector(num_players=3, table_hands=10, **kwargs)
+
+
+def test_forked_copies_play_all_the_hands_and_hand_back_ready_trajectories():
+    collector = make_copying_collector()
+    trajectories = collector.collect(40, workers=4)
+    # One style hand per seat per hand played: a table lost or doubled would show here.
+    assert collector.style_hands == 3 * 40
+    assert 2 * 40 <= len(trajectories) <= 3 * 40
+    for trajectory in trajectories:
+        assert len(trajectory.advantages) == len(trajectory.decisions)
+        assert len(trajectory.returns) == len(trajectory.decisions)
+        assert trajectory.decisions[-1].critic_extra is not None  # the critic ran, here
+
+
+def test_the_last_table_is_the_short_one_so_the_hands_are_exactly_those_asked_for():
+    collector = make_copying_collector()
+    collector.collect(25, workers=3)  # tables of 10, 10 and 5 hands
+    assert collector.style_hands == 3 * 25
+
+
+def test_forked_copies_do_not_play_each_others_hands():
+    """A copy inherits the parent's random streams; without a reseed per table every table
+    would deal the very same cards, and most decisions would appear four times."""
+    trajectories = make_copying_collector().collect(40, workers=2)
+    firsts = [tuple(t.decisions[0].features) for t in trajectories]
+    assert len(set(firsts)) > 0.75 * len(firsts)
+
+
+def test_the_style_of_the_hands_played_in_copies_reaches_the_collector():
+    collector = make_copying_collector()
+    collector.collect(30, workers=3)
+    assert collector.style_hands == 3 * 30
+    assert sum(hands for hands, _rates in collector.style_by_group.values()) == 3 * 30
+    events, chances = collector.style_rates["vpip"]
+    assert chances == collector.style_hands and 0 <= events <= chances
+
+
+def test_every_table_is_given_its_own_seed(tmp_path):
+    seeds = tmp_path / "seeds"
+    collector = fake_collector(
+        fixed_mix(3, stack_bb=STARTING_STACK / BIG_BLIND),
+        uniform_masked_policy(random.Random(1)),
+        rng=random.Random(1),
+        table_hands=10,
+        child_setup=lambda seed: seeds.open("a").write(f"{seed}\n"),
+    )
+    collector.collect(40, workers=3)
+    given = seeds.read_text().split()
+    assert len(given) == 4 and len(set(given)) == 4
+
+
+def test_a_copy_that_fails_is_reported_not_swallowed(monkeypatch):
+    collector = make_copying_collector()
+
+    def broken(*args, **kwargs):
+        raise ValueError("boom in the copy")
+
+    monkeypatch.setattr(collector, "_play_hand", broken)
+    with pytest.raises(RuntimeError, match="boom in the copy"):
+        collector.collect(40, workers=2)
+
+
+def test_with_a_single_table_to_play_nothing_is_forked():
+    collector = make_copying_collector()
+    assert collector.collect(10, workers=8)  # ceil(10 / 10) = 1 table: played here
+    assert collector.style_hands == 3 * 10
+
+
+def test_one_worker_is_the_serial_collector():
+    serial = make_copying_collector().collect(20, workers=1)
+    again = make_copying_collector().collect(20)
+    assert [t.reward for t in serial] == [t.reward for t in again]

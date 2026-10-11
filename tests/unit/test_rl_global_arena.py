@@ -1257,3 +1257,30 @@ def test_play_global_sessions_needs_enough_models_for_the_largest_table(tmp_path
     mix = TableMix(weights=(1, 0, 0, 0, 0, 1, 0, 0), stack_min_bb=5.0, stack_max_bb=50.0,
                    small_blind=1, big_blind=2)  # 2- and 7-handed
     assert play_global_sessions(_four_candidates(tmp_path), mix, sessions=3, session_hands=1) == []
+
+
+def test_forked_copies_play_a_global_pass_exactly_as_one_process_does(tmp_path):
+    candidates = _four_candidates(tmp_path)
+
+    def run(fork_workers):
+        styles: list[dict] = []
+        sessions = play_global_sessions(
+            candidates, GAME, sessions=9, session_hands=4, seed=5, styles=styles,
+            fork_workers=fork_workers,
+        )
+        return sessions, styles
+
+    assert run(1) == run(3)
+
+
+def test_forked_copies_report_one_progress_step_per_session(tmp_path):
+    candidates = _four_candidates(tmp_path)
+    seen: list[tuple[int, int, str]] = []
+
+    play_global_sessions(
+        candidates, GAME, sessions=6, session_hands=2, seed=1, fork_workers=3,
+        on_progress=lambda done, total, detail: seen.append((done, total, detail)),
+    )
+
+    assert [done for done, _total, _detail in seen] == [1, 2, 3, 4, 5, 6]
+    assert {total for _done, total, _detail in seen} == {6}

@@ -11,7 +11,9 @@ place in `rl/ppo.py`, where trajectories become tensors.
 
 from __future__ import annotations
 
+import multiprocessing
 import random
+import traceback
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
@@ -228,6 +230,12 @@ class TableBank:
     def _hand_started(self, info: dict) -> None:
         self.hole_cards = info["hole_cards"]
 
+    def reseed(self, seed: int) -> None:
+        """Restart both random streams (the deals and the stacks) from `seed`: what a forked
+        copy of the collector does so that it does not repeat its siblings' hands."""
+        self._rng.seed(seed)
+        self._stack_rng.seed(self._rng.random())
+
     def seats(self, num_players: int, slot: int = 0) -> list[SeatProxy]:
         """The proxies of the `num_players` table, for the caller to seat.
 
@@ -322,12 +330,16 @@ class SelfPlayCollector:
         allin_runouts: int = DEFAULT_ALLIN_RUNOUTS,
         styles: StyleConfig | None = None,
         critic: CriticFns,
+        child_setup: Callable[[int], None] | None = None,
     ) -> None:
         if table_hands < 1 or concurrent_tables < 1:
             raise ValueError("table_hands and concurrent_tables must be at least 1")
         if allin_runouts < 0:
             raise ValueError("allin_runouts must be 0 (off) or more")
         self._allin_runouts = allin_runouts
+        # Called with a fresh seed in every forked copy that plays hands (see `collect`):
+        # the place to restart whatever random stream lives outside this module (torch's).
+        self._child_setup = child_setup
         self._styles = styles if styles is not None else StyleConfig()
         # Opponent seats opened so far, and how many of them were given a style.
         self.opponent_seats = 0
@@ -409,14 +421,16 @@ class SelfPlayCollector:
     def _record(self, record: DecisionRecord) -> None:
         self._pending.setdefault(record.seat, []).append(record)
 
-    def _open_table(self, slot: int) -> _TableSession:
-        """A new table for `slot`: a size, who sits at each seat, and blank statistics.
+    def _open_table(self, slot: int, num_players: int | None = None) -> _TableSession:
+        """A new table for `slot`: a size (drawn, unless given), who sits at each seat, and
+        blank statistics.
 
         At least one seat is always the learner, so a hand can never yield no training
         data; every other seat is a pool model with probability `opponent_probability`,
         else another copy of the learner. They stay for `table_hands` hands.
         """
-        num_players = self._mix.draw_size(self._rng)
+        if num_players is None:
+            num_players = self._mix.draw_size(self._rng)
         learner_seat = self._rng.randrange(num_players)
         occupants: list[Opponent | None] = []
         for seat in range(num_players):
@@ -459,48 +473,181 @@ class SelfPlayCollector:
         return learner_seats
 
     def collect(
-        self, num_hands: int, *, gamma: float = 1.0, lam: float = 0.95
+        self, num_hands: int, *, gamma: float = 1.0, lam: float = 0.95, workers: int = 1
     ) -> list[HandTrajectory]:
-        trajectories: list[HandTrajectory] = []
-        for _ in range(num_hands):
-            # Tables are played in turn, hand by hand; one that has used up its hands
-            # is replaced by a new table with new opponents and blank statistics.
-            slot = self._turn % len(self._sessions)
-            self._turn += 1
-            session = self._sessions[slot]
-            if session is None or session.hands_left <= 0:
-                session = self._sessions[slot] = self._open_table(slot)
-            session.hands_left -= 1
-            num_players = session.num_players
-            proxies = self._bank.seats(num_players, slot)
-            learner_seats = self._seat(session, proxies)
-            self._pending = {}
-            before, after = self._bank.play_hand(num_players, slot)
-            self._record_style(learner_seats)
-            expected = (
-                expected_deltas(self._bank.last_hand, self._runout_rng, self._allin_runouts)
-                if self._pending and self._bank.last_hand is not None
-                else None
-            )
+        """Play `num_hands` hands and return the learner's trajectories, advantages included.
 
-            for seat, decisions in self._pending.items():
-                reward = (after[seat] - before[seat]) / self._mix.big_blind
-                trained = expected[seat] / self._mix.big_blind if expected is not None else reward
-                decisions[-1].reward = trained * self._reward_scale
-                others = [stack for other, stack in enumerate(before) if other != seat]
-                trajectory = HandTrajectory(
-                    seat=seat,
-                    player_id=proxies[seat].player_id,
-                    decisions=decisions,
-                    reward=reward,
-                    num_players=num_players,
-                    effective_stack_bb=min(before[seat], max(others)) / self._mix.big_blind,
-                )
-                trajectories.append(trajectory)
+        **With `workers` > 1 the hands are played by forked copies of this process**, whole
+        tables at a time (`_play_in_copies`), and only the critic and the advantages are
+        computed here, after, on all the hands together. A copy sees the weights this process
+        holds at the moment of the fork (so nothing is synchronised) and shares its memory
+        until it writes to it, which is why it costs a fraction of a second process; it exits
+        when the tables are played. Three consequences: no table outlives an iteration (the
+        tables of a serial run carry over), and a table is played alone and to its end, one
+        after another in a copy, where the serial collector deals `concurrent_tables` of them
+        in turn; at most `ceil(num_hands / table_hands)` copies have anything to do; and the
+        streams are reseeded per table, so a fixed seed reproduces a run for whatever
+        `workers`."""
+        workers = min(workers, -(-num_hands // self._table_hands))
+        if workers > 1:
+            trajectories = self._play_in_copies(num_hands, workers)
+        else:
+            trajectories = self._play(num_hands, range(len(self._sessions)))
         self._fill_critic(trajectories)
         for trajectory in trajectories:
             trajectory.advantages, trajectory.returns = compute_gae(trajectory, gamma=gamma, lam=lam)
         return trajectories
+
+    def _play(self, num_hands: int, slots: Sequence[int]) -> list[HandTrajectory]:
+        """The hands themselves, on the tables in `slots`, taken in turn."""
+        trajectories: list[HandTrajectory] = []
+        for _ in range(num_hands):
+            # Tables are played in turn, hand by hand; one that has used up its hands
+            # is replaced by a new table with new opponents and blank statistics.
+            slot = slots[self._turn % len(slots)]
+            self._turn += 1
+            session = self._sessions[slot]
+            if session is None or session.hands_left <= 0:
+                session = self._sessions[slot] = self._open_table(slot)
+            trajectories.extend(self._play_hand(slot, session))
+        return trajectories
+
+    def _play_hand(self, slot: int, session: _TableSession) -> list[HandTrajectory]:
+        """One hand at the table in `slot`: the trajectory of every learner seat that acted."""
+        session.hands_left -= 1
+        num_players = session.num_players
+        proxies = self._bank.seats(num_players, slot)
+        learner_seats = self._seat(session, proxies)
+        self._pending = {}
+        before, after = self._bank.play_hand(num_players, slot)
+        self._record_style(learner_seats)
+        expected = (
+            expected_deltas(self._bank.last_hand, self._runout_rng, self._allin_runouts)
+            if self._pending and self._bank.last_hand is not None
+            else None
+        )
+
+        trajectories: list[HandTrajectory] = []
+        for seat, decisions in self._pending.items():
+            reward = (after[seat] - before[seat]) / self._mix.big_blind
+            trained = expected[seat] / self._mix.big_blind if expected is not None else reward
+            decisions[-1].reward = trained * self._reward_scale
+            others = [stack for other, stack in enumerate(before) if other != seat]
+            trajectories.append(HandTrajectory(
+                seat=seat,
+                player_id=proxies[seat].player_id,
+                decisions=decisions,
+                reward=reward,
+                num_players=num_players,
+                effective_stack_bb=min(before[seat], max(others)) / self._mix.big_blind,
+            ))
+        return trajectories
+
+    def _play_in_copies(self, num_hands: int, workers: int) -> list[HandTrajectory]:
+        """`num_hands` hands as whole tables, played by `workers` forked copies.
+
+        The parent draws the tables up front -- a size and a seed each, `table_hands` hands
+        apiece, the last one shorter -- and the copies take them off a shared counter, the
+        biggest first. Tables are the unit, not hands or a fixed share per copy, because a
+        hand costs about as many seats as the table has: a copy that drew two nine-handed
+        tables would take four times as long as one that drew two heads-up ones, and the
+        iteration waits for the slowest. Every table is played to its end, so the sizes of
+        the hands played are the sizes drawn, whichever copy gets which."""
+        context = multiprocessing.get_context("fork")
+        sizes: list[int] = []
+        for _ in range(-(-num_hands // self._table_hands)):
+            sizes.append(self._mix.draw_size(self._rng))
+        hands = [self._table_hands] * len(sizes)
+        hands[-1] = num_hands - self._table_hands * (len(sizes) - 1)
+        seeds = [self._rng.getrandbits(62) for _ in sizes]
+        order = sorted(range(len(sizes)), key=lambda job: -sizes[job] * hands[job])
+        workers = min(workers, len(sizes))
+
+        taken = context.Value("i", 0)
+        running = []
+        for _ in range(workers):
+            receiver, sender = context.Pipe(duplex=False)
+            process = context.Process(
+                target=self._play_tables_in_a_copy,
+                args=(sender, taken, order, sizes, hands, seeds),
+            )
+            process.start()
+            sender.close()  # the copy holds the other end; EOF here means it died
+            running.append((process, receiver))
+
+        by_table: dict[int, list[HandTrajectory]] = {}
+        failure: str | None = None
+        for process, receiver in running:
+            try:
+                kind, payload = receiver.recv()
+            except EOFError:
+                kind, payload = "error", "the copy exited without sending its hands"
+            process.join()
+            if kind == "error":
+                failure = failure or payload
+                continue
+            played, pooled, by_group, opponent_seats, styled_seats = payload
+            by_table.update(played)
+            for hand in pooled:
+                self._style.add(STYLE_PLAYER, hand)
+            for group, group_hands in by_group.items():
+                for hand in group_hands:
+                    self._style_by_group[group].add(STYLE_PLAYER, hand)
+            self.opponent_seats += opponent_seats
+            self.styled_seats += styled_seats
+        if failure is not None:
+            raise RuntimeError(f"a forked collector failed:\n{failure}")
+        # In the order the tables were drawn, so which copy played which does not show.
+        return [trajectory for table in sorted(by_table) for trajectory in by_table[table]]
+
+    def _play_tables_in_a_copy(self, sender, taken, order, sizes, hands, seeds) -> None:
+        """Runs in the forked copy: take tables off the counter until none is left, play
+        each from its own seed, and send back what the parent has to keep.
+
+        Nothing is written to the parent's memory from here -- the copy's own changes
+        (trackers, counters) die with it -- so the style counts and the seat counters are
+        sent explicitly, as only what this copy added."""
+        try:
+            self._style = StatsTracker(window=STYLE_WINDOW)
+            self._style_by_group = {
+                group: StatsTracker(window=STYLE_WINDOW) for group in self._style_by_group
+            }
+            self.opponent_seats = 0
+            self.styled_seats = 0
+            played: dict[int, list[HandTrajectory]] = {}
+            while True:
+                with taken.get_lock():
+                    position = taken.value
+                    taken.value += 1
+                if position >= len(order):
+                    break
+                job = order[position]
+                # A new bank and new streams for every table: its content then depends on
+                # its seed alone, not on the tables this copy happened to play before.
+                self._bank = TableBank(self._mix, self._rng)
+                self._bank.reseed(seeds[job])
+                self._runout_rng.seed(self._rng.random())
+                if self._child_setup is not None:
+                    self._child_setup(seeds[job])
+                session = self._open_table(0, sizes[job])
+                trajectories: list[HandTrajectory] = []
+                for _ in range(hands[job]):
+                    trajectories.extend(self._play_hand(0, session))
+                played[job] = trajectories
+            sender.send((
+                "ok",
+                (
+                    played,
+                    self._style.recent(STYLE_PLAYER),
+                    {g: t.recent(STYLE_PLAYER) for g, t in self._style_by_group.items()},
+                    self.opponent_seats,
+                    self.styled_seats,
+                ),
+            ))
+        except BaseException:  # noqa: BLE001 - reported to the parent, which raises
+            sender.send(("error", traceback.format_exc()))
+        finally:
+            sender.close()
 
     def _fill_critic(self, trajectories: list[HandTrajectory]) -> None:
         """Give every decision what the critic reads and the value it makes of it.

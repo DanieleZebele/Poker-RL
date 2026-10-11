@@ -152,6 +152,19 @@ class StyleTally:
                 chances[i] += hand_counts.opportunities[i]
             self._hands[label] = self._hands.get(label, 0) + 1
 
+    def merge(self, exported: Mapping[str, dict]) -> None:
+        """Add what `export` returned (from another tally, or another process) to this one."""
+        for label, entry in exported.items():
+            if self._track is not None and label not in self._track:
+                continue
+            events = self._events.setdefault(label, [0] * STAT_COUNT)
+            chances = self._chances.setdefault(label, [0] * STAT_COUNT)
+            for i, name in enumerate(STATS):
+                hits, opportunities = entry["style"][name]
+                events[i] += hits
+                chances[i] += opportunities
+            self._hands[label] = self._hands.get(label, 0) + entry["hands"]
+
     def export(self) -> dict[str, dict]:
         """`{label: {"hands": n, "style": {statistic: [events, opportunities]}}}`."""
         return {

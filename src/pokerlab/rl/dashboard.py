@@ -842,7 +842,7 @@ function renderCharts(host, hist){
 const HP_LABELS = {
   lr: 'lr', hands: 'hands/iter', ppo_epochs: 'PPO epochs',
   clip_epsilon: 'clip', minibatch_size: 'minibatch', gae_lambda: 'GAE lambda',
-  value_coef: 'value coef', policy_max_grad_norm: 'policy max grad norm', critic_max_grad_norm: 'critic max grad norm', entropy_coef: 'entropy coef', opponent_probability: 'opponent prob.',
+  value_coef: 'value coef', policy_max_grad_norm: 'policy max grad norm', critic_max_grad_norm: 'critic max grad norm', opponent_probability: 'opponent prob.',
   /* Together these two are the strength of the field the worker trains against:
      what share of its seats come from the best-rated band, and how deep that
      band is. The `pool` column shows the strength they actually produced. */

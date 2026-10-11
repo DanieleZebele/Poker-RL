@@ -27,6 +27,7 @@ from functools import partial
 from pathlib import Path
 
 from pokerlab.rl.device import resolve_device
+from pokerlab.rl.forking import run_in_copies, torch_seeded
 from pokerlab.rl.global_store import (
     DEFAULT_LOCK_SECONDS,
     PRUNE_LOCK,
@@ -480,8 +481,12 @@ def play_global_sessions(
     on_skip=None,
     on_progress: Callable[[int, int, str], None] | None = None,
     styles: list[dict[str, dict]] | None = None,
+    fork_workers: int = 1,
 ) -> list[dict[str, float]]:
     """Play `sessions` sessions, each seating candidates drawn at random.
+
+    `fork_workers` > 1 plays them in that many forked copies of this process (`rl/forking.py`),
+    which share the loaded models copy-on-write; the result is the same list either way.
 
     Tables are drawn at random from the sampled candidates rather than by
     rating, so a model from one machine routinely faces models from the others
@@ -525,41 +530,51 @@ def play_global_sessions(
         return []
 
     rng = random.Random(seed)
-    bot_rng = random.Random(rng.random())
     size_rng = random.Random(rng.random())
-    bank = TableBank(mix, rng)
 
-    played: list[dict[str, float]] = []
-
+    # Who sits at each session and its seed are drawn first, so a session plays the same hands
+    # wherever it runs and `fork_workers` forked copies can share them.
+    plan: list[tuple[int, list[str], int]] = []
     for _ in range(sessions):
         # Drawn per session and held for all of it (see `table_mix`).
         num_players = mix.draw_size(size_rng)
-        proxies = bank.seats(num_players)
-        seat_labels = rng.sample(labels, num_players)
+        plan.append((num_players, rng.sample(labels, num_players), rng.getrandbits(62)))
 
-        for proxy, label in zip(proxies, seat_labels):
-            opponent = loaded[label]
-            proxy.inner = opponent.factory(proxy.player_id, label, bot_rng)
-            proxy.name = label
-
-        tally = StyleTally() if styles is not None else None
-        deltas = bank.play_session(
-            num_players,
-            session_hands,
-            on_hand=None
-            if tally is None
-            else partial(tally.add_hand, labels=dict(enumerate(seat_labels))),
-        )
-        if tally is not None:
-            styles.append(tally.export())
-
+    def play(index: int) -> tuple[dict[str, float], dict[str, dict] | None]:
+        num_players, seat_labels, session_seed = plan[index]
+        with torch_seeded(session_seed):
+            session_rng = random.Random(session_seed)
+            bot_rng = random.Random(session_rng.random())
+            bank = TableBank(mix, session_rng)
+            proxies = bank.seats(num_players)
+            for proxy, label in zip(proxies, seat_labels):
+                proxy.inner = loaded[label].factory(proxy.player_id, label, bot_rng)
+                proxy.name = label
+            tally = StyleTally() if styles is not None else None
+            deltas = bank.play_session(
+                num_players,
+                session_hands,
+                on_hand=None
+                if tally is None
+                else partial(tally.add_hand, labels=dict(enumerate(seat_labels))),
+            )
         results: dict[str, float] = {}
         for label, delta in zip(seat_labels, deltas):
             results[label] = results.get(label, 0.0) + delta
-        played.append(results)
-        if on_progress is not None:
-            on_progress(len(played), sessions, f"{len(played)} sessioni")
+        return results, None if tally is None else tally.export()
 
+    done = 0
+
+    def report(_index: int, _result) -> None:
+        nonlocal done
+        done += 1
+        if on_progress is not None:
+            on_progress(done, sessions, f"{done} sessioni")
+
+    outcomes = run_in_copies(play, sessions, fork_workers, on_result=report)
+    played = [results for results, _exported in outcomes]
+    if styles is not None:
+        styles.extend(exported for _results, exported in outcomes)
     return played
 
 
@@ -845,6 +860,7 @@ def play_population_sessions_sharded(
     device: str = "cpu",
     seed: int | None = None,
     workers: int = 1,
+    fork_workers: int = 1,
     draw: Callable[[list[Candidate], int, random.Random], list[Candidate]] | None = None,
     on_skip: Callable[[Path, str], None] | None = None,
     on_progress: Callable[[int, int, str], None] | None = None,
@@ -922,6 +938,7 @@ def play_population_sessions_sharded(
             on_skip=on_skip,
             on_progress=on_progress,
             styles=styles,
+            fork_workers=fork_workers,
         )
     else:
         played = play_sharded(
@@ -1428,6 +1445,7 @@ def run_population_sessions(
     device: str = "cpu",
     seed: int | None = None,
     workers: int = 1,
+    fork_workers: int = 1,
     draw: Callable[[list[Candidate], int, random.Random], list[Candidate]] | None = None,
     lock_ttl: float = DEFAULT_LOCK_SECONDS,
     trigger_size: int = DEFAULT_POPULATION_TRIGGER,
@@ -1468,6 +1486,7 @@ def run_population_sessions(
         device=device,
         seed=seed,
         workers=workers,
+        fork_workers=fork_workers,
         draw=draw,
         on_skip=on_skip,
         on_progress=on_progress,

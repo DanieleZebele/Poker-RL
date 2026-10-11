@@ -6,13 +6,14 @@ Requires the `rl` extra (`pip install -e ".[rl]"`).
 from __future__ import annotations
 
 import argparse
+import copy
 import math
 import random
 import socket
 import statistics
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import torch
@@ -32,7 +33,8 @@ from pokerlab.rl.benchmark import (
     DEFAULT_BENCHMARK_SESSIONS,
     DEFAULT_RESIDENT_ANCHORS,
 )
-from pokerlab.rl.device import resolve_device
+from pokerlab.rl.device import resolve_device, resolve_update_device
+from pokerlab.rl.forking import run_in_copies, torch_seeded
 from pokerlab.rl.equity_net import (
     encoder_config,
     equity_net_from_checkpoint,
@@ -93,6 +95,7 @@ from pokerlab.rl.pool_registry import (
 )
 from pokerlab.rl.ppo import (
     PPOConfig,
+    entropy_coefficient_at,
     build_batch,
     build_model_from_checkpoint,
     check_compatible,
@@ -281,6 +284,12 @@ class TrainConfig:
     # Boards a hand closed before the river is averaged over for its training reward
     # (`rl/allin_reward.py`); 0 trains on the chips that moved.
     allin_runouts: int = DEFAULT_ALLIN_RUNOUTS
+    # Forked copies of the process that play an iteration's hands (`SelfPlayCollector.collect`);
+    # 1 plays them here, as before. CPU only: a CUDA context does not survive a fork.
+    collect_workers: int = 1
+    # The same for the sessions of a rated pass (`forking.run_in_copies`): the validation
+    # here, and the passes of `benchmark.py` and `global_arena.py` the run ends with.
+    session_workers: int = 1
     # How the pool models in the opponent seats are given a style (`rl/styles.py`).
     styles: StyleConfig = field(default_factory=StyleConfig)
     # There is deliberately no knob for seating the run's own past selves: a
@@ -302,6 +311,7 @@ class SelfPlayTrainer:
         ppo_config: PPOConfig | None = None,
         *,
         device: str | torch.device = "cpu",
+        update_device: str | torch.device | None = None,
         rng: random.Random | None = None,
         model: PokerActorCritic,
         critic: CriticFns,
@@ -310,6 +320,17 @@ class SelfPlayTrainer:
         initial_rating: float = DEFAULT_RATING,
         k_schedule: Sequence[tuple[int, float]] = DEFAULT_K_SCHEDULE,
     ) -> None:
+        counts = (
+            (train_config.collect_workers, train_config.session_workers)
+            if train_config is not None
+            else (1, 1)
+        )
+        if min(counts) < 1:
+            raise ValueError("collect_workers and session_workers must be at least 1")
+        if max(counts) > 1 and str(device).startswith("cuda"):
+            raise ValueError(
+                "collecting hands in forked copies needs the cpu: a CUDA context does not survive a fork"
+            )
         self._mix = mix
         self._k_schedule = tuple(k_schedule)
         self._registry = registry
@@ -340,8 +361,20 @@ class SelfPlayTrainer:
         self._train = train_config if train_config is not None else TrainConfig()
         self._ppo = ppo_config if ppo_config is not None else PPOConfig()
         self._device = device
+        # **The hands and the update can run on different devices.** `device` is where the
+        # policy plays (the CPU: a decision at a time is no faster on a GPU), `update_device`
+        # where the PPO update and the critic run, on big batches. The network that is
+        # trained -- the master: optimizer, critic, checkpoints -- lives on `update_device`;
+        # the one that plays is a copy on `device`, refreshed after every update
+        # (`sync_play_model`). On a single device they are the same object.
+        self._update_device = device if update_device is None else update_device
         self._rng = rng if rng is not None else random.Random()
-        self._model = model.to(device)
+        self._model = model.to(self._update_device)
+        self._play_model = (
+            copy.deepcopy(self._model).to(device)
+            if str(self._update_device) != str(device)
+            else self._model
+        )
         self._optimizer = torch.optim.Adam(self._model.parameters(), lr=self._ppo.learning_rate)
         self._iteration = 0
         self._value_diagnostics: ValueDiagnostics | None = None
@@ -356,7 +389,7 @@ class SelfPlayTrainer:
         # no rebuilding between iterations.
         self._collector = SelfPlayCollector(
             mix,
-            make_policy_fn(self._model, device=device),
+            make_policy_fn(self._play_model, device=device),
             rng=self._rng,
             opponent_pool=self._pool,
             opponent_probability=self._train.opponent_probability,
@@ -366,11 +399,26 @@ class SelfPlayTrainer:
             allin_runouts=self._train.allin_runouts,
             styles=self._train.styles,
             critic=critic,
+            child_setup=_prepare_collector_copy,
         )
 
     @property
     def model(self) -> PokerActorCritic:
+        """The network being trained: what is loaded into, saved and published."""
         return self._model
+
+    @property
+    def play_model(self) -> PokerActorCritic:
+        """The network that plays, on the playing device: `model` itself on one device, a
+        refreshed copy of it on two. Whatever plays hands (a rated pass, the benchmark) must
+        take this one, since `make_policy_fn` moves the network it is given."""
+        return self._play_model
+
+    def sync_play_model(self) -> None:
+        """Copy the trained weights into the network that plays; a no-op on one device. Called
+        after every update, and by whoever loads weights into `model` from outside."""
+        if self._play_model is not self._model:
+            self._play_model.load_state_dict(self._model.state_dict())
 
     @property
     def style_hands(self) -> int:
@@ -421,6 +469,7 @@ class SelfPlayTrainer:
         seed: int | None = None,
         hands: int = DEFAULT_SESSION_HANDS,
         device: str | torch.device | None = None,
+        workers: int | None = None,
     ) -> float:
         """Play the ranked pool, return bb/100, and update everyone's rating.
 
@@ -464,6 +513,7 @@ class SelfPlayTrainer:
             raise ValueError("evaluate_against_pool needs a registry; none was configured")
 
         device = self._device if device is None else device
+        workers = self._train.session_workers if workers is None else workers
         mix = self._mix
         needed = mix.max_players - 1
         opponents = registry_opponents(
@@ -479,49 +529,62 @@ class SelfPlayTrainer:
             )
 
         streams = random.Random(seed)
-        rng = random.Random(streams.random())
-        bot_rng = random.Random(streams.random())
+        # The deals and the bots' choices of each session come from that session's own seed
+        # (below), not from one stream shared by all of them, so a session plays the same
+        # hands wherever it runs and the pass can be spread over forked copies.
         seat_rng = random.Random(streams.random())
         size_rng = random.Random(streams.random())
 
-        bank = TableBank(mix, rng)
+        # Everything the pass decides is drawn here, before anyone plays: the size of each
+        # session (held for all of it: a session compares the same participants over the same
+        # hands), the learner's seat, the opponents (sample() draws positions, so a member
+        # that fill_slots duplicated can legitimately occupy two seats -- that is what
+        # weighting a short pool by duplication means) and the seed.
+        plan: list[tuple[int, int, list[int], int]] = []
+        for _ in range(sessions):
+            num_players = mix.draw_size(size_rng)
+            learner_seat = seat_rng.randrange(num_players)
+            drawn = seat_rng.sample(range(len(opponents)), num_players - 1)
+            plan.append((num_players, learner_seat, drawn, streams.getrandbits(62)))
+
         learners = [
             RLAgentPlayer(
                 f"s{seat}",
                 LEARNER_LABEL,
-                policy_fn=make_policy_fn(self._model, device=device),
+                policy_fn=make_policy_fn(self._play_model, device=device),
                 big_blind=mix.big_blind,
                 starting_stack=mix.starting_stack,
             )
             for seat in range(mix.max_players)
         ]
 
+        def play(index: int) -> tuple[list[int], dict[int, str]]:
+            num_players, learner_seat, drawn, session_seed = plan[index]
+            with torch_seeded(session_seed):
+                session_rng = random.Random(session_seed)
+                bot_rng = random.Random(session_rng.random())
+                # A table of its own: its button starts where every table's does, which
+                # cannot favour anyone, the learner's seat and the opponents being random.
+                bank = TableBank(mix, session_rng)
+                proxies = bank.seats(num_players)
+                occupants: dict[int, str] = {}
+                draw = iter(drawn)
+                for seat, proxy in enumerate(proxies):
+                    if seat == learner_seat:
+                        proxy.inner = learners[seat]
+                        proxy.name = LEARNER_LABEL
+                        occupants[seat] = LEARNER_LABEL
+                    else:
+                        opponent = opponents[next(draw)]
+                        proxy.inner = opponent.factory(proxy.player_id, opponent.label, bot_rng)
+                        proxy.name = opponent.label
+                        occupants[seat] = opponent.label
+                return bank.play_session(num_players, hands), occupants
+
+        played = run_in_copies(play, sessions, workers)
+
         won = 0
-        for _session in range(sessions):
-            # The size is drawn per session and held for all of it: a session
-            # compares the same participants over the same hands.
-            num_players = mix.draw_size(size_rng)
-            proxies = bank.seats(num_players)
-            learner_seat = seat_rng.randrange(num_players)
-            # sample() draws positions, so a member that fill_slots duplicated
-            # can legitimately occupy two seats -- that is what weighting a
-            # short pool by duplication means.
-            drawn = seat_rng.sample(opponents, num_players - 1)
-
-            occupants: dict[int, str] = {}
-            draw = iter(drawn)
-            for seat, proxy in enumerate(proxies):
-                if seat == learner_seat:
-                    proxy.inner = learners[seat]
-                    proxy.name = LEARNER_LABEL
-                    occupants[seat] = LEARNER_LABEL
-                else:
-                    opponent = next(draw)
-                    proxy.inner = opponent.factory(proxy.player_id, opponent.label, bot_rng)
-                    proxy.name = opponent.label
-                    occupants[seat] = opponent.label
-
-            block_delta = bank.play_session(num_players, hands)
+        for (_size, learner_seat, _drawn, _seed), (block_delta, occupants) in zip(plan, played):
             won += block_delta[learner_seat]
 
             # A member seated twice contributes both seats to one result, so
@@ -589,12 +652,19 @@ class SelfPlayTrainer:
     def train_iteration(self) -> dict[str, float]:
         self._iteration += 1
         trajectories = self._collector.collect(
-            self._train.hands_per_iteration, gamma=self._train.gamma, lam=self._train.lam
+            self._train.hands_per_iteration,
+            gamma=self._train.gamma,
+            lam=self._train.lam,
+            workers=self._train.collect_workers,
         )
         # Before the update: these are the values the policy collected with.
         self._value_diagnostics = value_diagnostics(trajectories)
-        batch = build_batch(trajectories, device=self._device)
-        stats = ppo_update(self._model, self._optimizer, batch, self._ppo)
+        batch = build_batch(trajectories, device=self._update_device)
+        ppo = replace(
+            self._ppo, entropy_coefficient=entropy_coefficient_at(self._ppo, self._iteration)
+        )
+        stats = ppo_update(self._model, self._optimizer, batch, ppo)
+        self.sync_play_model()
         stats["iteration"] = float(self._iteration)
         stats["decisions"] = float(len(batch))
         stats["reward_bb"] = sum(t.reward for t in trajectories) / max(len(trajectories), 1)
@@ -639,7 +709,6 @@ REPORTED_AXES = (
     "value_coef",
     "policy_max_grad_norm",
     "critic_max_grad_norm",
-    "entropy_coef",
     "opponent_probability",
     # How strong a field this run drew. Reported like the rest, and worth
     # reading next to the `pool rating: media ...` line printed just below,
@@ -710,6 +779,39 @@ def parent_shape_mismatch(path: str | Path, shape: dict[str, int], equity: dict[
     return None if found_equity == equity else {**found, "equity": found_equity}
 
 
+_NETWORK_OF: dict[str, tuple | None] = {}
+
+
+def same_network_filter(
+    shape: dict[str, int], equity: dict[str, int]
+) -> Callable[[str | Path], bool]:
+    """A test for "this checkpoint can be resumed into a network of `shape` and `equity`":
+    the same trunk and head sizes, the same equity encoder, and this build's encoding.
+
+    A published checkpoint never changes, so what is read from one is remembered for the
+    life of the process (the supervisor asks about every model of the store each
+    generation, and a read is ~7 ms). A file that cannot be read or is not this build's
+    is simply not a parent."""
+    wanted = (*(shape[key] for key in sorted(shape)), tuple(sorted(equity.items())))
+
+    def accepts(path: str | Path) -> bool:
+        key = str(path)
+        if key not in _NETWORK_OF:
+            try:
+                checkpoint = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+                check_compatible(checkpoint, key)
+                found = checkpoint_shape(checkpoint)
+                _NETWORK_OF[key] = (
+                    *(found[name] for name in sorted(found)),
+                    tuple(sorted(checkpoint["equity"].items())),
+                )
+            except Exception:  # noqa: BLE001 - torch raises whatever the mount felt like
+                _NETWORK_OF[key] = None
+        return _NETWORK_OF[key] == wanted
+
+    return accepts
+
+
 def check_network_arguments(args: argparse.Namespace) -> None:
     """Refuse a shape that cannot be built, naming the flag, before anything starts."""
     for name, minimum in (("hidden", 1), ("num_layers", 1), ("head_hidden", 1), ("head_layers", 0)):
@@ -765,7 +867,6 @@ def run_metadata(args: argparse.Namespace) -> dict:
         "value_coef": args.value_coef,
         "policy_max_grad_norm": args.policy_max_grad_norm,
         "critic_max_grad_norm": args.critic_max_grad_norm,
-        "entropy_coef": args.entropy_coef,
         "opponent_probability": args.opponent_probability,
         "pool_models": args.pool_models,
         "table_hands": args.table_hands,
@@ -930,6 +1031,7 @@ def run_elo_fill_in(args, mix) -> tuple[int, int]:
                 sessions=args.fill_sessions,
                 session_hands=args.session_hands,
                 device=args.device,
+                fork_workers=args.session_workers,
                 lock_ttl=args.global_lock_seconds,
                 trigger_size=NO_PRUNE_TRIGGER,
                 k_schedule=parse_k_schedule(args.k_schedule),
@@ -965,6 +1067,28 @@ def run_elo_fill_in(args, mix) -> tuple[int, int]:
         draining.unlink(missing_ok=True)
     print(f"riempimento elo: {passes} passate, {sessions} sessioni giocate")
     return passes, sessions
+
+
+def _prepare_collector_copy(seed: int) -> None:
+    """Runs in each forked copy of the collector: torch's random stream is the one thing
+    outside the collector that decides actions, and it is a copy of the parent's, so every
+    copy would draw the same numbers; and a copy must not open a thread pool of its own."""
+    torch.manual_seed(seed)
+    torch.set_num_threads(1)
+
+
+def entropy_settings(args: argparse.Namespace) -> dict[str, float | int]:
+    """The entropy bonus fields of `PPOConfig`, the same for every worker: the fleet's
+    annealing curve from `--entropy-anneal-start` to `--entropy-anneal-final` over
+    `--entropy-anneal-iterations`, or, with 0 iterations, the final value from the first
+    update. None of it is swept or inherited: it is read from `config.toml`."""
+    if args.entropy_anneal_iterations:
+        return {
+            "entropy_coefficient": args.entropy_anneal_start,
+            "entropy_coefficient_final": args.entropy_anneal_final,
+            "entropy_anneal_iterations": args.entropy_anneal_iterations,
+        }
+    return {"entropy_coefficient": args.entropy_anneal_final}
 
 
 def inherited_rating(path: str | Path, *, default: float = DEFAULT_RATING) -> float:
@@ -1039,11 +1163,39 @@ def build_parser() -> argparse.ArgumentParser:
         "networks share no weight and their gradients live on different scales",
     )
     parser.add_argument(
-        "--entropy-coef", type=float, default=PPOConfig.entropy_coefficient,
-        help="weight of the entropy bonus in the PPO loss. Zero by default: a "
-        "bonus here buys per-decision dithering, not different strategies, since "
-        "it perturbs each decision independently while a bluff is a sequence. See "
-        "PPOConfig.entropy_coefficient for the measurements behind that",
+        "--update-device", default="same",
+        help="where the PPO update and the critic run: same (as --device), auto (the GPU if "
+        "there is one, else as --device), cpu or cuda. The hands are played on --device; with "
+        "--device cpu --update-device cuda a worker collects on the CPU and trains on the GPU",
+    )
+    parser.add_argument(
+        "--session-workers", type=int, default=1,
+        help="forked copies of the process that play the sessions of a rated pass at the same "
+        "time -- the validation, the pass against the anchors, the cross-machine Elo passes "
+        "(1: none). They share the loaded models and exit with their sessions. A CPU-only "
+        "option. Forwarded to every worker by poker-loop",
+    )
+    parser.add_argument(
+        "--collect-workers", type=int, default=1,
+        help="forked copies of the process that play an iteration's hands at the same time "
+        "(1: no copies). Each adds ~120 MB while it runs and exits with its hands; a CPU-only "
+        "option. Forwarded to every worker by poker-loop",
+    )
+    parser.add_argument(
+        "--entropy-anneal-iterations", type=int, default=0,
+        help="iterations over which the entropy bonus falls from --entropy-anneal-start to "
+        "--entropy-anneal-final, geometrically, counted from the start of THIS run (a worker "
+        "that inherited a trained parent starts the curve again); 0 = no annealing, the bonus "
+        "is --entropy-anneal-final from the first update. Fleet-wide: read from config.toml, "
+        "not swept",
+    )
+    parser.add_argument(
+        "--entropy-anneal-start", type=float, default=0.1,
+        help="entropy bonus at a run's first iteration (unused without annealing)",
+    )
+    parser.add_argument(
+        "--entropy-anneal-final", type=float, default=0.0001,
+        help="entropy bonus once the annealing is over (the whole run's, without annealing)",
     )
     parser.add_argument(
         "--device", default="auto",
@@ -1283,6 +1435,7 @@ def main() -> None:
     except ConfigError as error:
         parser.exit(2, f"{parser.prog}: config: {error}\n")
     args.device = resolve_device(args.device)
+    args.update_device = resolve_update_device(args.update_device, args.device)
     if args.print_config:
         print(format_config(vars(args), [k for k, v in report.applied.items() if vars(args)[k] == v]))
         return
@@ -1329,7 +1482,9 @@ def main() -> None:
     equity_config = encoder_config(equity_saved)
     model = PokerActorCritic(**shape, equity=equity_config)
     load_encoder_weights(model.equity_encoder, equity_saved)
-    critic = make_critic_fns(model, equity_net_from_checkpoint(equity_saved), device=args.device)
+    critic = make_critic_fns(
+        model, equity_net_from_checkpoint(equity_saved), device=args.update_device
+    )
     if args.resume:
         # A parent of another shape cannot be loaded into this network, and
         # `pick_parents` draws by rating, not by shape, so after the shape in
@@ -1353,12 +1508,14 @@ def main() -> None:
             table_hands=args.table_hands,
             concurrent_tables=args.concurrent_tables,
             allin_runouts=args.allin_runouts,
+            collect_workers=args.collect_workers,
+            session_workers=args.session_workers,
             styles=style_config_from_args(args),
             lam=args.gae_lambda,
         ),
         PPOConfig(
             learning_rate=args.lr,
-            entropy_coefficient=args.entropy_coef,
+            **entropy_settings(args),
             epochs=args.ppo_epochs,
             clip_epsilon=args.clip_epsilon,
             minibatch_size=args.minibatch_size,
@@ -1368,6 +1525,7 @@ def main() -> None:
             critic_stack_power=args.critic_stack_power,
         ),
         device=args.device,
+        update_device=args.update_device,
         rng=random.Random(args.seed),
         model=model,
         critic=critic,
@@ -1381,9 +1539,10 @@ def main() -> None:
     parent_settings: dict[str, float] = {}
     parent_rating = trainer.learner_rating
     if args.resume:
-        resumed = load_checkpoint(args.checkpoint, trainer.model, device=args.device)
+        resumed = load_checkpoint(args.checkpoint, trainer.model, device=args.update_device)
         # the file is the source of truth for the frozen encoder
         load_encoder_weights(trainer.model.equity_encoder, equity_saved)
+        trainer.sync_play_model()
         parent_settings = {
             axis: value
             for axis, value in (resumed.get("metadata") or {}).items()
@@ -1400,6 +1559,8 @@ def main() -> None:
     Path(args.scratch_dir).mkdir(parents=True, exist_ok=True)
     archive_path = Path(args.scratch_dir) / f"agent-{run_id}.pt"
     print(f"device {args.device} | tables {sizes_text(args.table_weights)} | {args.hands} hands/iteration")
+    if args.update_device != args.device:
+        print(f"update on {args.update_device}: hands are played on {args.device}", flush=True)
     # Built from `run_metadata`, not from `args` directly, so the line in the log
     # and the metadata inside the published checkpoint cannot disagree about what
     # this run was.
@@ -1427,6 +1588,12 @@ def main() -> None:
             )
     else:
         print(f"no models in {args.models_dir} yet -- plain self-play for this run")
+    if args.entropy_anneal_iterations:
+        print(
+            f"entropy bonus: {args.entropy_anneal_start:g} -> {args.entropy_anneal_final:g} "
+            f"over {args.entropy_anneal_iterations} iterations",
+            flush=True,
+        )
     for _ in range(args.iterations):
         stats = trainer.train_iteration()
         print(
@@ -1557,7 +1724,7 @@ def main() -> None:
             for label_, member in load_ranking(args.global_dir).members.items()
         }
         rated = rate_against_benchmark(
-            trainer.model,
+            trainer.play_model,
             args.benchmark_dir,
             mix,
             label=label,
@@ -1570,6 +1737,7 @@ def main() -> None:
             resident=args.benchmark_resident,
             rotate_every=args.benchmark_rotate_every,
             device=args.device,
+            workers=args.session_workers,
             seed=args.seed or 0,
             on_skip=lambda path, why: print(f"  benchmark, saltato {path}: {why}"),
             on_progress=PhaseProgress(SERIES),
@@ -1670,6 +1838,7 @@ def main() -> None:
                 sessions=args.global_sessions,
                 session_hands=args.session_hands,
                 device=args.device,
+                fork_workers=args.session_workers,
                 lock_ttl=args.global_lock_seconds,
                 draw=tiered_draw(
                     ranking_for_draw(args.global_dir),

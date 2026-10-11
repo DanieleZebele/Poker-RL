@@ -292,6 +292,10 @@ class StatsTracker:
     def hands(self, player_id: str) -> int:
         return len(self._hands.get(player_id, ()))
 
+    def recent(self, player_id: str) -> list[HandCounts]:
+        """The hands in the player's window, oldest first: what `add` was given."""
+        return list(self._hands.get(player_id, ()))
+
     def rates(self, player_id: str) -> dict[str, tuple[int, int]]:
         """`(events, opportunities)` per statistic over the window."""
         events = self._events.get(player_id, [0] * STAT_COUNT)
