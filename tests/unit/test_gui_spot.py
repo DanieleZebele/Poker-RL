@@ -147,7 +147,8 @@ def test_actions_appear_on_the_chair_of_whoever_is_to_act(app):
             assert has_buttons == (chair == turn_chair)
         frame._append(Action(ActionType.FOLD))
         assert frame.layout.chair_of(frame.state.to_act) != turn_chair
-        frame._undo()
+        frame.script.pop()
+        frame.refresh()
         assert frame.layout.chair_of(frame.state.to_act) == turn_chair
     finally:
         frame.destroy()

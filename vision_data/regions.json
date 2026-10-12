@@ -277,28 +277,28 @@
       "height": 34
     },
     "bet_8_2": {
-      "left": 494,
-      "top": 544,
-      "width": 68,
-      "height": 32
+      "left": 495,
+      "top": 543,
+      "width": 122,
+      "height": 33
     },
     "bet_8_3": {
-      "left": 601,
-      "top": 395,
-      "width": 79,
-      "height": 32
+      "left": 577,
+      "top": 394,
+      "width": 146,
+      "height": 34
     },
     "bet_8_4": {
-      "left": 882,
+      "left": 885,
       "top": 321,
-      "width": 79,
-      "height": 32
+      "width": 130,
+      "height": 34
     },
     "bet_8_6": {
-      "left": 1352,
-      "top": 547,
-      "width": 75,
-      "height": 28
+      "left": 1307,
+      "top": 540,
+      "width": 122,
+      "height": 39
     },
     "player_8_6": {
       "left": 1443,
@@ -319,9 +319,9 @@
       "height": 29
     },
     "bet_8_7": {
-      "left": 1160,
-      "top": 689,
-      "width": 80,
+      "left": 1126,
+      "top": 688,
+      "width": 114,
       "height": 34
     },
     "player_8_7": {
@@ -337,10 +337,10 @@
       "height": 38
     },
     "bet_8_1": {
-      "left": 679,
-      "top": 695,
-      "width": 74,
-      "height": 26
+      "left": 678,
+      "top": 691,
+      "width": 132,
+      "height": 33
     },
     "dealer_8_7": {
       "left": 1190,
@@ -349,15 +349,87 @@
       "height": 38
     },
     "bet_8_0": {
-      "left": 930,
-      "top": 687,
-      "width": 82,
-      "height": 30
+      "left": 928,
+      "top": 682,
+      "width": 107,
+      "height": 37
     },
     "bet_8_5": {
-      "left": 1226,
+      "left": 1187,
       "top": 394,
-      "width": 83,
+      "width": 158,
+      "height": 34
+    },
+    "dealer_3_0": {
+      "left": 838,
+      "top": 731,
+      "width": 40,
+      "height": 40
+    },
+    "dealer_3_1": {
+      "left": 744,
+      "top": 387,
+      "width": 42,
+      "height": 37
+    },
+    "dealer_3_2": {
+      "left": 1136,
+      "top": 386,
+      "width": 39,
+      "height": 41
+    },
+    "player_3_2": {
+      "left": 1203,
+      "top": 224,
+      "width": 135,
+      "height": 108
+    },
+    "player_3_0": {
+      "left": 877,
+      "top": 769,
+      "width": 167,
+      "height": 101
+    },
+    "bet_3_0": {
+      "left": 926,
+      "top": 685,
+      "width": 98,
+      "height": 34
+    },
+    "bet_3_2": {
+      "left": 1012,
+      "top": 357,
+      "width": 122,
+      "height": 35
+    },
+    "stack_3_2": {
+      "left": 1201,
+      "top": 356,
+      "width": 132,
+      "height": 32
+    },
+    "stack_3_0": {
+      "left": 889,
+      "top": 911,
+      "width": 138,
+      "height": 35
+    },
+    "player_3_1": {
+      "left": 581,
+      "top": 220,
+      "width": 136,
+      "height": 104
+    },
+    "stack_3_1": {
+      "left": 583,
+      "top": 357,
+      "width": 131,
+      "height": 29
+    },
+    "bet_3_1": {
+      "left": 768,
+      "top": 354,
+      "width": 115,
       "height": 33
     }
   }

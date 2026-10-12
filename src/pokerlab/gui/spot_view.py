@@ -29,7 +29,7 @@ from types import SimpleNamespace
 
 from pokerlab.cards.card import Card
 from pokerlab.cli.play import discover_global_top_models
-from pokerlab.engine.actions import Action, ActionType, LegalAction
+from pokerlab.engine.actions import FORCED_ACTIONS, Action, ActionType, LegalAction
 from pokerlab.engine.state import PlayerStatus, Street
 from pokerlab.engine.stats import StatsTracker
 from pokerlab.gui.spot import (
@@ -54,7 +54,7 @@ from pokerlab.gui.spot_table import (
     chair_for_client_seat,
     chair_slot,
 )
-from pokerlab.vision.regions import DEALER_TABLE_SIZES
+from pokerlab.vision.regions import DEALER_TABLE_SIZES, DEFAULT_TABLE_SIZE
 
 # One wheel notch over a bet or raise amount moves it by this many big blinds.
 WHEEL_STEP_BIG_BLINDS = 1
@@ -88,6 +88,10 @@ SAME_DEAL_SECONDS = 5.0
 # came after it, and the hand rebuilt from there (`_heal_script`). Not one: a stack is
 # updated a moment late, and a misread frame passes.
 HEAL_READINGS = 3
+# The actions box keeps the hands the screen has left, this many, above the current one,
+# each closed by `HAND_SEPARATOR` (`_archive_hand_log`).
+KEPT_HANDS = 30
+HAND_SEPARATOR = "─" * 12 + " nuova mano " + "─" * 12
 # Every reading that changed something, written here for whoever has to find out why the
 # rebuild went wrong (only while the screen is read; `_log_reading`).
 SCREEN_LOG = Path("hand_histories") / "spot_screen.log"
@@ -376,7 +380,7 @@ class SpotFrame(ttk.Frame):
         # Checked before the widget exists: a half-built frame left in the app
         # would fail when the app later destroys it.
         if table_size is None:
-            table_size = getattr(master, "spot_table_size", DEALER_TABLE_SIZES[0])
+            table_size = getattr(master, "spot_table_size", DEFAULT_TABLE_SIZE)
         if table_size not in DEALER_TABLE_SIZES:
             raise ValueError(f"tavolo da {table_size} non gestito: {DEALER_TABLE_SIZES}")
         super().__init__(master, padding=8)
@@ -422,11 +426,21 @@ class SpotFrame(ttk.Frame):
         self._last_dealer: int | None = None  # client seat of the button last seen
         self._seat_states: dict[int, str] = {}  # chair -> state, from the last reading
         self._seating_read = False  # whether the seats have been taken off the screen yet
+        # Whether the hand on screen was seen from its start (a hand boundary). The first
+        # one after the screen is opened usually was not -- it was joined midway, its early
+        # actions never read -- so it is not counted in the statistics.
+        self._hand_start_seen = False
         self._sync_note = ""  # what the last action rebuild did, for the status line
         self._last_view = None  # the last reading as `action_sync` saw it (engine seats, chips)
         # Chairs whose starting stack this hand was read off the screen (`_apply_stacks`):
         # only their stacks on screen are evidence of chips put in.
         self._stacks_from_screen: set[int] = set()
+        # Chairs seen with their cards face up during this hand (a showdown); emptied with
+        # the actions, so a new hand starts without it.
+        self._showdown_chairs: set[int] = set()
+        # The actions box: the lines of the hand on screen, and those of the hands before it.
+        self._hand_log: list[str] = []
+        self._past_hand_logs: list[list[str]] = []
         # The script's length when your countdown bar was seen while the engine waited on
         # you: that decision's bar has been seen, so its going away is your action.
         self._my_turn_mark: int | None = None
@@ -472,8 +486,6 @@ class SpotFrame(ttk.Frame):
         ante = ttk.Entry(top, textvariable=self.ante_var, width=5)
         ante.pack(side="left", padx=(0, 10))
         ante.bind("<Return>", lambda _e: self.refresh())
-        ttk.Button(top, text="Annulla ultima azione", command=self._undo).pack(side="left", padx=3)
-        ttk.Button(top, text="Azzera azioni", command=self._clear).pack(side="left", padx=3)
         ttk.Button(top, text="Azzera statistiche", command=self.reset_stats).pack(side="left", padx=3)
         ttk.Checkbutton(
             top, text="Policy: avversari sempre nuovi (statistiche azzerate)",
@@ -826,6 +838,39 @@ class SpotFrame(ttk.Frame):
             player_ids=ids,
         )
 
+    def _complete_hand(self) -> None:
+        """At a hand boundary, finish the hand the screen has left from its last picture.
+
+        The end of a hand is where the rebuild most often falls short: on the river no card
+        comes to prove a call, the chips go straight into the pot, and a player who mucks at
+        the showdown looks like one who folded. Whatever is still pending was decided, so it
+        is read off the stacks of that last picture (`TableView.hand_over`), before the hand
+        is recorded and archived. Said in the actions box, so a guess is not mistaken for a
+        reading."""
+        from dataclasses import replace as dc_replace
+
+        from pokerlab.gui.action_sync import sync_actions
+
+        view = self._last_view
+        if view is None or not self.script:
+            return
+        try:
+            synced, result = sync_actions(self.build_spot(), dc_replace(view, hand_over=True))
+        except ValueError:
+            return
+        if not result.actions:
+            return
+        self.script = list(synced.script)
+        self.refresh()
+        self._hand_log = [*self._hand_log, "(fine mano dedotta dagli stack)"]
+
+    def _archive_hand_log(self) -> None:
+        """Keep the actions box's lines of the hand the screen has just left, so the next
+        hand is written below them rather than over them."""
+        if self.script and self._hand_log:
+            self._past_hand_logs = [*self._past_hand_logs, self._hand_log][-KEPT_HANDS:]
+        self._hand_log = []
+
     def _hand_boundary(self, change, now: float) -> bool:
         """Whether this reading ends the hand the screen was showing.
 
@@ -983,7 +1028,7 @@ class SpotFrame(ttk.Frame):
             self.state = None
             self.situation.configure(text="")
             self.warning.configure(text=str(exc))
-            self._write(self.log, "")
+            self._write(self.log, "\n".join(self._past_log_lines()))
             self._write(self.advice, "")
             return
         state = self.state
@@ -998,7 +1043,7 @@ class SpotFrame(ttk.Frame):
             self.chair_ui[chair].info.configure(text=names[seat])
         self._write_log(state, names)
         if state.finished:
-            self.situation.configure(text="Mano conclusa: annulla l'ultima azione per riaprirla.")
+            self.situation.configure(text="Mano conclusa.")
             self._write(self.advice, "")
             return
         self._show_state(spot, state, names)
@@ -1137,6 +1182,7 @@ class SpotFrame(ttk.Frame):
         self._seat_states = {}
         self._empty_readings = {}
         self._seating_read = False
+        self._hand_start_seen = False
         self._screen_stacks = {}
         self._stacks_from_screen = set()
         self.refresh()
@@ -1182,10 +1228,19 @@ class SpotFrame(ttk.Frame):
         from pokerlab.vision.labels import SEAT_EMPTY
 
         change = diff_reading(self._last_reading, reading, self._last_hand, self._last_dealer)
+        # The first reading looks like a new hand (no button seen before it), but it is only
+        # where the screen started watching, usually in the middle of one.
+        first_reading = self._last_reading is None
         self._last_reading = reading
         if self._hand_boundary(change, time.monotonic()):
             # The hand on the screen is over: count it while the seating still describes it.
-            self._record_finished_hand()
+            self._complete_hand()
+            if self._hand_start_seen:
+                self._record_finished_hand()
+            elif self.script:
+                self._hand_log = [*self._hand_log, "(mano presa a metà: non contata nelle statistiche)"]
+            self._hand_start_seen = not first_reading
+            self._archive_hand_log()
             self._my_turn_mark = None  # a bar seen in the last hand says nothing about this one
             # ... and then forget whoever left during it, or the hand they played would be
             # the first one of the player sitting there next.
@@ -1282,6 +1337,16 @@ class SpotFrame(ttk.Frame):
                 view.out.add(self.layout.seat_of(chair))
             elif chair in self.layout.chairs and state == SEAT_IN_HAND:
                 view.in_hand.add(self.layout.seat_of(chair))
+        # Cards face up are a showdown only with the whole board out, which is when one
+        # happens. Before it they are a misreading: at the 3-seat client the card backs are
+        # not magenta, so cards held face down read as face up, and every preflop decision
+        # became a call or a check the instant a hand was dealt.
+        shown = reading.shown if reading.board is not None and len(reading.board) == 5 else ()
+        for client_seat in shown or ():
+            chair = chair_for_client_seat(self.table_size, client_seat)
+            if chair in self.layout.chairs:
+                view.shown.add(self.layout.seat_of(chair))
+                view.in_hand.add(self.layout.seat_of(chair))
         return view
 
     def _sync_actions(self, reading) -> bool:
@@ -1299,6 +1364,9 @@ class SpotFrame(ttk.Frame):
             return False
         view.my_turn_seen = self._my_turn_mark == len(self.script)
         self._last_view = view
+        if not self.script:
+            self._showdown_chairs = set()  # a new hand (or none yet): no showdown in it
+        self._showdown_chairs |= {self.layout.chair_of(seat) for seat in view.shown}
         try:
             healed = self._heal_script(view)
             spot = self.build_spot()
@@ -1339,7 +1407,12 @@ class SpotFrame(ttk.Frame):
         for index, (seat, action) in enumerate(state.taken[: len(self.script)]):
             if action.action_type is ActionType.FOLD and seat in view.in_hand:
                 now[(index, seat, action)] = "ha ancora le carte"
-            elif action.action_type is ActionType.ALL_IN and view.stacks.get(seat, 0) > view.tolerance:
+            elif (
+                action.action_type is ActionType.ALL_IN and not state.finished
+                and view.stacks.get(seat, 0) > view.tolerance
+            ):
+                # Once the hand is over the pot is paid: an all-in that won has chips again,
+                # and taken back it left the hand recorded without it (a VPIP of 0).
                 now[(index, seat, action)] = "ha ancora chips"
         self._contradicted = {key: self._contradicted.get(key, 0) + 1 for key in now}
         due = sorted(key for key, count in self._contradicted.items() if count >= HEAL_READINGS)
@@ -1370,6 +1443,7 @@ class SpotFrame(ttk.Frame):
                 f"{time.strftime('%H:%M:%S')} hole={reading.hole} board={reading.board} "
                 f"dealer={reading.dealer} seats={reading.seats} bets={reading.bets} "
                 f"stacks={reading.stacks} pot={reading.pot} my_turn={reading.my_turn} "
+                f"shown={sorted(reading.shown) if reading.shown is not None else None} "
                 f"| script[{len(self.script)}]={script} | {where}{self._sync_note}\n"
             )
             with SCREEN_LOG.open("a", encoding="utf-8") as out:
@@ -1533,21 +1607,49 @@ class SpotFrame(ttk.Frame):
         self.script.append(action)
         self.refresh()
 
-    def _undo(self) -> None:
-        if self.script:
-            self.script.pop()
-        self.refresh()
+    def _past_log_lines(self) -> list[str]:
+        """The hands the screen has left, each closed by the separator."""
+        return [line for hand in self._past_hand_logs for line in (*hand, HAND_SEPARATOR)]
 
-    def _clear(self) -> None:
-        self.script.clear()
-        self.refresh()
+    def _street_heading(self, street: Street) -> str:
+        """"FLOP: Ks 8d 3h": the street, with its board cards when they are all known."""
+        shown = {Street.FLOP: 3, Street.TURN: 4, Street.RIVER: 5}.get(street, 0)
+        cards = list(self.board[:shown])
+        heading = street.value.upper()
+        if shown and len(cards) == shown and all(cards):
+            heading += ": " + " ".join(card_text(c) for c in cards)
+        return heading
 
     def _write_log(self, state: SpotState, names: list[str]) -> None:
         lines = []
+        # The street of each decision, from the engine's own records (blinds and antes first,
+        # then one record per scripted action, in the same order as `taken`).
+        decisions = [r for r in state.records if r.action_type not in FORCED_ACTIONS]
+        street = Street.PREFLOP
+        big_blind = self._big_blind()
         for number, (seat, action) in enumerate(state.taken, start=1):
+            record = decisions[number - 1] if number <= len(decisions) else None
+            if record is not None and record.street is not street:
+                street = record.street
+                lines.append(self._street_heading(street))
             name = self._player_name(self.layout.chair_of(seat))
-            lines.append(f"{number}. {name} ({names[seat]}): {describe_action(action, None, self._big_blind())}")
-        self._write(self.log, "\n".join(lines))
+            text = describe_action(action, None, big_blind)
+            if action.action_type is ActionType.CALL and record is not None:
+                # What the call cost, off the engine's record (an `Action` carries no amount).
+                text = f"call {format_bb(record.stack_before - record.stack_after, big_blind)}"
+            lines.append(f"{number}. {name} ({names[seat]}): {text}")
+        if self._showdown_chairs:
+            # Everyone the rebuilt hand still has in, once someone's cards were seen face up.
+            folded = {seat for seat, action in state.taken if action.action_type is ActionType.FOLD}
+            players = [
+                f"{self._player_name(chair)} ({names[seat]})"
+                for seat, chair in enumerate(self.layout.order()) if seat not in folded
+            ]
+            if len(players) > 1:
+                players = [", ".join(players[:-1]), players[-1]]
+            lines.append("Showdown: " + " e ".join(players))
+        self._hand_log = lines
+        self._write(self.log, "\n".join(self._past_log_lines() + lines))
         self.log.see("end")  # the latest actions always in view
 
     @staticmethod

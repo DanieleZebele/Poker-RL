@@ -30,7 +30,7 @@ from pokerlab.vision.regions import (
 )
 
 # The table size whose per-seat zones are read unless told otherwise; the spot
-# screen chooses 6 or 8 (`regions.DEALER_TABLE_SIZES`).
+# screen chooses 3, 6 or 8 (`regions.DEALER_TABLE_SIZES`).
 DEALER_PLAYERS = 6
 
 
@@ -60,6 +60,9 @@ class ScreenReading:
     # it), in big blinds; a seat whose stack could not be read is missing.
     # None when no stack zone is set.
     stacks: dict[int, float] | None = None
+    # The client seats showing their cards face up (a showdown); None when no player
+    # zone is set.
+    shown: set[int] | None = None
     problems: list[str] = field(default_factory=list)
 
 
@@ -224,10 +227,12 @@ class ScreenReader:
         if not seats:
             return
         templates = self._get_sit_out_templates()
-        read = {
-            seat: read_seat(frame, seat, templates, self._empty_backgrounds.get(name), self._reactions).state
+        readings = {
+            seat: read_seat(frame, seat, templates, self._empty_backgrounds.get(name), self._reactions)
             for seat, (name, frame) in seats.items()
         }
+        read = {seat: r.state for seat, r in readings.items()}
+        reading.shown = {seat for seat, r in readings.items() if r.face_up}
         reading.seats = keep_through_reactions(read, self._seat_states)
         reacting = sorted(seat for seat, state in read.items() if state == SEAT_REACTION)
         if reacting:

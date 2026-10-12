@@ -116,3 +116,16 @@ def test_an_opponent_showing_cards_is_in_the_hand_even_green_ones(templates):
     cv2.circle(image, (60, 80), 12, (255, 255, 255), -1)
     cv2.circle(image, (100, 80), 12, (255, 255, 255), -1)
     assert read_seat(image, 3, templates).state == "in_gioco"
+
+
+def test_face_up_cards_are_in_the_hand_with_no_card_back():
+    """A showdown: white ranks and no magenta back. Face-down cards have white too, so
+    the back is what tells them apart; your own seat never counts (your cards are always
+    face up to you)."""
+    from pokerlab.vision.seats import SeatReading
+
+    face_up = SeatReading("in_gioco", magenta=0.0, chair=0.0, white=0.109, sit_out=0.0, seat=3)
+    face_down = SeatReading("in_gioco", magenta=0.4, chair=0.0, white=0.12, sit_out=0.0, seat=3)
+    yours = SeatReading("in_gioco", magenta=0.0, chair=0.0, white=0.09, sit_out=0.0, seat=0)
+    out = SeatReading("fuori", magenta=0.0, chair=0.0, white=0.02, sit_out=0.0, seat=3)
+    assert face_up.face_up and not face_down.face_up and not yours.face_up and not out.face_up

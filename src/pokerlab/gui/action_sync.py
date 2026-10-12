@@ -33,7 +33,8 @@ What counts as proof that the seat to act (`p`) has acted:
   on the next street already), you acted -- CALL facing a bet if you are still in the
   hand, FOLD if your cards are gone, CHECK with nothing to call;
 - `p` is you, your bar was seen for this decision (`TableView.my_turn_seen`) and
-  is gone, with no chips added and nothing to call: you checked. Without it your
+  is gone, with no chips added (in front *or* off your stack) and nothing to call: you
+  checked. Without it your
   own check was found only when someone after you acted or the next card came,
   and until then the screen kept waiting on you;
 - `p`'s stack on screen (`TableView.stacks`) is lower than the engine's, and the
@@ -43,7 +44,18 @@ What counts as proof that the seat to act (`p`) has acted:
 - the next card came and `p` still has cards in front (`TableView.in_hand`) facing a
   bet: it called, whatever its stack shows (the client may update it a moment late);
 - the next card came and `p`'s stack did not move, and `p` is not shown in the hand:
-  with nothing to call it checked, facing a bet it folded.
+  with nothing to call it checked, facing a bet it folded;
+- someone's cards are face up (`TableView.shown`, a showdown): the betting is over for
+  good, read as if the next card had come -- whoever still holds cards called what it
+  faced or checked, whoever is out folded. On the river no card comes, and a call there
+  goes straight into the pot, so without this the screen waited on it for ever;
+- facing a bet, nothing in front of `p` any more and its stack down: the chips went
+  straight into the pot (on the river there is no next card to say so);
+- the next hand has started (`TableView.hand_over`, the last picture of this one): what
+  is still pending was decided, and the stacks say how -- up (it won the pot, so it stayed:
+  called or checked), down (called or bet that much), unchanged (folded facing a bet,
+  checked otherwise). A player who mucked at the showdown reads "out" like one who folded,
+  so the stack, not the cards, decides.
 
 The stacks are the chips *behind*. With the board one street ahead the drop also
 holds what `p` has put in on the new street, which is in front of it and is taken
@@ -80,6 +92,12 @@ class TableView:
     out: set[int] = field(default_factory=set)
     # Seats shown *in* the hand (their cards in front of them). Empty when not read.
     in_hand: set[int] = field(default_factory=set)
+    # Seats showing their cards face up: a showdown, so the betting is over for good.
+    shown: set[int] = field(default_factory=set)
+    # The screen has moved on to the next hand and this is the last picture of the one
+    # before: whatever the rebuild still waits on was decided, and is read off the stacks
+    # (`SpotFrame._complete_hand`).
+    hand_over: bool = False
     board_cards: int | None = None
     # The countdown bar is on your seat: the action has reached you, so every
     # seat the engine still has before you has acted. None when not read.
@@ -186,30 +204,57 @@ def next_action(state: SpotState, view: TableView, my_seat: int | None = None) -
         view.board_cards in STREET_BY_BOARD
         and _street_index(STREET_BY_BOARD[view.board_cards]) > _street_index(state.street)
     )
-    if view.my_turn and seat == my_seat and not ahead:
+    # A showdown closes the betting as surely as the next card does, and so does the
+    # next hand.
+    closed = ahead or bool(view.shown) or view.hand_over
+    if view.hand_over:
+        # Only the stack is evidence here: the cards are mucked or the table cleared, and a
+        # player still shown holding cards in a picture of a hand that just jumped to the
+        # next proves nothing about the decisions it skipped.
+        stack = view.stacks.get(seat)
+        if stack is None:
+            return None, f"fine mano: stack del posto {seat} non letto"
+        change = stack - state.stacks.get(seat, 0)
+        can_check = _legal(state, ActionType.CHECK)
+        if change > view.tolerance or abs(change) <= view.tolerance:
+            if facing > current:
+                # Up: it won the pot, so it was there at the end and called (mucked or not).
+                # Unchanged: it put nothing in, so it folded.
+                return (_call(state) if change > view.tolerance else Action(ActionType.FOLD)), ""
+            return (Action(ActionType.CHECK), "") if can_check else (None, "attendo")
+        # Down: it put that much in -- a call, or a bet or raise to that.
+        put_in = _street_chips(state, view, seat)
+        action = _to_amount(state, seat, current + put_in, view.tolerance) if put_in else None
+        if action is None and facing > current:
+            action = _call(state)  # a drop that makes no bet: it was in, so it called
+        return (action, "") if action else (None, f"stack del posto {seat} non coerente")
+    if view.my_turn and seat == my_seat and not closed:
         # Your bar is up on the engine's street: you are deciding. With the board further
         # on, the bar is your turn on the *next* street, and this decision is long made:
         # heads-up, a call that closes the street brings the card and your turn back at
         # once, and the bar never went away for the call to be seen.
         return None, "tocca a te"
     if (
-        view.board_cards in STREET_BY_BOARD
+        not view.hand_over  # the next hand clears the board: nothing to wait for
+        and view.board_cards in STREET_BY_BOARD
         and _street_index(STREET_BY_BOARD[view.board_cards]) < _street_index(state.street)
     ):
         # The engine has closed the street and moved on, the screen has not dealt the next
         # card yet: the chips in front still belong to the street just closed. Read as this
         # street's, a call that closed the preflop came back as a flop bet, over and over.
         return None, "attendo la carta"
-    if shown is not None and shown > current and not ahead:
+    if shown is not None and shown > current and not closed:
         # Chips in front beyond the engine's: a call, bet or raise to that amount.
         action = _to_amount(state, seat, shown)
         return (action, "") if action else (None, f"importo {shown} non coerente per il posto {seat}")
     put_in = _street_chips(state, view, seat)
-    if put_in and (ahead or shown is None):
+    if put_in and (closed or shown is None or shown < current or (facing > current and not shown)):
+        # Facing a bet with nothing in front and the stack down: a call that went straight
+        # into the pot (the river has no next card to prove it).
         # The table cannot show these chips (swept into the pot, or the zone not read),
         # but the stack went down by them: a call, bet or raise to that.
         action = _to_amount(state, seat, current + put_in, view.tolerance)
-        if action is None and ahead and facing > current and seat in view.in_hand:
+        if action is None and closed and facing > current and (seat in view.in_hand or seat in view.shown):
             # A drop that makes no bet (a stack caught mid-update, a misread), but the card
             # came and the player still holds cards: called.
             return _call(state), ""
@@ -217,17 +262,21 @@ def next_action(state: SpotState, view: TableView, my_seat: int | None = None) -
     if (
         seat == my_seat and view.my_turn is False and view.my_turn_seen
         and seat not in view.out and facing == current and _legal(state, ActionType.CHECK)
+        and not _stack_dropped(state, view, seat)
     ):
         # Your bar came and went, nothing went in front of you, nothing to call: a check.
+        # Not while your stack is down: the client takes the chips off the stack a moment
+        # before it draws them in front of you, and in between a bet looked like a check
+        # -- the engine moved to the next street and the hand was lost from there.
         return Action(ActionType.CHECK), ""
     if seat in view.out:
         if facing == current and _legal(state, ActionType.CHECK):
             # Out with nothing to call: it checked, and folded later on.
-            return (Action(ActionType.CHECK), "") if ahead else (Action(ActionType.FOLD), "")
+            return (Action(ActionType.CHECK), "") if closed else (Action(ActionType.FOLD), "")
         return Action(ActionType.FOLD), ""
-    if ahead:
+    if closed:
         if facing > current:
-            if seat == my_seat or seat in view.in_hand:
+            if seat == my_seat or seat in view.in_hand or seat in view.shown:
                 # The card came and the player still has cards in front (you: you are not
                 # out): called. The cards say it better than the stack, which the client
                 # may update a moment after the card -- read unchanged, it made a fold of
@@ -249,7 +298,10 @@ def next_action(state: SpotState, view: TableView, my_seat: int | None = None) -
     # action went round to you, so they acted -- the evidence a check never
     # leaves on the table by itself.
     later_acted = later_acted or (bool(view.my_turn) and my_seat is not None and seat != my_seat)
-    if later_acted and facing == current and _legal(state, ActionType.CHECK):
+    if (
+        later_acted and facing == current and _legal(state, ActionType.CHECK)
+        and not _stack_dropped(state, view, seat)  # its chips are on their way in front
+    ):
         return Action(ActionType.CHECK), ""
     return None, "attendo"
 

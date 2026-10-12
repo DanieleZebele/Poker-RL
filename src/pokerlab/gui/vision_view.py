@@ -36,7 +36,7 @@ from pokerlab.vision.regions import (
 )
 
 # The table size whose per-seat zones the screen opens on; the "Tavolo" choice
-# at the top switches the seat sections between `DEALER_TABLE_SIZES` (6 and 8),
+# at the top switches the seat sections between `DEALER_TABLE_SIZES` (3, 6 and 8),
 # each with zones of its own.
 DEALER_PLAYERS = 6
 # The card zones, in the order their buttons appear.
@@ -508,8 +508,8 @@ class VisionFrame(ttk.Frame):
         self._build_stacks(self.seat_sections)
 
     def set_players(self, size: int) -> bool:
-        """Show the seat sections of a `size`-seat table (6 or 8). The zones of
-        the other size stay saved; only which ones these sections set changes.
+        """Show the seat sections of a `size`-seat table (3, 6 or 8). The zones of
+        the other sizes stay saved; only which ones these sections set changes.
         False if nothing changed."""
         if size not in DEALER_TABLE_SIZES or size == self.players:
             self.players_size_var.set(self.players)

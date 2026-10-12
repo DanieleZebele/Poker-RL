@@ -117,6 +117,28 @@ def test_your_bar_gone_with_nothing_in_front_is_your_check():
     assert sync_actions(spot, bet)[1].actions[:1] == [(0, Action(ActionType.BET, 4))]  # chips: a bet
 
 
+def test_your_stack_down_with_nothing_in_front_yet_is_not_a_check():
+    """The client takes your chips off the stack a moment before it draws them in front
+    of you: bar gone, bet zone empty, stack down. That is a bet on its way, not a check --
+    read as one, the engine moved to the turn and the hand was lost from there."""
+    call, check = Action(ActionType.CALL), Action(ActionType.CHECK)
+    board = (parse_card("Ks"), parse_card("8d"), parse_card("3h"))
+    spot = Spot(num_players=3, my_seat=0, script=[call, call, check, check, check], board=board)
+
+    on_its_way = TableView(
+        bets={0: 0, 1: 0, 2: 0}, board_cards=3, my_turn=False, my_turn_seen=True,
+        stacks={0: 194, 1: 198, 2: 198},
+    )
+    _, result = sync_actions(spot, on_its_way)
+    assert result.actions == [] and result.waiting_for == 0
+
+    shown = TableView(
+        bets={0: 4, 1: 0, 2: 0}, board_cards=3, my_turn=False, my_turn_seen=True,
+        stacks={0: 194, 1: 198, 2: 198},
+    )
+    assert sync_actions(spot, shown)[1].actions[:1] == [(0, Action(ActionType.BET, 4))]
+
+
 def test_heads_up_your_call_is_seen_when_the_card_comes_with_your_bar_still_up():
     """Heads-up, you are the big blind (seat 1): the button raises, you call, the flop
     comes and you are first to act on it -- the bar never went away, so it was your call
@@ -228,3 +250,77 @@ def test_chips_left_in_front_of_a_closed_street_are_not_the_next_street_s():
     view = TableView(bets={0: 6, 1: 0, 2: 6}, out={1}, board_cards=0)
     _, result = sync_actions(spot, view)
     assert result.actions == [] and result.note == "attendo la carta"
+
+
+# --- the river: no next card comes to close it.
+
+def _river_bet():
+    """Three-handed, checked down to the river; the SB (seat 1) bets 3 BB, the BB to act."""
+    call, check = Action(ActionType.CALL), Action(ActionType.CHECK)
+    board = tuple(parse_card(c) for c in ("Ks", "8d", "3h", "2c", "9h"))
+    script = [call, call, check, *[check] * 6, Action(ActionType.BET, 6)]
+    spot = Spot(num_players=3, my_seat=0, script=script, board=board)
+    assert replay(spot).to_act == 2
+    return spot
+
+
+def test_a_showdown_proves_the_river_call_and_closes_the_hand():
+    """The SB bets, the BB calls, you fold; the call went straight into the pot, so
+    nothing shows -- but both their cards are turned face up: they went to the end."""
+    view = TableView(bets={0: 0, 1: 0, 2: 0}, out={0}, shown={1, 2}, board_cards=5)
+    spot, result = sync_actions(_river_bet(), view)
+    assert result.actions == [(2, Action(ActionType.CALL)), (0, Action(ActionType.FOLD))]
+    assert replay(spot).finished
+
+
+def test_a_river_call_swept_into_the_pot_is_read_off_the_stack():
+    """No cards face up (mucked), nothing in front, but the BB's stack went down by
+    the bet: it called."""
+    view = TableView(bets={0: 0, 1: 0, 2: 0}, board_cards=5, stacks={0: 198, 1: 192, 2: 192})
+    _, result = sync_actions(_river_bet(), view)
+    assert result.actions[:1] == [(2, Action(ActionType.CALL))]
+
+
+def test_without_a_showdown_or_a_stack_the_river_call_is_not_invented():
+    view = TableView(bets={0: 0, 1: 0, 2: 0}, board_cards=5, in_hand={1, 2})
+    assert sync_actions(_river_bet(), view)[1].actions == []
+
+
+# --- the hand is over (`TableView.hand_over`): the stacks decide what is still pending.
+# After the limps everyone has 198 behind; the SB's river bet of 6 leaves it 192.
+
+def _over(**stacks):
+    return TableView(
+        bets={0: 0, 1: 0, 2: 0}, out={0, 1, 2}, board_cards=0, hand_over=True,
+        stacks={int(seat[1:]): chips for seat, chips in stacks.items()},
+    )
+
+
+def test_at_the_next_hand_a_stack_that_grew_won_so_it_called():
+    """The BB's cards are gone (mucked or the table cleared), but its stack went up: it
+    won the pot, so it called. You, unchanged facing the bet, folded."""
+    spot, result = sync_actions(_river_bet(), _over(s0=198, s1=192, s2=210))
+    assert result.actions == [(2, Action(ActionType.CALL)), (0, Action(ActionType.FOLD))]
+    assert replay(spot).finished
+
+
+def test_at_the_next_hand_a_player_who_mucked_after_calling_called():
+    """The BB called and lost, then mucked: "out" like a fold, but its stack went down by
+    the bet, so it was a call."""
+    _, result = sync_actions(_river_bet(), _over(s0=198, s1=210, s2=192))
+    assert result.actions[:1] == [(2, Action(ActionType.CALL))]
+
+
+def test_at_the_next_hand_an_unchanged_stack_facing_a_bet_folded():
+    _, result = sync_actions(_river_bet(), _over(s0=198, s1=204, s2=198))
+    assert result.actions == [(2, Action(ActionType.FOLD)), (0, Action(ActionType.FOLD))]
+
+
+def test_at_the_next_hand_a_river_nobody_bet_was_checked_down():
+    """Checked to the river and everyone mucked: three checks, not three folds."""
+    call, check = Action(ActionType.CALL), Action(ActionType.CHECK)
+    board = tuple(parse_card(c) for c in ("Ks", "8d", "3h", "2c", "9h"))
+    spot = Spot(num_players=3, my_seat=0, script=[call, call, check, *[check] * 6], board=board)
+    spot, result = sync_actions(spot, _over(s0=198, s1=198, s2=204))
+    assert [a.action_type for _, a in result.actions] == [ActionType.CHECK] * 3
+    assert replay(spot).finished

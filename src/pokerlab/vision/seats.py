@@ -163,6 +163,18 @@ class SeatReading:
     sit_out: float
     empty: float = float("inf")  # distance from this zone's empty background
     reaction: float = 0.0  # orange share of a reaction emoji
+    seat: int = -1
+
+    @property
+    def face_up(self) -> bool:
+        """An opponent's cards turned face up (a showdown): in the hand, with no card back.
+        White does not tell them apart -- face-down cards have it too (0.076-0.144 measured
+        on the labelled crops) -- the magenta of the back does (>= 0.10 face down, 0.0 on
+        the labelled face-up crop)."""
+        return (
+            self.seat != YOUR_SEAT and self.state == SEAT_IN_HAND
+            and self.magenta < MAGENTA_IN_HAND and self.white >= OPPONENT_WHITE_IN_HAND
+        )
 
 
 def read_seat(image: np.ndarray, seat: int, templates: list[np.ndarray],
@@ -187,7 +199,7 @@ def read_seat(image: np.ndarray, seat: int, templates: list[np.ndarray],
         state = SEAT_EMPTY
     else:
         state = SEAT_OUT
-    return SeatReading(state, magenta, chair, white, sit_out, empty, reaction)
+    return SeatReading(state, magenta, chair, white, sit_out, empty, reaction, seat)
 
 
 @dataclass
