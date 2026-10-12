@@ -23,6 +23,7 @@ import torch
 
 from pokerlab.players.rl_agent import RLAgentPlayer
 from pokerlab.rl.forking import run_in_copies, torch_seeded
+from pokerlab.rl.memory import release_free_memory
 from pokerlab.rl.policy import PokerActorCritic, make_policy_fn
 from pokerlab.rl.pool_registry import (
     DEFAULT_K_SCHEDULE,
@@ -292,6 +293,8 @@ def rate_against_benchmark(
                 # for hours. Read by `monitor._SERIES_DETAIL`.
                 running = won / mix.big_blind / (played * hands) * 100
                 on_progress(played, sessions, f"rating {current:.0f}, {running:+.1f} bb/100")
+        # The slice's models are dropped at the next one: give their pages back first.
+        release_free_memory()
 
     if played == 0:
         return None

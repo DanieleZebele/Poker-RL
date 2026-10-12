@@ -28,6 +28,7 @@ from pathlib import Path
 
 from pokerlab.rl.device import resolve_device
 from pokerlab.rl.forking import run_in_copies, torch_seeded
+from pokerlab.rl.memory import release_free_memory
 from pokerlab.rl.global_store import (
     DEFAULT_LOCK_SECONDS,
     PRUNE_LOCK,
@@ -575,6 +576,7 @@ def play_global_sessions(
     played = [results for results, _exported in outcomes]
     if styles is not None:
         styles.extend(exported for _results, exported in outcomes)
+    release_free_memory()
     return played
 
 
