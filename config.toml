@@ -1,6 +1,6 @@
 
 [fleet]
-worker_ceiling = 3
+worker_ceiling = 5
 device = "cpu"      # "auto": the GPU if torch sees one, else "cpu"; or "cpu" / "cuda" to force it
 update_device = "auto"   # where the PPO update and the critic run: "same" as device; "auto" = the GPU if the machine has one, else as device; or "cpu" / "cuda". The hands are always played on device
 collect_workers = 20  # forked copies of each worker that play its iteration's hands at the same time (~120 MB each while they run); 1 = none. cpu only
@@ -18,7 +18,7 @@ sb = 50
 bb = 100
 
 [training]
-iterations = 2000
+iterations = 1000
 table_hands = 200       # hands a training table keeps the same players: the opponent statistics fill in over them
 concurrent_tables = 8   # tables played in turn, so a batch is not the same few opponents
 allin_runouts = 20      # a hand all-in before the river trains on its expected result over this many boards (0: the real chips)
@@ -48,7 +48,7 @@ equity_model = "equity_evaluator/distill-lat32_h256_h1.pt"   # required: an equi
 pool_models = 20
 
 [inheritance]
-parent_tiers = "10, 100, all"   # Where a worker's parent comes from.
+parent_tiers = "5, 10, 100, all"   # Where a worker's parent comes from.
 
 [starting-point]
 lr = 0.00005
@@ -91,7 +91,7 @@ global_sessions = 50
 
 [fill-in]
 elo_fill_in = true         
-fill_deadline_minutes = 300
+fill_deadline_minutes = 1000
 fill_sessions = 10
 
 [pruning]
