@@ -35,6 +35,7 @@ from pokerlab.rl.benchmark import (
 )
 from pokerlab.rl.device import resolve_device, resolve_update_device
 from pokerlab.rl.forking import run_in_copies, torch_seeded
+from pokerlab.rl.memory import release_free_memory
 from pokerlab.rl.equity_net import (
     encoder_config,
     equity_net_from_checkpoint,
@@ -617,6 +618,7 @@ class SelfPlayTrainer:
             self._learner_rating += deltas.get(LEARNER_LABEL, 0.0)
             self._learner_games += 1
 
+        release_free_memory()
         return won / mix.big_blind / (sessions * hands) * 100
 
     def archive(
@@ -668,6 +670,10 @@ class SelfPlayTrainer:
         stats["iteration"] = float(self._iteration)
         stats["decisions"] = float(len(batch))
         stats["reward_bb"] = sum(t.reward for t in trajectories) / max(len(trajectories), 1)
+        # The batch and the trajectories are dropped when this returns; hand back their pages
+        # now, or the process grows by a few tens of MB with every iteration.
+        del batch, trajectories
+        release_free_memory()
         return stats
 
     def train(

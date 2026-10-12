@@ -3,8 +3,8 @@
 worker_ceiling = 5
 device = "cpu"      # "auto": the GPU if torch sees one, else "cpu"; or "cpu" / "cuda" to force it
 update_device = "auto"   # where the PPO update and the critic run: "same" as device; "auto" = the GPU if the machine has one, else as device; or "cpu" / "cuda". The hands are always played on device
-collect_workers = 10  # forked copies of each worker that play its iteration's hands at the same time (~120 MB each while they run); 1 = none. cpu only
-session_workers = 10   # the same for the sessions of a rated pass: the validation, the pass against the anchors, the Elo passes. cpu only
+collect_workers = 20  # forked copies of each worker that play its iteration's hands at the same time (~120 MB each while they run); 1 = none. cpu only
+session_workers = 20   # the same for the sessions of a rated pass: the validation, the pass against the anchors, the Elo passes. cpu only
 
 [elo]
 k_schedule = "0:16, 20:11, 45:7.4, 80:5, 140:3.4, 225:2.3, 325:1.6, 500:1.05, 750:0.72, 1200:0.49, 1700:0.33, 2500:0.22, 3750:0.15, 5500:0.1, 8500:0.07, 12000:0.047, 18000:0.032, 27500:0.022, 40000:0.015, 60000:0.01"
@@ -18,7 +18,7 @@ sb = 50
 bb = 100
 
 [training]
-iterations = 2000
+iterations = 1000
 table_hands = 200       # hands a training table keeps the same players: the opponent statistics fill in over them
 concurrent_tables = 8   # tables played in turn, so a batch is not the same few opponents
 allin_runouts = 20      # a hand all-in before the river trains on its expected result over this many boards (0: the real chips)
@@ -48,7 +48,7 @@ equity_model = "equity_evaluator/distill-lat32_h256_h1.pt"   # required: an equi
 pool_models = 20
 
 [inheritance]
-parent_tiers = "10, 100, all"   # Where a worker's parent comes from.
+parent_tiers = "5, 10, 100, all"   # Where a worker's parent comes from.
 
 [starting-point]
 lr = 0.00005
@@ -91,11 +91,11 @@ global_sessions = 50
 
 [fill-in]
 elo_fill_in = true         
-fill_deadline_minutes = 300
+fill_deadline_minutes = 1000
 fill_sessions = 10
 
 [pruning]
-global_trigger_size = 1000
+global_trigger_size = 900
 global_eliminate_fraction = 0.05
 global_protect_percentile = 25.0
 

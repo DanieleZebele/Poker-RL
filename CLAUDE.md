@@ -575,6 +575,21 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
   callbacks keep their meaning (a step per session; the benchmark's arrive in bursts after each
   slice). **CPU only**, like the collection. The `workers` of `play_sharded`/`poker-elo
   --workers` (subprocesses that each reload every model) is another thing and unchanged.
+- **A worker's memory is handed back at the end of every iteration** (`rl/memory.py::
+  release_free_memory`: `gc.collect()` and glibc `malloc_trim(0)`, Linux only; also at the end
+  of the validation, of each benchmark slice and of an Elo pass). Why: each decision carries a
+  list of ~660 Python floats (~20 KB), so an iteration builds and drops hundreds of MB; glibc
+  keeps most of those pages in its free lists, and fragmentation keeps them from merging, so
+  the resident size drifted up ~20 MB an iteration (1,091 -> 1,310 MB in 12 iterations, with
+  300-500 MB of it free memory `malloc_trim` hands back) -- on a machine running many workers
+  that is what fills it. With the release the size at the end of an iteration is flat at
+  ~870 MB and the number of Python objects stops growing once the style windows
+  (`STYLE_WINDOW`, 20,000 seat-hands per group) are full, around 36 iterations of 1,024 hands.
+  The peak inside an iteration is the same; the cost of the release is a few tenths of a
+  second per iteration. **The bigger fix, not done**: keep a decision's features as a compact
+  array (`array('f')`, 2.6 KB) instead of a list of Python floats, which would cut the batch
+  ~8x; it touches `features.py`'s pure-list contract, `build_batch` and the pickling of the
+  forked copies.
 - **Two gradient-norm clips, one per network** (`ppo.py`): `policy_max_grad_norm` (the old
   `max_grad_norm`) on the policy's trunk and head, `critic_max_grad_norm` on the critic's;
   both are axes of the sweep, starting from `config.toml` `[starting-point]`. A parent
