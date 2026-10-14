@@ -42,28 +42,6 @@ def test_the_module_does_not_import_torch():
     assert finished.stdout.strip() == "False", finished.stdout
 
 
-def test_the_draw_reaches_the_least_played_first(tmp_path):
-    """The automatic passes sample uniformly on purpose -- they can delete people.
-    This one exists to reach models those passes have never seated."""
-    population = [Candidate(label=f"m{i}", path=tmp_path / f"m{i}.pt") for i in range(10)]
-    counts = {f"m{i}": {"games": i * 100} for i in range(10)}
-
-    drawn = arena.least_played_draw(counts)(population, 4, random.Random(1))
-
-    assert len(drawn) == 4
-    # Half the slots go to the least played, deterministically.
-    assert {c.label for c in drawn[:2]} == {"m0", "m1"}
-
-
-def test_a_model_never_rated_is_drawn_before_a_veteran(tmp_path):
-    population = [Candidate(label=n, path=tmp_path / f"{n}.pt") for n in ("vet", "new")]
-    counts = {"vet": {"games": 900}}   # "new" is absent, i.e. zero games
-
-    drawn = arena.least_played_draw(counts)(population, 1, random.Random(0))
-
-    assert [c.label for c in drawn] == ["new"]
-
-
 # The test store holds a handful of models: a six-handed table is the largest it seats.
 SIX_SEATS = ["--table-weights", "0", "0", "0", "0", "1", "0", "0", "0"]
 
@@ -122,20 +100,49 @@ def test_prune_restores_the_ordinary_trigger(tmp_path, monkeypatch):
     assert calls[0]["trigger_size"] == 1234
 
 
-def test_random_coverage_passes_no_draw_at_all(tmp_path, monkeypatch):
-    """`--elo-coverage random` has to fall back to the pass's own uniform sample,
-    not to a re-implementation of it."""
+def test_the_draw_is_the_tiered_one_the_end_of_run_pass_uses(tmp_path, monkeypatch):
+    """Each tier of `--draw-tiers` gets an equal share of the seats, as in `poker-train`."""
+    root = store(tmp_path, models=12)
+    for index in range(12):
+        write_member(
+            root / "global", PoolMember(label=f"m{index}", ref="x", rating=1500.0 + index, games=1)
+        )
+
+    calls = run_with_stub(monkeypatch, [
+        "--root", str(root), "--global-dir", str(root / "global"), "--draw-tiers", "3, all",
+    ])
+    draw = calls[0]["draw"]
+    population = [Candidate(label=f"m{i}", path=None) for i in range(12)]
+    import random
+
+    drawn = {c.label for c in draw(population, 6, random.Random(0))}
+
+    # The three best rated are m11, m10, m9: half of the six seats go to them, the rest to everyone else.
+    assert len(drawn) == 6
+    assert len(drawn & {"m11", "m10", "m9"}) == 3
+
+
+def test_session_workers_play_each_draw_in_forked_copies_not_shards(tmp_path, monkeypatch):
     root = store(tmp_path)
 
     calls = run_with_stub(monkeypatch, [
-        "--root", str(root), "--global-dir", str(root / "global"), "--elo-coverage", "random",
+        "--root", str(root), "--global-dir", str(root / "global"), "--device", "cpu",
+        "--session-workers", "3", "--workers", "5",
     ])
 
-    assert calls[0]["draw"] is None
-    played = run_with_stub(monkeypatch, [
-        "--root", str(root), "--global-dir", str(root / "global"), "--elo-coverage", "played",
+    assert calls[0]["fork_workers"] == 3
+    assert calls[0]["workers"] == 1
+
+
+def test_without_session_workers_nothing_is_forked(tmp_path, monkeypatch):
+    root = store(tmp_path)
+
+    calls = run_with_stub(monkeypatch, [
+        "--root", str(root), "--global-dir", str(root / "global"), "--workers", "2",
     ])
-    assert played[0]["draw"] is not None
+
+    assert calls[0]["fork_workers"] == 1
+    assert calls[0]["workers"] == 2
 
 
 def test_a_store_too_small_to_seat_a_table_is_reported_not_crashed(tmp_path):

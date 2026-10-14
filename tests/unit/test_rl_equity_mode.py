@@ -320,3 +320,41 @@ def test_a_parent_built_with_another_encoder_is_reported_like_one_of_another_sha
     save_checkpoint(tmp_path / "p.pt", model)
     assert parent_shape_mismatch(tmp_path / "p.pt", model.shape, model.equity) is None
     assert parent_shape_mismatch(tmp_path / "p.pt", model.shape, {**model.equity, "latent": 4}) is not None
+
+
+def test_the_equity_inputs_are_what_a_seat_by_seat_fill_would_write():
+    """`deal_tensors` writes with one indexed assignment per tensor; it has to give exactly what
+    assigning each deal and seat on its own gives, with empty seats, empty boards and a lone deal."""
+    import random
+
+    from pokerlab.rl.policy import CARDS, EQUITY_SLOTS, deal_tensors
+    from pokerlab.rl.rollout import DealView
+
+    rng = random.Random(3)
+    views = []
+    for _ in range(200):
+        deck = list(range(CARDS))
+        rng.shuffle(deck)
+        seats = rng.randint(2, EQUITY_SLOTS)
+        holes = [(deck[2 * i], deck[2 * i + 1]) for i in range(seats)]
+        holes += [None] * (EQUITY_SLOTS - seats)
+        rng.shuffle(holes)
+        views.append(DealView(holes=tuple(holes), board=tuple(deck[20 : 20 + rng.choice([0, 3, 4, 5])])))
+
+    expected_holes = torch.zeros(len(views), EQUITY_SLOTS, CARDS)
+    expected_board = torch.zeros(len(views), CARDS)
+    expected_mask = torch.zeros(len(views), EQUITY_SLOTS, dtype=torch.bool)
+    for row, view in enumerate(views):
+        for slot, cards in enumerate(view.holes):
+            if cards is not None:
+                expected_holes[row, slot, list(cards)] = 1.0
+                expected_mask[row, slot] = True
+        expected_board[row, list(view.board)] = 1.0
+
+    holes, board, mask = deal_tensors(views)
+    assert torch.equal(holes, expected_holes)
+    assert torch.equal(board, expected_board)
+    assert torch.equal(mask, expected_mask)
+    # Nothing to write at all is fine too.
+    empty_holes, empty_board, empty_mask = deal_tensors([DealView(holes=(None,) * EQUITY_SLOTS, board=())])
+    assert not empty_holes.any() and not empty_board.any() and not empty_mask.any()

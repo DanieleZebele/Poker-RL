@@ -11,7 +11,10 @@ import pytest
 
 # The studies are scripts, not part of the package (`src/` never imports them), run with
 # their own folder on the path: the tests import them the same way.
-STUDY_DIRS = (Path(__file__).resolve().parents[1] / "studies" / "agents",)
+STUDY_DIRS = (
+    Path(__file__).resolve().parents[1] / "studies" / "agents",
+    Path(__file__).resolve().parents[1] / "studies" / "player_embedding",
+)
 for _folder in STUDY_DIRS:
     if str(_folder) not in sys.path:
         sys.path.insert(0, str(_folder))

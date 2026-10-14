@@ -35,6 +35,11 @@ class PPOConfig:
     # iterations and stays there (see `entropy_coefficient_at`); 0 iterations = constant.
     entropy_coefficient_final: float = 0.0
     entropy_anneal_iterations: int = 0
+    # The learning rate falls geometrically from `learning_rate` to `learning_rate_final`
+    # over `learning_rate_anneal_iterations` iterations and stays there (see
+    # `learning_rate_at`); 0 iterations = constant.
+    learning_rate_anneal_iterations: int = 0
+    learning_rate_final: float = 1e-5
     epochs: int = 4
     minibatch_size: int = 1024
     # The gradient-norm clip, one per network: the policy and the critic share no weight,
@@ -55,6 +60,15 @@ class PPOConfig:
     critic_stack_power: float = 0.0
 
     def __post_init__(self) -> None:
+        if self.learning_rate_anneal_iterations < 0:
+            raise ValueError("learning_rate_anneal_iterations cannot be negative")
+        if self.learning_rate_anneal_iterations and (
+            self.learning_rate <= 0 or self.learning_rate_final <= 0
+        ):
+            raise ValueError(
+                "annealing the learning rate needs a positive start and a positive final value: "
+                "it falls geometrically, and a geometric curve never leaves or reaches 0"
+            )
         if self.entropy_anneal_iterations < 0:
             raise ValueError("entropy_anneal_iterations cannot be negative")
         if self.entropy_anneal_iterations and (
@@ -80,6 +94,20 @@ def entropy_coefficient_at(config: PPOConfig, iteration: int) -> float:
         return config.entropy_coefficient
     progress = min(max(iteration - 1, 0) / steps, 1.0)
     return config.entropy_coefficient * (config.entropy_coefficient_final / config.entropy_coefficient) ** progress
+
+
+def learning_rate_at(config: PPOConfig, iteration: int) -> float:
+    """The learning rate of a run's `iteration`-th update (1-based).
+
+    Geometric from `learning_rate` (the worker's own, swept, value) at the first iteration
+    to the fleet's `learning_rate_final` (an absolute value) after
+    `learning_rate_anneal_iterations` more, then flat. Counted from the start of the run, like the entropy bonus: a child that
+    resumed a trained parent starts at its own `lr` again."""
+    steps = config.learning_rate_anneal_iterations
+    if steps == 0:
+        return config.learning_rate
+    progress = min(max(iteration - 1, 0) / steps, 1.0)
+    return config.learning_rate * (config.learning_rate_final / config.learning_rate) ** progress
 
 
 @dataclass
@@ -186,9 +214,15 @@ def ppo_update(
     policy_norms: list[float] = []
     critic_norms: list[float] = []
 
+    # Every minibatch has exactly `minibatch_size` decisions: the remainder that would make a
+    # smaller last one is left out of this epoch (the next one shuffles again, so it is a
+    # different handful each time). A batch smaller than one minibatch is used whole.
+    full = len(batch) - len(batch) % config.minibatch_size
+    stop = full if full else len(batch)
+
     for _ in range(config.epochs):
         permutation = torch.randperm(len(batch), device=batch.features.device)
-        for start in range(0, len(batch), config.minibatch_size):
+        for start in range(0, stop, config.minibatch_size):
             index = permutation[start : start + config.minibatch_size]
             logits, values = model(
                 batch.features[index],

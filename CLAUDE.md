@@ -371,7 +371,26 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
   global ranking at the rating the learner measured. Publishing once at the end
   is what makes a label mean one set of weights forever — overwriting a model that
   already has a rating history would blend two different networks into one Elo.
-  There is no mid-run archiving and no cadence flag.
+  The one exception is the **snapshot** (`--snapshot-every N`, `snapshot_every` in `[benchmark]` of
+  `config.toml`, 0 = off): every N iterations (not the last, which is the final model) a run copies
+  its weights, plays `--snapshot-benchmark-sessions` rated sessions against the frozen anchors
+  (`train.publish_snapshot`, the same `rate_against_benchmark` as the final model's pass, started
+  from the learner's rating and session count *at that moment*) and publishes the copy as a model
+  of its own, label `<final label>-i<iteration>`, at the rating that earned. Each label is still
+  one set of weights forever. **What the anchors said becomes the learner's rating**
+  (`SelfPlayTrainer.adopt_rating`; not its session count, not its optimizer): the next snapshot,
+  and the final model's pass, start from the rating the previous snapshot earned and not from the
+  validation's number, so the run's rating is one chain. The session count that sets the K stays
+  the learner's own (its validation sessions, not the snapshots' passes): carrying it too would
+  drive the K down to ~0.1 after a few snapshots, and a rating built on sessions of earlier, weaker
+  networks would then lag the weights as they improve. A snapshot has no population pass, no sweep observation and no anchor promotion: those are the
+  final model's. With no anchors to rate it, it is not published (never at the pool's number). The
+  file sits in the scratch directory as `snapshot-*.pt`, a name the loop's sweep does not publish,
+  and is deleted whether or not it was published, so a worker that dies mid-pass leaves nothing that
+  could enter the ranking on an unearned rating. The metadata carries `snapshot_iteration` and
+  `run_label`. Cost: the pass plays `snapshot_benchmark_sessions` x 1,000 hands per snapshot (500
+  sessions = 0.5M hands, ~19 snapshots over 2,000 iterations), and the store grows by that many
+  near-duplicate models per run, which `pick_parents` can draw as parents like any other.
   If a run dies before it can publish, the loop's sweep publishes the scratch
   file from the sidecar (see "Continuous training loop"). The name carries the
   machine (`--machine`) and, from `poker-loop`, the generation and worker
@@ -432,9 +451,16 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
   bb/100, so it is rated through `DEFAULT_K_SCHEDULE` on its own session count,
   which is what makes the number mean something inside a run — see "K follows a
   staircase".
-  - **It starts at the parent's rating, not at 1500** (`train.inherited_rating`,
-    read off the resumed checkpoint's `publish_rating` metadata, falling back to
-    `pool_rating` and then to the baseline). A child is its parent plus some
+  - **It starts at the parent's rating, not at 1500, and at the one the ledger holds
+    *now*, not the one the parent was published with.** `launch_worker` reads the
+    parent's member file (`global_store.read_member`) and passes `--initial-rating`;
+    the parent has been rated since it was published, which is the better estimate.
+    A parent the ledger no longer knows (pruned, never rated) passes nothing and the
+    worker falls back to `train.inherited_rating`, the resumed checkpoint's
+    `publish_rating` metadata, then `pool_rating`, then the baseline; so does a
+    hand-run `poker-train --resume`. The sweep log's `parent_rating` is the same
+    number (the learner's starting rating), so a step's gain is measured against the
+    parent's rating at launch. A child is its parent plus some
     training, not an unknown quantity, so starting at 1500 would spend the run's
     first rated sessions re-discovering where its own lineage already sits. The
     *session count* still starts at zero, and the two together are exactly what
@@ -528,6 +554,15 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
   also removed `_HP_SEED_FROM_ZERO` and the seed step in `sweep_optimizer.log_step`). A parent's
   metadata may still carry the old key; nothing reads it. Pinned in `test_rl_ppo.py`
   (`test_the_entropy_bonus_falls_geometrically...`, `test_every_iteration_updates_with...`).
+- **The learning rate falls over a run too** (`ppo.learning_rate_at`, `--lr-anneal-iterations`,
+  `--lr-anneal-final`, `[training]` in `config.toml`: 500 iterations, final 1e-5). Unlike the
+  entropy bonus, `lr` stays a swept axis: the worker's own value (`--lr`, perturbed/inherited as
+  before) is where *its* curve starts, and the fleet-wide setting is the *absolute* rate every
+  run ends at, reached geometrically over the first N iterations *of the run*, then flat; N = 0
+  is a constant rate (the worker's `lr`). A worker whose swept `lr` ends up below the final
+  value would see its rate rise toward it: nothing clamps that. `train_iteration` writes the rate into the optimizer's param groups before each
+  update. The recorded `lr` (metadata, `iperparametri:`, the sweep's observations) is the starting
+  one, so a lineage's drift in `lr` keeps its meaning. Pinned in `test_rl_ppo.py`.
 - **Hands can be collected by forked copies of the worker** (`--collect-workers N`,
   `collect_workers` in `[fleet]`, default 1 = none; `SelfPlayCollector.collect(workers=)`,
   `_play_in_copies`). The parent draws the iteration's tables up front (`ceil(hands /
@@ -559,6 +594,18 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
   network it is given. `save_checkpoint` writes CPU tensors, so a model published by a GPU
   worker loads anywhere. Each worker on a GPU opens its own CUDA context. Tested with
   `cpu`/`cpu:0` as the two devices in `test_rl_ppo.py`; **not run on a real GPU yet**.
+- **The opponent pool is drawn again every `pool_refresh_every` iterations** (`--pool-refresh-every`,
+  `[opponent-pool]` in `config.toml`, 10 in the shipped file; 0 = once, at the start, as before).
+  A refresh is a whole new `draw_training_pool` over the store and the ranking *as they are now*,
+  with the worker's own `pool_top_share` and `pool_top_n` (two swept axes, so each lineage keeps
+  its own); `train.refreshed_opponents` loads only the models not already in memory (one drawn
+  again keeps its object, the ones that left are freed), `SelfPlayTrainer.refresh_opponents` swaps
+  the collector's pool (`SelfPlayCollector.set_pool`: the tables already open keep their players,
+  the next ones sit the new ones) and the in-memory registry the validation scores against. The
+  learner's rating and session count are the trainer's and carry over. It reprints `pool rating:
+  media ...` so the dashboard's `pool` column follows the field the run faces now. Cost measured:
+  loading 20 models is ~1.5 s, against 30-50 s an iteration. A refresh does not touch a model's
+  weights or any rating; it only changes who is drawn to sit opposite.
 - **Rated sessions can be played by forked copies too** (`--session-workers N`,
   `session_workers` in `[fleet]`, default 1; `rl/forking.py::run_in_copies`). It covers every
   phase that plays sessions for a rating: the validation (`evaluate_against_pool`), the pass
@@ -575,6 +622,12 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
   callbacks keep their meaning (a step per session; the benchmark's arrive in bursts after each
   slice). **CPU only**, like the collection. The `workers` of `play_sharded`/`poker-elo
   --workers` (subprocesses that each reload every model) is another thing and unchanged.
+  `benchmark_arena` takes `--session-workers` too (`session_workers` in `[fleet]`, so the file's 30
+  applies): each batch of `arena_checkpoint_sessions` goes to `play_global_sessions(fork_workers=)`,
+  the anchors loaded once per batch and shared; it wins over its own `--workers` (shards) when both
+  are above 1, refuses `--device cuda`, and the startup projection drops the shard-load term.
+  `poker-elo` takes `--session-workers` too (each draw's sessions go to `run_population_sessions(
+  fork_workers=)`; wins over its `--workers`, refuses cuda). Its draw is `tiered_draw` with `draw_tiers`, the end-of-run pass's own.
 - **A worker's memory is handed back at the end of every iteration** (`rl/memory.py::
   release_free_memory`: `gc.collect()` and glibc `malloc_trim(0)`, Linux only; also at the end
   of the validation, of each benchmark slice and of an Elo pass). Why: each decision carries a
@@ -590,6 +643,18 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
   array (`array('f')`, 2.6 KB) instead of a list of Python floats, which would cut the batch
   ~8x; it touches `features.py`'s pure-list contract, `build_batch` and the pickling of the
   forked copies.
+- **Every PPO minibatch has exactly `minibatch_size` decisions** (`ppo_update`): when the batch is
+  not a multiple of it, the remainder that would make a smaller last minibatch is left out of that
+  epoch (each epoch shuffles again, so it is a different handful each time). A batch smaller than
+  one minibatch is used whole. `minibatch_size` counts *decisions*, not hands (~10 a hand at the
+  default mixture), so a run's steps are about `epochs x floor(hands x 10 / minibatch_size)`.
+- **The critic's equity inputs are written with indexed assignments, not seat by seat**
+  (`policy.deal_tensors`, used by `make_critic_fns.equity`): one assignment per tensor from flat
+  (row, seat, card) lists. The seat-by-seat loop was ~7 s of pure Python per iteration at 66,000
+  decisions, serial in the parent whatever the device (measured 15-20 s for `_fill_critic` before,
+  ~5 s after, on 8,000 hands with 24 forks and a CPU critic). What is left of the serial part of an
+  iteration is the features' list-to-tensor conversion (twice: the critic's value and
+  `build_batch`) and the unpickling of the forks' lists; see the compact-array note above.
 - **Two gradient-norm clips, one per network** (`ppo.py`): `policy_max_grad_norm` (the old
   `max_grad_norm`) on the policy's trunk and head, `critic_max_grad_norm` on the critic's;
   both are axes of the sweep, starting from `config.toml` `[starting-point]`. A parent
@@ -1250,8 +1315,8 @@ and run at the speed of one), organised into generations.
       record writes one (`--parent-label`, passed by `launch_worker`; a no-parent
       worker has no step to report). **Models published before this existed carry no
       parent and cannot be backfilled.**
-    - **Gain is `child rating - parent rating`**, both as published (earned against
-      the pinned anchors), frozen in the file, so a pruned parent takes no evidence
+    - **Gain is `child rating - parent rating`**, the child as published (earned against
+      the pinned anchors) and the parent as the ledger held it when the child started, frozen in the file, so a pruned parent takes no evidence
       with it. The parents come from the top of the ranking, so their ratings are
       biased up and the mean gain is negative for reasons unrelated to settings; the
       regression carries the parent's rating as a nuisance term for that.
@@ -1925,6 +1990,26 @@ plays), `hud_study.py` (whether the opponents' HUD changes what it does) and
   to a bet with nothing 42% instead of 62%), wrong against the nit and the station (calls
   their bets lighter, bluffs the station more) -- and it earns nothing measurable: -3.7 +-
   5.9 (nit), -1.7 +- 11.2 (maniaco), +2.4 +- 9.9 (station) bb/100.
+
+## Player embedder (`studies/player_embedding/`) -- a study, nothing in `src/` uses it
+
+The offline gate for the idea in the TODO ("an embedding of the player's past actions"): a GRU over
+the hands a player has played (one step per hand, hands 0..t-1 only for the embedding before hand t)
+turns what an observer saw into a few numbers; a predictor, given those numbers, the public spot and
+**the player's own cards** (so the embedding is only rewarded for the style the cards do not
+explain), predicts the action. `embed_generate.py` plays mixed tables of the store's models (random
+styles on a share of the seats) and writes shards; `embed_train.py` trains it and the same predictor
+with no embedding, and prints the gain in action cross-entropy **on models held out by name**, by
+hands seen and by showdown mode. The showdown is seen through a simulated muck: winners show, each
+loser by its own `p_show` (a quarter never, a quarter always, the rest between), and the training
+draws the mode (`full`/`winners`/`none`) per sequence; `none` is what the embedder is worth when no
+card is read, as the spot screen does today. Run line and reading of the table in its `README.md`;
+tests in `tests/unit/test_study_player_embedding.py` (the leak test -- hand t is not in the embedding
+used to play it -- is the one to keep). The models play with **zero opponent statistics** in the data (`--with-opponent-stats` restores them),
+so what is read is each model's own style and not its reactions. First reading (models reading the
+statistics): gain +0.05-0.07 nats from hand 10 on, the same for GRU and running mean, half for a causal
+transformer, the same under every showdown mode; one seed, baseline = no embedding. Not done:
+the comparison against the nine statistics, held-out archetypes, the tracker and a feature version.
 
 ## GUI (`gui/app.py`, `players/gui.py`)
 
@@ -2866,7 +2951,7 @@ the **defaults**; the file only overrides, and an absent key means the default.
     in `poker-train` and the length of a session in an arena. What is specific to a
     tool has its own prefix: `arena_min_sessions`, `arena_max_sessions`,
     `arena_tolerance`, `arena_window`, `arena_checkpoint_sessions`, `elo_sessions`,
-    `elo_coverage`, `dashboard_port`, `dashboard_refresh`. `iterations` is shared with
+    `dashboard_port`, `dashboard_refresh`. `iterations` is shared with
     the dashboard on purpose: it scales every progress bar, and has to equal the
     loop's. Pinned by
     `test_a_key_shared_with_an_arena_or_the_dashboard_means_the_same_everywhere`
@@ -2889,6 +2974,22 @@ the **defaults**; the file only overrides, and an absent key means the default.
     and `session_hands` (the session length the Elo scale is defined by) apply
     to `poker-elo` and `benchmark_arena` exactly as they do to a training run, so a
     change is a change of scale for everyone: do it with a fleet reset.
+- **A machine can have a file of its own**, `config.<machine>.toml` beside the shared one
+  (`config.zebele.toml` next to `config.toml`; `config.machine_name`, `override_path`, read in
+  `parse_with_config`). Same keys, same checks (an unknown key, a wrong type or a per-machine key such as
+  a path or `machine` is refused in it too), and **only the keys it names replace the shared file's**:
+  precedence is flag > the machine's file > `config.toml` > the code's default. The machine is
+  `--machine` when the command line has it (`run.sh` always passes it) and this host's short name
+  otherwise, so `poker-elo` and `benchmark_arena` run on a host pick up its file as well. No file for
+  a machine means the shared one alone; `--config ""` reads neither. `--print-config` marks each key
+  with the file that set it, and the startup line says `config: config.toml + config.zebele.toml`.
+  The supervisor re-reads both every generation like the shared file, and workers get the resolved
+  values as flags as before, so a per-machine **network shape** is the whole of a machine's change:
+  its workers start from scratch until the store holds a model of that shape (parents are chosen
+  among the worker's own network), and its models are judged among the best of *their* shape.
+  Everything fleet-defining (`k_schedule`, `session_hands`, `table_weights`, the anchors) should
+  stay in the shared file, since the ratings mean the same thing only if every machine plays them
+  the same way.
 - **TOML, not a `.py`, deliberately**: a supervisor re-reads it every generation for
   weeks, and a data file cannot run inside a live process. Stdlib `tomllib`.
 - **A key is the long flag name with underscores**; `[sections]` are decoration (keys are

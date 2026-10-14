@@ -2,7 +2,7 @@
 
 
 # ── TRAINING ───────────────────────────────────────────────────────────────────
-cd /mnt/shared_volume/POKER/Poker-RL
+cd /mnt/shared_volume/POKER/Poker-RL-v2
 ./run.sh start          # avvia il loop (gira per giorni, staccato per progetto)
 ./run.sh watch          # tabella dei worker, si ridisegna ogni 30s
 ./run.sh status         # una lettura sola
@@ -12,7 +12,7 @@ cd /mnt/shared_volume/POKER/Poker-RL
 
 
 # ── WEBAPP (tutte le macchine insieme) ────────────────────────────────────────
-cd /mnt/shared_volume/POKER/Poker-RL
+cd /mnt/shared_volume/POKER/Poker-RL-v2
 OMP_NUM_THREADS=1 .venv/bin/poker-dashboard --host 0.0.0.0 --iterations 1000
 # da qui:          http://127.0.0.1:8770
 # dalle altre VM:  http://10.64.10.17:8770
@@ -40,7 +40,7 @@ cd C:\Users\zeppo\Desktop\POKER
 
 cd /mnt/shared_volume/POKER/Poker-RL
 OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1 .venv/bin/python -m pokerlab.rl.benchmark_arena \
-    --workers 30 \
+    --workers 1 --workers 1 --session-workers 43 \
     2>&1 | tee checkpoints/logs/arena-$(date +%Y%m%d-%H%M%S).log
 
 # solo snapshot, senza rigiocare:
@@ -55,7 +55,7 @@ OMP_NUM_THREADS=1 .venv/bin/python -m pokerlab.rl.benchmark_arena --arena-max-se
 
 cd /mnt/shared_volume/POKER/Poker-RL
 OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1 .venv/bin/poker-elo \
-    --elo-sessions 2000 --workers 20 \
+    --elo-sessions 50000 --workers 1 --session-workers 43 --k-schedule "0:0.5" \
     2>&1 | tee checkpoints/logs/elo-$(date +%Y%m%d-%H%M%S).log
 
 # i parametri comuni (tavolo, campione, sessioni, mani per sessione...) si leggono da
@@ -129,7 +129,24 @@ PYTHONUNBUFFERED=1 OMP_NUM_THREADS=1 PYTHONPATH=src:studies/equity_net   .venv/b
 
 analysis:
 PYTHONPATH=src:studies/equity_net .venv/bin/python studies/equity_net/analyze.py \
-  --model studies/equity_net/runs/attn-l-lat256.pt
+  --model equity_evaluator/distill-lat32_h256_h1.pt
 
 PYTHONPATH=src:studies/equity_net .venv/bin/python studies/equity_net/analyze.py \
   --model studies/equity_net/runs/distill-lat64_h128_h16.pt 
+
+
+# ── EMBEDDER DEI GIOCATORI (studies/player_embedding, solo studio: non tocca il training) ──
+# 1. genera le mani: tavoli misti dei modelli nello store, showdown con muck simulato
+#    --top 100 usa solo i 100 migliori per rating; --style-share 0.3 e' gia' il default
+OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1 PYTHONPATH=src:studies/agents:studies/player_embedding \
+    .venv/bin/python studies/player_embedding/embed_generate.py \
+    --sessions 2000 --jobs 24 --out checkpoints/studies/player_embedding \
+    2>&1 | tee checkpoints/logs/embed-generate-$(date +%Y%m%d-%H%M%S).log
+
+# 2. addestra l'embedder e lo stesso predittore senza embedding; stampa il guadagno sui
+#    modelli esclusi, per mani viste e per modalita' di showdown (full / winners / none)
+PYTHONUNBUFFERED=1 PYTHONPATH=src:studies/agents:studies/player_embedding \
+    .venv/bin/python studies/player_embedding/embed_train.py \
+    --data checkpoints/studies/player_embedding --steps 5000 \
+    --sequence-models gru mean transformer \
+    2>&1 | tee checkpoints/logs/embed-train-$(date +%Y%m%d-%H%M%S).log

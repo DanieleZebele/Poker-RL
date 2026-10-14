@@ -28,7 +28,6 @@ from pokerlab.rl.global_arena import (
     draw_tiers_text,
     prune_ghost_members,
     repair_member_refs,
-    sample_population,
     tiered_draw,
 )
 from pokerlab.rl.global_store import (
@@ -256,23 +255,6 @@ def test_discover_benchmark_population_ignores_anything_outside_the_benchmark_di
     _touch(tmp_path / "benchmark_stray.pt")
 
     assert discover_benchmark_population(tmp_path) == []
-
-
-# ---- sample_population --------------------------------------------------------
-
-
-def test_sample_population_returns_everything_when_asked_for_more_than_it_has():
-    population = [Candidate(label=f"m{i}", path=None) for i in range(3)]
-    assert sample_population(population, {}, 10, random.Random(0)) == population
-
-
-def test_sample_population_prefers_the_least_played_half():
-    population = [Candidate(label=f"m{i}", path=None) for i in range(10)]
-    ratings = {f"m{i}": {"games": i} for i in range(10)}
-
-    chosen = {c.label for c in sample_population(population, ratings, 4, random.Random(0))}
-
-    assert {"m0", "m1"} <= chosen
 
 
 # ---- per-model locks ------------------------------------------------------------

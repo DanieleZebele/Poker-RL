@@ -33,7 +33,7 @@ markers = [
     "gui: Tkinter app, spot screen, screen reader",
     "vision: screen capture and recognisers",
     "config: config.toml loading",
-    "study: the scripts under studies/agents (duel_power, elo_bb_grid, agent_study, hud_study, archetype_study)",
+    "study: the scripts under studies/agents (duel_power, elo_bb_grid, agent_study, hud_study, archetype_study) and studies/player_embedding",
     "slow: launches real poker-loop / poker-train subprocesses",
 ]
 

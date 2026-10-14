@@ -70,6 +70,7 @@ from pokerlab.rl.global_store import (
     load_global_registry,
     load_ranking,
     publish_model,
+    read_member,
     read_sidecar,
 )
 
@@ -808,7 +809,6 @@ def launch_worker(
         "--iterations", str(args.iterations),
         "--hands", str(hp.hands),
         *table_arguments(table_mix_from_args(args)),
-        "--lr", str(hp.lr),
         # The fleet's network shape, as `config.toml` resolved it when this
         # generation started.
         *[
@@ -831,7 +831,11 @@ def launch_worker(
         "--critic-stack-power", str(args.critic_stack_power),
         "--collect-workers", str(args.collect_workers),
         "--session-workers", str(args.session_workers),
+        "--pool-refresh-every", str(args.pool_refresh_every),
         "--update-device", args.update_device,
+        "--lr", str(hp.lr),
+        "--lr-anneal-iterations", str(args.lr_anneal_iterations),
+        "--lr-anneal-final", str(args.lr_anneal_final),
         "--entropy-anneal-iterations", str(args.entropy_anneal_iterations),
         "--entropy-anneal-start", str(args.entropy_anneal_start),
         "--entropy-anneal-final", str(args.entropy_anneal_final),
@@ -860,6 +864,8 @@ def launch_worker(
         "--global-dir", str(args.global_dir),
         "--global-lock-seconds", str(args.global_lock_seconds),
         "--benchmark-sessions", str(args.benchmark_sessions),
+        "--snapshot-every", str(args.snapshot_every),
+        "--snapshot-benchmark-sessions", str(args.snapshot_benchmark_sessions),
         "--benchmark-resident", str(args.benchmark_resident),
         "--benchmark-rotate-every", str(args.benchmark_rotate_every),
         "--k-schedule", args.k_schedule,
@@ -904,6 +910,14 @@ def launch_worker(
         # The worker records which model it came from, so the finished child can
         # say how much Elo it gained over it (`rl/sweep_log.py`).
         command.append("--resume")
+        # The child starts at its parent's rating as the ledger holds it now, not at the
+        # one the parent was published with: it has been rated since, and that is the
+        # better estimate of where the lineage sits. A parent the ledger no longer knows
+        # (pruned, never rated) passes nothing and the worker falls back to the rating
+        # recorded in the checkpoint.
+        parent_member = read_member(args.global_dir, inherit_from.stem)
+        if parent_member is not None and math.isfinite(parent_member.rating):
+            command += ["--initial-rating", repr(parent_member.rating)]
         # Only a worker whose settings are its parent's (perturbed) took a step
         # from it. One that runs the fleet's own values took no step, and a
         # "step" of toml-minus-parent would confound the optimizer's evidence with
@@ -1422,9 +1436,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hands", type=int, default=512)
     add_table_arguments(parser)
     add_network_arguments(parser)
-    parser.add_argument("--lr", type=float, default=3e-4,
-                        help="starting learning rate of the workers with no parent "
-                        "to inherit settings from; every worker then perturbs it")
     parser.add_argument(
         "--hp-multipliers", type=float, nargs="+", default=list(HP_MULTIPLIERS),
         help="the factors a worker draws from, independently per axis, to move its "
@@ -1541,6 +1552,12 @@ def build_parser() -> argparse.ArgumentParser:
         "on --device. Forwarded as given, so `auto` is resolved on each machine",
     )
     parser.add_argument(
+        "--pool-refresh-every", type=int, default=0,
+        help="every this many iterations each worker draws its opponent pool again from the "
+        "store as it is then, with --pool-top-share and --pool-top-n (0: the pool drawn at the "
+        "start stays); forwarded to every worker",
+    )
+    parser.add_argument(
         "--session-workers", type=int, default=1,
         help="forked copies of each worker that play the sessions of its rated passes at once "
         "(1: none); forwarded to every worker",
@@ -1560,6 +1577,17 @@ def build_parser() -> argparse.ArgumentParser:
                         help="the bonus at a run's first iteration, when annealing")
     parser.add_argument("--entropy-anneal-final", type=float, default=0.0001,
                         help="the bonus once the annealing is over")
+    parser.add_argument("--lr", type=float, default=3e-4,
+                        help="starting learning rate of the workers with no parent "
+                        "to inherit settings from; every worker then perturbs it")
+    parser.add_argument(
+        "--lr-anneal-iterations", type=int, default=0,
+        help="iterations over which every worker's learning rate falls from its own lr (swept, "
+        "inherited) to --lr-anneal-final (absolute), from the start of its own run (0: constant); "
+        "forwarded to every worker",
+    )
+    parser.add_argument("--lr-anneal-final", type=float, default=1e-5,
+                        help="the rate once the annealing is over, an absolute value")
     parser.add_argument("--eval-every", type=int, default=100)
     parser.add_argument(
         "--eval-sessions", type=int, default=DEFAULT_EVAL_SESSIONS,
@@ -1666,6 +1694,16 @@ def build_parser() -> argparse.ArgumentParser:
         "clear each other by more than this",
     )
     parser.add_argument(
+        "--snapshot-every", type=int, default=0,
+        help="every this many iterations each worker publishes the model it has then, rated "
+        "against the frozen anchors first (0: only the final model); forwarded to every worker",
+    )
+    parser.add_argument(
+        "--snapshot-benchmark-sessions", type=int, default=DEFAULT_BENCHMARK_SESSIONS,
+        help="rated sessions of 1000 hands a snapshot plays against the frozen anchors to earn "
+        "its published rating; forwarded to every worker",
+    )
+    parser.add_argument(
         "--benchmark-sessions", type=int, default=DEFAULT_BENCHMARK_SESSIONS,
         help="rated sessions of 1000 hands each worker's published model plays "
         "against opponents drawn at random from the frozen set, before the "
@@ -1755,10 +1793,15 @@ def main() -> None:
     except ConfigError as error:
         parser.exit(2, f"{parser.prog}: config: {error}\n")
     if args.print_config:
-        print(format_config(vars(args), [k for k, v in report.applied.items() if vars(args)[k] == v]))
+        print(format_config(
+            vars(args),
+            [k for k, v in report.applied.items() if vars(args)[k] == v],
+            [k for k in report.overridden if k in report.applied and vars(args)[k] == report.applied[k]],
+            report.override.name if report.override is not None else "machine file",
+        ))
         return
     if report.path is not None and not args.status:
-        print(f"config: {report.path}, {len(report.applied)} valori", flush=True)
+        print(f"config: {report.files}, {len(report.applied)} valori", flush=True)
 
     if args.status:
         if args.watch <= 0:

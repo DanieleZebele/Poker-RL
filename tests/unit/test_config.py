@@ -247,3 +247,88 @@ def make_parser_with(kind):
     parser = make_parser()
     parser.add_argument("--code", type=kind, default="ab")
     return parser
+
+
+# ---- a machine's own file -----------------------------------------------------
+
+
+def test_a_machine_file_overrides_only_the_keys_it_names(tmp_path):
+    base = write(tmp_path, "hands = 512\nname = 'shared'\n")
+    write(tmp_path, "hands = 2048\n", name="config.boxa.toml")
+
+    args, report = parse_with_config(make_parser(), ["--config", str(base), "--machine", "boxa"])
+
+    assert args.hands == 2048  # the machine's file beats the shared one
+    assert args.name == "shared"  # a key it does not name stays the shared file's
+    assert report.override == tmp_path / "config.boxa.toml" and report.overridden == ("hands",)
+    assert report.files == f"{base} + {report.override}"
+
+
+def test_another_machine_reads_the_shared_file_alone(tmp_path):
+    base = write(tmp_path, "hands = 512\n")
+    write(tmp_path, "hands = 2048\n", name="config.boxa.toml")
+
+    args, report = parse_with_config(make_parser(), ["--config", str(base), "--machine", "boxb"])
+
+    assert args.hands == 512 and report.override is None and report.files == str(base)
+
+
+def test_a_flag_still_beats_the_machine_file(tmp_path):
+    base = write(tmp_path, "hands = 512\n")
+    write(tmp_path, "hands = 2048\n", name="config.boxa.toml")
+
+    args, _ = parse_with_config(
+        make_parser(), ["--config", str(base), "--machine", "boxa", "--hands", "64"]
+    )
+
+    assert args.hands == 64
+
+
+def test_the_machine_is_the_hosts_short_name_when_there_is_no_flag(tmp_path, monkeypatch):
+    import socket
+
+    monkeypatch.setattr(socket, "gethostname", lambda: "boxa.example.net")
+    base = write(tmp_path, "hands = 512\n")
+    write(tmp_path, "hands = 2048\n", name="config.boxa.toml")
+
+    args, _ = parse_with_config(make_parser(), ["--config", str(base)])
+
+    assert args.hands == 2048
+
+
+def test_the_machine_file_is_held_to_the_same_rules_as_the_shared_one(tmp_path):
+    base = write(tmp_path, "hands = 512\n")
+    for text, message in (
+        ("hand = 5\n", "did you mean 'hands'"),
+        ("hands = 1.5\n", "hands"),
+        ("models_dir = '/tmp'\n", "per-machine"),
+        ("machine = 'x'\n", "per-machine"),
+    ):
+        write(tmp_path, text, name="config.boxa.toml")
+        with pytest.raises(ConfigError, match=message):
+            parse_with_config(make_parser(), ["--config", str(base), "--machine", "boxa"])
+
+
+def test_no_file_at_all_means_no_machine_file_either(tmp_path):
+    write(tmp_path, "hands = 2048\n", name="config.boxa.toml")
+
+    args, report = parse_with_config(make_parser(), ["--config", "", "--machine", "boxa"])
+
+    assert args.hands == 256 and report.path is None and report.override is None
+
+
+def test_a_machine_name_cannot_point_somewhere_else(tmp_path):
+    from pokerlab.config import override_path
+
+    assert override_path(tmp_path / "config.toml", "boxa") == tmp_path / "config.boxa.toml"
+    for bad in ("../x", "a/b", "", ".hidden"):
+        assert override_path(tmp_path / "config.toml", bad) is None
+
+
+def test_print_config_says_which_file_set_each_key(tmp_path):
+    values = {"hands": 2048, "name": "shared", "lr": 3e-4}
+    text = format_config(values, ["hands", "name"], ["hands"], "config.boxa.toml")
+    lines = dict(line.split(" = ", 1) for line in text.splitlines())
+    assert lines["hands"].endswith("# config.boxa.toml")
+    assert lines["name"].endswith("# config.toml")
+    assert "#" not in lines["lr"]

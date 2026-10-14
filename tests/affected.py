@@ -29,6 +29,7 @@ AREAS = (
     # The engine, cards, evaluator and players are what everything else runs on.
     ("src/pokerlab/", {"engine", "rl", "gui", "study"}),
     ("studies/agents/", {"study"}),
+    ("studies/player_embedding/", {"study"}),
     ("run.sh", {"rl"}),
     ("config.toml", {"rl", "config"}),
 )

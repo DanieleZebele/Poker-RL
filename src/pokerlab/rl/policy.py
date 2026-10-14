@@ -207,6 +207,42 @@ def make_policy_fn(
     return policy_fn
 
 
+def deal_tensors(views: Sequence[DealView]) -> tuple[Tensor, Tensor, Tensor]:
+    """The equity network's inputs for a batch of deals: every seat's hole cards `(n, EQUITY_SLOTS,
+    CARDS)`, the board `(n, CARDS)` and which seats hold cards `(n, EQUITY_SLOTS)`.
+
+    The ones are written with one indexed assignment per tensor from flat lists of
+    (row, seat, card) indices. Assigning them one view and one seat at a time was ~7 s of pure
+    Python on an iteration's 66,000 decisions, and the same on a machine with a GPU."""
+    count = len(views)
+    holes = torch.zeros(count, EQUITY_SLOTS, CARDS)
+    board = torch.zeros(count, CARDS)
+    mask = torch.zeros(count, EQUITY_SLOTS, dtype=torch.bool)
+    hole_rows: list[int] = []
+    hole_seats: list[int] = []
+    hole_cards: list[int] = []
+    seat_rows: list[int] = []
+    seat_seats: list[int] = []
+    board_rows: list[int] = []
+    board_cards: list[int] = []
+    for row, view in enumerate(views):
+        for seat, cards in enumerate(view.holes):
+            if cards is not None:
+                hole_rows.extend([row] * len(cards))
+                hole_seats.extend([seat] * len(cards))
+                hole_cards.extend(cards)
+                seat_rows.append(row)
+                seat_seats.append(seat)
+        board_rows.extend([row] * len(view.board))
+        board_cards.extend(view.board)
+    if hole_cards:
+        holes[hole_rows, hole_seats, hole_cards] = 1.0
+        mask[seat_rows, seat_seats] = True
+    if board_cards:
+        board[board_rows, board_cards] = 1.0
+    return holes, board, mask
+
+
 def make_critic_fns(
     model: PokerActorCritic, equity_net: EquityNet, *, device: str | torch.device = "cpu"
 ) -> CriticFns:
@@ -218,16 +254,7 @@ def make_critic_fns(
     equity_net.to(device)
 
     def equity(views: Sequence[DealView]) -> list[list[float]]:
-        count = len(views)
-        holes = torch.zeros(count, EQUITY_SLOTS, CARDS)
-        board = torch.zeros(count, CARDS)
-        mask = torch.zeros(count, EQUITY_SLOTS, dtype=torch.bool)
-        for row, view in enumerate(views):
-            for slot, cards in enumerate(view.holes):
-                if cards is not None:
-                    holes[row, slot, list(cards)] = 1.0
-                    mask[row, slot] = True
-            board[row, list(view.board)] = 1.0
+        holes, board, mask = deal_tensors(views)
         with torch.no_grad():
             shares = equity_net(holes.to(device), board.to(device), mask.to(device))
         return shares.cpu().tolist()
