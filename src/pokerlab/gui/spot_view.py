@@ -20,6 +20,7 @@ import itertools
 import math
 import random
 import time
+import traceback
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
@@ -72,6 +73,7 @@ SCREEN_POLL_MS = 500
 # How many readings in a row must show a seat empty before its player's statistics are
 # forgotten (one second at `SCREEN_POLL_MS`).
 EMPTY_READINGS_TO_FORGET = 2
+AVATAR_READINGS_TO_FORGET = 2  # the same different avatar in a row (see `_note_avatars`)
 # How a seat state read off the screen is shown (`vision.labels.SEAT_STATES`).
 SEAT_STATE_LABELS = {"in_gioco": "in gioco", "fuori": "fold", "sit_out": "sit-out", "libero": "liberi",
                      "reazione": "reazioni"}
@@ -130,6 +132,20 @@ STAT_LABELS = {
     "cbet": "Cbet", "fold_to_cbet": "FCbet", "wtsd": "WTSD",
 }
 STATS_PER_LINE = 3
+# The same wait for this long is shown as "FERMO" on the Stato line.
+STUCK_SECONDS = 10
+# How long the red line about a problem of the rebuild stays after it was last seen.
+ANOMALY_SECONDS = 8
+# Notes of the rebuild (`SyncResult.note`) that mean it found something wrong, not that it waits.
+WRONG_NOTES = ("non coerente", "rifiutata", "troppi passi", "non letto")
+
+# Why the rebuild stops on a seat (`action_sync.SyncResult.note`), in words.
+WAIT_REASONS = {
+    "attendo": "nessuna prova che abbia agito (nessuna puntata nuova, stack fermo, nessuna carta nuova)",
+    "tocca a te": "e' il tuo turno (barra del tempo accesa)",
+    "attendo la carta": "il motore e' avanti: aspetto che il client dia la carta successiva",
+}
+
 # Lines of the models' advice panel: the action drawn, every option of the first model
 # (two or three lines wrapped), then a line a model; the list of actions above it takes
 # the rest of the height.
@@ -408,6 +424,9 @@ class SpotFrame(ttk.Frame):
         # still kept and shown; only what the policy reads changes. Kept on the app, so
         # the screen reopens with it.
         self.fresh_opponents_var = tk.BooleanVar(value=getattr(master, "spot_fresh_opponents", False))
+        # On: a sound plays when it is your turn (once per decision). Kept on the app too.
+        self.sound_var = tk.BooleanVar(value=getattr(master, "spot_sound", False))
+        self._beeped_key = None  # the decision the sound was last played for
         self.sb_var = tk.StringVar(value=str(ENGINE_SMALL_BLIND))
         self.bb_var = tk.StringVar(value=str(ENGINE_BIG_BLIND))
         self.name_vars = [
@@ -420,6 +439,19 @@ class SpotFrame(ttk.Frame):
         self.board_buttons: list[tk.Button] = []
         self.hole_buttons: list[tk.Button] = []
         self.screen_var = tk.StringVar(value="Schermo: lettura spenta")
+        # What the rebuild is doing right now and what it waits for (`_wait_text`), how long
+        # it has been the same (`_wait_since`), and how long the last reading took.
+        self.state_var = tk.StringVar(value="Stato: lettura spenta")
+        # What the rebuild found wrong, shown in red (`_report_anomalies`): kept on screen for
+        # `ANOMALY_SECONDS` after the last time it was seen, so a flicker can be read.
+        self.anomaly_var = tk.StringVar(value="")
+        self._anomalies: list[str] = []
+        self._anomaly_text = ""
+        self._anomaly_time = float("-inf")
+        self._wait_text = ""
+        self._wait_key = None
+        self._wait_since = time.monotonic()
+        self._read_ms = 0.0
         self._reader = None
         self._last_reading = None
         self._last_hand: list[str] | None = None
@@ -454,6 +486,11 @@ class SpotFrame(ttk.Frame):
         # on the screen: see `_note_players_leaving`.
         self._empty_readings: dict[int, int] = {}
         self._left_chairs: set[int] = set()
+        # The avatar last seen in each chair while its player was out of the hand, and a
+        # different one seen but not yet confirmed (signature, readings in a row).
+        self._avatars: dict[int, object] = {}
+        self._avatar_pending: dict[int, tuple[object, int]] = {}
+        self._notices: list[str] = []  # what to say in red about this reading, besides the rebuild's
         # Scripted actions the screen contradicts, and for how many readings in a row
         # (`_heal_script`).
         self._contradicted: dict[tuple, int] = {}
@@ -491,9 +528,12 @@ class SpotFrame(ttk.Frame):
             top, text="Policy: avversari sempre nuovi (statistiche azzerate)",
             variable=self.fresh_opponents_var, command=self._fresh_opponents_toggled,
         ).pack(side="left", padx=6)
+        ttk.Checkbutton(
+            top, text="Abilita audio", variable=self.sound_var, command=self._sound_toggled,
+        ).pack(side="left", padx=6)
         ttk.Button(top, text="Torna al menu", command=self.app.show_setup).pack(side="right")
 
-        main = ttk.Frame(self)
+        main =ttk.Frame(self)
         main.pack(side="top", fill="both", expand=True)
         self.canvas = tk.Canvas(
             main, width=self.table_geom.canvas[0], height=self.table_geom.canvas[1],
@@ -510,6 +550,10 @@ class SpotFrame(ttk.Frame):
         self.warning.pack(anchor="w")
         self.situation = ttk.Label(side, justify="left", font=("TkDefaultFont", 10, "bold"))
         self.situation.pack(anchor="w", pady=(2, 4))
+        ttk.Label(side, textvariable=self.anomaly_var, foreground="#b00020", wraplength=300,
+                  justify="left", font=("TkDefaultFont", 9, "bold")).pack(anchor="w")
+        ttk.Label(side, textvariable=self.state_var, wraplength=300, justify="left",
+                  font=("TkDefaultFont", 9, "bold")).pack(anchor="w", pady=(0, 4))
         ttk.Label(side, textvariable=self.screen_var, foreground="#555555", wraplength=300,
                   justify="left").pack(anchor="w", pady=(0, 4))
         # The models' advice keeps a fixed height at the bottom (packed first, from the
@@ -778,6 +822,21 @@ class SpotFrame(ttk.Frame):
         self.app.spot_fresh_opponents = self.fresh_opponents_var.get()
         self.refresh()
 
+    def _sound_toggled(self) -> None:
+        self.app.spot_sound = self.sound_var.get()
+        if self.sound_var.get():
+            self._play_sound()  # a test beep, so you know it works
+
+    def _play_sound(self) -> None:
+        try:
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+        except Exception:  # noqa: BLE001 - not Windows, or no sound device
+            try:
+                self.bell()
+            except tk.TclError:
+                pass
+
     @staticmethod
     def _stats_id(chair: int) -> str:
         return f"chair{chair}"
@@ -800,9 +859,51 @@ class SpotFrame(ttk.Frame):
                 self.stats.forget(self._stats_id(chair))
                 self._left_chairs.add(chair)
 
+    def _note_avatars(self, reading) -> None:
+        """Remember each out-of-hand opponent's avatar; a different one in the same chair,
+        read `AVATAR_READINGS_TO_FORGET` times in a row, is a different player: their
+        statistics go. A new player can take a seat between two readings, with no empty one
+        in between (`_note_players_leaving` never sees it), and the avatar is the only trace
+        -- it shows only while the seat is out, so it is compared then. A reference is
+        replaced only when the change was confirmed, never by a doubtful frame."""
+        from pokerlab.vision.labels import SEAT_EMPTY, SEAT_OUT
+        from pokerlab.vision.seats import AVATAR_CHANGED, avatar_distance
+
+        for chair, state in self._seat_states.items():
+            if state == SEAT_EMPTY:
+                # Nobody sits there: the next avatar is the first of a new player, which the
+                # emptied seat already made forget.
+                self._avatars.pop(chair, None)
+                self._avatar_pending.pop(chair, None)
+        for client_seat, signature in (reading.avatars or {}).items():
+            chair = chair_for_client_seat(self.table_size, client_seat)
+            if self._seat_states.get(chair) != SEAT_OUT or chair not in self.layout.chairs:
+                continue  # empty by its stack, or not seated here: nothing to compare
+            known = self._avatars.get(chair)
+            if known is None or avatar_distance(known, signature) <= AVATAR_CHANGED:
+                self._avatars[chair] = signature if known is None else known
+                self._avatar_pending.pop(chair, None)
+                continue
+            pending, count = self._avatar_pending.get(chair, (None, 0))
+            # The doubtful frames must agree with each other, or they are noise
+            count = count + 1 if pending is not None and avatar_distance(pending, signature) <= AVATAR_CHANGED else 1
+            self._avatar_pending[chair] = (signature, count)
+            if count >= AVATAR_READINGS_TO_FORGET:
+                self._avatars[chair] = signature
+                self._avatar_pending.pop(chair, None)
+                self.stats.forget(self._stats_id(chair))
+                # ... and again after the hand on the screen is recorded, as for a player who
+                # left: that hand was the old player's.
+                self._left_chairs.add(chair)
+                self._notices.append(
+                    f"Nuovo giocatore alla sedia {chair} (avatar cambiato): statistiche azzerate"
+                )
+
     def reset_stats(self) -> None:
         """Forget everything seen so far (another table, say) and redraw."""
         self.stats = StatsTracker()
+        self._avatars.clear()
+        self._avatar_pending.clear()
         self.refresh()
 
     def _record_finished_hand(self) -> None:
@@ -1181,6 +1282,8 @@ class SpotFrame(ttk.Frame):
         self._last_dealer = None
         self._seat_states = {}
         self._empty_readings = {}
+        self._avatars.clear()
+        self._avatar_pending.clear()
         self._seating_read = False
         self._hand_start_seen = False
         self._screen_stacks = {}
@@ -1203,15 +1306,28 @@ class SpotFrame(ttk.Frame):
         from pokerlab.gui.screen_reader import VisionNotAvailable
 
         self._screen_job = None
+        started = time.perf_counter()
         try:
             reading = self._reader.read()
         except VisionNotAvailable as exc:
             self.screen_var.set(f"Schermo: lettura non disponibile, {exc}")
+            self.state_var.set("Stato: lettura dello schermo ferma (extra vision mancante)")
             return  # permanent: no point retrying
         except Exception as exc:  # noqa: BLE001 - a bad tick must not stop the reading
             self.screen_var.set(f"Schermo: errore di lettura, {exc}")
+            self._report_anomalies([f"Errore nella cattura dello schermo: {exc}"])
+            self.state_var.set(f"Stato ({time.strftime('%H:%M:%S')}): ERRORE nella cattura dello schermo: {exc}")
         else:
-            self.apply_reading(reading)
+            self._read_ms = (time.perf_counter() - started) * 1000
+            try:
+                self.apply_reading(reading)
+            except Exception as exc:  # noqa: BLE001 - an error here used to end the polling for good
+                traceback.print_exc()
+                self._report_anomalies([f"Errore nel ricostruttore: {type(exc).__name__}: {exc}"])
+                self.state_var.set(
+                    f"Stato ({time.strftime('%H:%M:%S')}): ERRORE nell'elaborazione, riprovo: "
+                    f"{type(exc).__name__}: {exc}"
+                )
         if self.winfo_exists():
             self._screen_job = self.after(SCREEN_POLL_MS, self._poll_screen)
 
@@ -1253,6 +1369,7 @@ class SpotFrame(ttk.Frame):
                 chair_for_client_seat(self.table_size, seat): state for seat, state in reading.seats.items()
             }
             self._note_players_leaving()
+            self._note_avatars(reading)
             # Who sits where changes only between hands: applied mid-hand it would
             # wipe the actions being entered every time someone stood up. The one
             # exception is a player in sit-out whose blind shows up only after the
@@ -1302,10 +1419,43 @@ class SpotFrame(ttk.Frame):
             f"Schermo ({time.strftime('%H:%M:%S')}): mano {hole}, board {board}{dealer}{seats}"
             f"{self._sync_note}{statistics}{problems}"
         )
+        self._show_wait_state(reading)
+        self._report_anomalies(
+            [*(f"Lettura dubbia: {p}" for p in reading.problems), *self._anomalies, *self._notices]
+        )
+        self._notices = []
         if change.any or synced or stacks_moved or ante_changed:
             self.refresh()
         self._log_reading(reading, change.any or synced or ante_changed)
         return change.any or synced or ante_changed
+
+    def _report_anomalies(self, found: list[str]) -> None:
+        """Write in red what the rebuild found wrong; it stays `ANOMALY_SECONDS` after the
+        last time it was seen, then goes."""
+        now = time.monotonic()
+        if found:
+            self._anomaly_text = "\n".join(f"⚠ {line}" for line in found)
+            self._anomaly_time = now
+        elif now - self._anomaly_time > ANOMALY_SECONDS:
+            self._anomaly_text = ""
+        self.anomaly_var.set(self._anomaly_text)
+
+    def _show_wait_state(self, reading) -> None:
+        """The "Stato" line: what the rebuild waits for, since when, and how the reading is
+        going. The same thing for more than `STUCK_SECONDS` is flagged as stuck."""
+        board = None if reading.board is None else len(reading.board)
+        key = (len(self.script), self._wait_text, board, bool(reading.my_turn))
+        now = time.monotonic()
+        if key != self._wait_key:
+            self._wait_key = key
+            self._wait_since = now
+        seconds = int(now - self._wait_since)
+        stuck = f"  [FERMO da {seconds} s]" if seconds >= STUCK_SECONDS else f"  (da {seconds} s)"
+        timer = "barra del tempo: SU" if reading.my_turn else "barra del tempo: giu'"
+        self.state_var.set(
+            f"Stato ({time.strftime('%H:%M:%S')}): {self._wait_text or 'nessuna ricostruzione'}"
+            f"{stuck}\nlettura {self._read_ms:.0f} ms | azioni lette: {len(self.script)} | {timer}"
+        )
 
     def _table_view(self, reading):
         """The reading in the engine's seat numbers and chips, for `action_sync`."""
@@ -1357,10 +1507,13 @@ class SpotFrame(ttk.Frame):
 
         self._sync_note = ""
         self._last_view = None
+        self._anomalies = []
         if reading.bets is None and not reading.my_turn:
+            self._wait_text = "non leggo ne' le puntate ne' la tua barra del tempo: niente su cui basarmi"
             return False  # neither amounts nor your timer read: nothing to go on
         view = self._table_view(reading)
         if view is None:
+            self._wait_text = "big blind del motore non valido"
             return False
         view.my_turn_seen = self._my_turn_mark == len(self.script)
         self._last_view = view
@@ -1372,12 +1525,26 @@ class SpotFrame(ttk.Frame):
             spot = self.build_spot()
             synced, result = sync_actions(spot, view)
         except ValueError:
+            self._wait_text = "tavolo non giocabile (servono almeno 2 giocatori seduti)"
             return False  # the table is not playable yet (one player, say)
         if result.actions:
             self.script = list(synced.script)
         if result.waiting_for == synced.my_seat and reading.my_turn:
             self._my_turn_mark = len(self.script)
         names = position_names(synced.num_players)
+        wrong = any(word in result.note for word in WRONG_NOTES)
+        if result.waiting_for is None:
+            self._wait_text = f"nessuno: {result.note}"
+            if wrong:
+                self._anomalies.append(f"Ricostruzione: {result.note}")
+        else:
+            who = names[result.waiting_for] + (" (TU)" if result.waiting_for == synced.my_seat else "")
+            reason = WAIT_REASONS.get(result.note, result.note)
+            self._wait_text = f"aspetto l'azione di {who}: {reason}"
+            if wrong:
+                self._anomalies.append(f"Non riesco a ricostruire l'azione di {who}: {result.note}")
+        if healed:
+            self._anomalies.append(f"Ho annullato un'azione che lo schermo smentiva: {healed}")
         added = ", ".join(
             f"{names[seat]} {describe_action(action, None, synced.big_blind)}"
             for seat, action in result.actions
@@ -1389,7 +1556,10 @@ class SpotFrame(ttk.Frame):
         if healed:
             parts.insert(0, healed)
         self._sync_note = f" | azioni: {'; '.join(parts)}" if parts else ""
-        self._sync_note += self._pot_check(synced, reading, view)
+        pot_warning = self._pot_check(synced, reading, view)
+        self._sync_note += pot_warning
+        if pot_warning:
+            self._anomalies.append(pot_warning.removeprefix(" | ").replace("ATTENZIONE piatto", "Il piatto non torna"))
         return bool(result.actions) or bool(healed)
 
     def _heal_script(self, view) -> str:
@@ -1699,6 +1869,10 @@ class SpotFrame(ttk.Frame):
             # from the best-rated model's probabilities, as it would play at a table, not
             # its likeliest action. `upper`, never `capitalize`, which lowercases "BB".
             chosen = self._sampled_action(advice[0], spot)
+            # Your turn: one sound per decision (the advice is rewritten at every reading).
+            if self.sound_var.get() and self._beeped_key != self._draw_key:
+                self._beeped_key = self._draw_key
+                self._play_sound()
             lines += [describe_action(chosen.action, state.observation, spot.big_blind).upper(), ""]
             bold_lines = (1,)
         for index, item in enumerate(advice, start=1):

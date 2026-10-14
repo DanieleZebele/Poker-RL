@@ -246,6 +246,12 @@ def next_action(state: SpotState, view: TableView, my_seat: int | None = None) -
     if shown is not None and shown > current and not closed:
         # Chips in front beyond the engine's: a call, bet or raise to that amount.
         action = _to_amount(state, seat, shown)
+        if action is None:
+            # An amount no legal action makes (a digit lost in the reading: 69,6 read as 9,6,
+            # below the bet it faces) is no evidence; the stack, if it went down, still is.
+            put_in = _street_chips(state, view, seat)
+            if put_in:
+                action = _to_amount(state, seat, current + put_in, view.tolerance)
         return (action, "") if action else (None, f"importo {shown} non coerente per il posto {seat}")
     put_in = _street_chips(state, view, seat)
     if put_in and (closed or shown is None or shown < current or (facing > current and not shown)):

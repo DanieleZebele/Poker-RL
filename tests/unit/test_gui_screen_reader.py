@@ -692,6 +692,50 @@ def test_a_seat_that_empties_is_forgotten_and_the_button_clears_the_rest(app):
         gc.collect()
 
 
+def test_a_new_avatar_in_a_seat_that_is_out_means_a_new_player(app):
+    import pytest
+
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("cv2")
+    from pokerlab.gui.spot_table import chair_for_client_seat as chair
+    from pokerlab.gui.spot_view import SpotFrame
+    from pokerlab.vision.seats import avatar_signature
+
+    def crop(seed, brightness=1.0, pill=False):
+        image = np.random.default_rng(seed).integers(0, 255, (133, 178, 3)).astype(np.float32)
+        if pill:
+            image[int(133 * 0.5):int(133 * 0.62), 40:140] = 30  # the "FOLD" pill sits lower
+        return (image * brightness).astype(np.uint8)
+
+    frame = SpotFrame(app)
+    frame._consult = lambda state, spot: None
+    try:
+        _play_a_hand_then_move_the_button(frame)
+        utg = f"chair{chair(6, 3)}"
+        assert frame.stats.hands(utg) == 1
+
+        def watch(image):
+            reading = full_reading(_bets(), board=[], dealer=1, out={3})
+            reading.avatars = {3: avatar_signature(image)}
+            frame.apply_reading(reading)
+
+        watch(crop(1))  # the player folded: their avatar is learnt
+        watch(crop(1, brightness=0.6, pill=True))  # dimmed, with the pill: the same player
+        assert frame.stats.hands(utg) == 1
+        watch(crop(2))  # one different picture: not yet
+        assert frame.stats.hands(utg) == 1
+        watch(crop(1))  # back to the first: the flicker is forgotten
+        watch(crop(2))
+        assert frame.stats.hands(utg) == 1
+        watch(crop(2))  # the other avatar twice in a row: someone new sits there
+        assert frame.stats.hands(utg) == 0
+        assert "Nuovo giocatore" in frame.anomaly_var.get()
+        assert frame.stats.hands(f"chair{chair(6, 4)}") == 1  # the others keep theirs
+    finally:
+        frame.destroy()
+        gc.collect()
+
+
 def _three_handed(frame):
     frame.add_player(3)
     frame.add_player(6)  # chairs 0, 3, 6: seats 0 (BTN), 1 (SB), 2 (BB)

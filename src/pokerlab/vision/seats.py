@@ -69,6 +69,8 @@ SIT_OUT_MATCH = 0.6  # normalised correlation with a "SIT OUT" template
 # measured), while an occupied seat of the same zone is >= 14.1 away.
 EMPTY_MATCH = 6.0
 EMPTY_THUMBNAIL = (32, 24)  # width, height
+AVATAR_THUMBNAIL = (24, 12)  # width, height
+AVATAR_CHANGED = 0.30  # signatures further apart than this are two different avatars
 # The orange of the reaction emoji (H 5-25, S >= 120, V >= 150): 0.35 of the labelled
 # reaction crop, at most 0.07 of any other (an orange avatar).
 REACTION_SHARE = 0.20
@@ -152,6 +154,26 @@ def empty_distance(image: np.ndarray, backgrounds: list[np.ndarray]) -> float:
         return float("inf")
     thumb = _thumbnail(image)
     return min(float(np.abs(thumb - background).mean()) for background in backgrounds)
+
+
+def avatar_signature(image: np.ndarray) -> np.ndarray:
+    """A small, brightness-free picture of the avatar in a seat's crop, to tell whether the
+    player sitting there is still the same one. Only the top part of the crop, centred: the
+    "FOLD" pill and the stack sit lower, and a player in the hand has cards over the avatar,
+    so it is read only while the seat is out. Each colour channel is centred and scaled, so
+    the dimming of a folded seat does not count."""
+    height, width = image.shape[:2]
+    part = image[int(height * 0.02):int(height * 0.40), int(width * 0.15):int(width * 0.85)]
+    thumb = cv2.resize(part, AVATAR_THUMBNAIL, interpolation=cv2.INTER_AREA).astype(np.float32)
+    thumb -= thumb.mean()
+    return thumb / (float(thumb.std()) + 1e-6)
+
+
+def avatar_distance(a: np.ndarray, b: np.ndarray) -> float:
+    """Mean absolute difference of two signatures: 0 for the same picture, 0.0-0.06 measured
+    between crops of one avatar (with and without the "FOLD" pill), 0.44-1.15 between
+    different players' avatars on the labelled crops."""
+    return float(np.abs(a - b).mean())
 
 
 @dataclass

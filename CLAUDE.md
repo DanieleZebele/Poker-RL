@@ -2353,6 +2353,25 @@ dependency (Flask, etc.) — it ships with Python. Architecture:
     hand is forgotten again right after that hand is recorded (`_left_chairs`), or the hand
     the old player was in would be the newcomer's first. "Azzera statistiche" forgets
     everyone (another table).
+  - **A new avatar in a chair is a new player** (`SpotFrame._note_avatars`,
+    `vision/seats.py::avatar_signature`/`avatar_distance`, `ScreenReading.avatars`). A player
+    can sit down between two readings with no empty seat in between, so only the avatar tells.
+    It is in view only while the seat reads "fuori" (cards cover it in the hand), so it is
+    remembered and compared then, never for your own seat. The signature is the top 38% of the
+    crop, centred, as a 24x12 thumbnail with each channel centred and scaled (the folded seat's
+    dimming does not count; the "FOLD" pill sits lower and is left out). Measured on the
+    labelled crops: one avatar 0.0-0.06 apart, different players 0.44-1.15, so `AVATAR_CHANGED`
+    is 0.30. A different avatar read `AVATAR_READINGS_TO_FORGET` (2) times in a row, agreeing
+    with each other, forgets the chair (and again after the hand on screen is recorded, as for
+    a player who left); a doubtful frame never replaces the reference. A seat read empty drops
+    its avatar, a table change or "Azzera statistiche" all of them. The red line says it.
+  - **The Stato and red lines** (`state_var`, `anomaly_var`): "Stato" says what the rebuild
+    waits for (`WAIT_REASONS`) and since when (`[FERMO da N s]` past `STUCK_SECONDS`); the red
+    line collects what the rebuild found wrong (`WRONG_NOTES`, a pot that does not add up, a
+    doubtful reading, an action taken back, an error) for `ANOMALY_SECONDS` after it was last
+    seen. `_poll_screen` catches an exception in `apply_reading`: it used to end the polling
+    for good. An amount no legal action makes (a lost digit: 69,6 read 9,6) falls back on the
+    stack's drop (`action_sync.next_action`).
   - **Into the models: `Spot.seat_stats`** (by engine seat, from `tracker.vectors`), handed to
     the replay's `Table` through `_FixedStats`, which records nothing. The top bar's
     "Policy: avversari sempre nuovi" switch (`fresh_opponents_var`, kept on the app as

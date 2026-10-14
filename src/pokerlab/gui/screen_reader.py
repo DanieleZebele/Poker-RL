@@ -63,6 +63,9 @@ class ScreenReading:
     # The client seats showing their cards face up (a showdown); None when no player
     # zone is set.
     shown: set[int] | None = None
+    # The avatar's signature (`seats.avatar_signature`) of each opponent seat read out of the
+    # hand ("fuori"), the one state where the avatar is in view. None when no player zone is set.
+    avatars: dict | None = None
     problems: list[str] = field(default_factory=list)
 
 
@@ -217,8 +220,8 @@ class ScreenReader:
 
     def _read_seats(self, frames: dict, reading: ScreenReading) -> None:
         """The state of every seat whose player zone is set."""
-        from pokerlab.vision.labels import SEAT_REACTION
-        from pokerlab.vision.seats import read_seat
+        from pokerlab.vision.labels import SEAT_OUT, SEAT_REACTION
+        from pokerlab.vision.seats import YOUR_SEAT, avatar_signature, read_seat
 
         seats = {
             seat: (name, frames[name]) for seat in range(self.players)
@@ -234,6 +237,12 @@ class ScreenReader:
         read = {seat: r.state for seat, r in readings.items()}
         reading.shown = {seat for seat, r in readings.items() if r.face_up}
         reading.seats = keep_through_reactions(read, self._seat_states)
+        # Avatars, only of seats that read "fuori" *now* (not kept through a reaction, which
+        # covers the picture) and never your own.
+        reading.avatars = {
+            seat: avatar_signature(frame) for seat, (name, frame) in seats.items()
+            if seat != YOUR_SEAT and read[seat] == SEAT_OUT
+        }
         reacting = sorted(seat for seat, state in read.items() if state == SEAT_REACTION)
         if reacting:
             reading.problems.append(f"reazione sul posto {', '.join(map(str, reacting))}: tengo lo stato di prima")

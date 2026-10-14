@@ -67,6 +67,13 @@ def test_an_amount_the_engine_cannot_make_stops_without_inventing():
     assert result.actions == [] and result.waiting_for == 3 and "non coerente" in result.note
 
 
+def test_an_amount_misread_below_the_bet_falls_back_on_the_stack():
+    # 60 read as 3 (a digit lost): no raise makes 3, but the stack went down by 60
+    view = TableView(bets={**BLINDS, 3: 3}, board_cards=0, stacks={3: 140})
+    _new, result = sync_actions(spot(), view)
+    assert kinds(result)[:1] == [(3, ActionType.RAISE, 60)]
+
+
 def test_a_shove_is_an_all_in():
     view = TableView(bets={**BLINDS, 3: 200}, board_cards=0)
     _new, result = sync_actions(spot(), view)
