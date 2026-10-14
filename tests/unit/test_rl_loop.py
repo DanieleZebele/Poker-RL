@@ -21,6 +21,7 @@ from pokerlab.rl.global_store import (
     ARENA_REQUEST_FILENAME,
     read_member,
     request_benchmark_arena,
+    write_member,
     write_sidecar,
 )
 from pokerlab.rl.loop import (
@@ -471,7 +472,7 @@ def launch_args(tmp_path, **overrides):
         "sb": 1, "bb": 2, "lr": 3e-4, "device": "cpu",
         "hidden": 512, "num_layers": 3, "head_hidden": 256, "head_layers": 1, "equity_model": "e.pt",
         "models_dir": tmp_path / "models",
-        "machine": "host-a", "pool_models": 20, "table_hands": 200, "concurrent_tables": 8, "allin_runouts": 20, "style_share": 0.0, "style_spread": 0.5, "style_temperature_spread": 0.2, "style_jitter": 0.1, "style_scales": [1.0] * 5, "critic_stack_power": 1.4, "collect_workers": 1, "session_workers": 1, "update_device": "same", "entropy_anneal_iterations": 0, "entropy_anneal_start": 0.1, "entropy_anneal_final": 0.0001, "pool_top_share": 0.5, "pool_top_n": 100,
+        "machine": "host-a", "pool_models": 20, "table_hands": 200, "concurrent_tables": 8, "allin_runouts": 20, "style_share": 0.0, "style_spread": 0.5, "style_temperature_spread": 0.2, "style_jitter": 0.1, "style_scales": [1.0] * 5, "critic_stack_power": 1.4, "collect_workers": 1, "session_workers": 1, "pool_refresh_every": 0, "update_device": "same", "snapshot_every": 0, "snapshot_benchmark_sessions": 10, "lr_anneal_iterations": 0, "lr_anneal_final": 1e-5, "entropy_anneal_iterations": 0, "entropy_anneal_start": 0.1, "entropy_anneal_final": 0.0001, "pool_top_share": 0.5, "pool_top_n": 100,
         "ppo_epochs": 4, "clip_epsilon": 0.2, "eval_every": 10,
         "minibatch_size": 1024, "gae_lambda": 0.95, "value_coef": 0.5, "policy_max_grad_norm": 0.5, "critic_max_grad_norm": 1.0,
         "k_schedule": "0:16, 100:2", "draw_tiers": "10, 100, 1000, all",
@@ -529,7 +530,12 @@ def test_a_worker_is_told_how_many_copies_collect_its_hands_and_how_its_entropy_
 
     assert value("--collect-workers") == "1"
     assert value("--session-workers") == "1"
+    assert value("--pool-refresh-every") == "0"
     assert value("--update-device") == "same"
+    assert value("--snapshot-every") == "0"
+    assert value("--snapshot-benchmark-sessions") == "10"
+    assert value("--lr-anneal-iterations") == "0"
+    assert value("--lr-anneal-final") == "1e-05"
     assert value("--entropy-anneal-iterations") == "0"
     assert value("--entropy-anneal-start") == "0.1"
     assert value("--entropy-anneal-final") == "0.0001"
@@ -556,6 +562,35 @@ def test_an_inheriting_worker_is_told_which_parent_it_came_from(tmp_path, monkey
     command, _ = capture_launch(tmp_path, monkeypatch, inherit_from=parent, hp=inherited)
 
     assert command[command.index("--parent-label") + 1] == parent.stem
+
+
+def test_an_inheriting_worker_starts_at_its_parents_rating_in_the_ledger_now(tmp_path, monkeypatch):
+    """The parent has been rated since it was published, and that is the better
+    estimate of where the lineage sits, so the child is handed it."""
+    parent = tmp_path / "models" / "m-gen0003-w01-agent-20260101-000000.pt"
+    parent.parent.mkdir()
+    parent.write_bytes(b"w")
+    write_member(tmp_path / "global", PoolMember(label=parent.stem, ref=str(parent), rating=1777.5, games=900))
+
+    command, _ = capture_launch(tmp_path, monkeypatch, inherit_from=parent)
+
+    assert float(command[command.index("--initial-rating") + 1]) == 1777.5
+
+
+def test_a_parent_the_ledger_does_not_know_passes_no_rating(tmp_path, monkeypatch):
+    """Pruned or never rated: the worker falls back to the rating in the checkpoint."""
+    parent = tmp_path / "models" / "m-gen0003-w01-agent-20260101-000000.pt"
+    parent.parent.mkdir()
+    parent.write_bytes(b"w")
+
+    command, _ = capture_launch(tmp_path, monkeypatch, inherit_from=parent)
+
+    assert "--resume" in command and "--initial-rating" not in command
+
+
+def test_a_worker_without_a_parent_is_given_no_rating(tmp_path, monkeypatch):
+    command, _ = capture_launch(tmp_path, monkeypatch)
+    assert "--initial-rating" not in command
 
 
 def test_a_worker_that_runs_the_fleets_own_settings_took_no_step_from_its_parent(tmp_path, monkeypatch):
@@ -1888,7 +1923,7 @@ def test_the_ranges_are_ordered_by_value_not_as_text():
     """The values are kept as the strings the run used, and "1024" sorts before
     "320" as text."""
     rows = [
-        parse_worker_log("w00", hp_log(hands=320), age=1.0),
+        parse_worker_log("w00", hp_log(lr=1.9e-4, hands=320), age=1.0),
         parse_worker_log("w01", hp_log(hands=1024), age=1.0),
     ]
 

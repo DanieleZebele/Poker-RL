@@ -1,0 +1,22 @@
+# Overrides for the machine "zebele" only: whatever is set here replaces the same key in
+# config.toml for this host, and every key not named here stays the shared file's.
+# Read next to config.toml, re-read by the supervisor at every generation.
+# Per-machine identity keys (machine, workers, paths) are refused here as in config.toml.
+
+[network]
+# Same values as config.toml today, so this file changes nothing yet. Change them here to
+# give only this machine another network: its workers start from scratch until the store
+# holds a model of that shape.
+hidden = 1024
+num_layers = 5
+head_hidden = 256
+head_layers = 1
+
+# Other things that usually differ per host (uncomment to use):
+# [fleet]
+worker_ceiling = 3
+collect_workers = 40     # forked copies of each worker that play its hands
+session_workers = 40     # the same for the rated passes
+
+# hands = 20000                # per iteration 
+# equity_model = "equity_evaluator/distill-lat32_h256_h1.pt"  # attn-l-lat512_h512_b4_l4_h8

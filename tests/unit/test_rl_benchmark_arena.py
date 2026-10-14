@@ -470,3 +470,32 @@ def test_a_checkpoint_must_hold_at_least_one_session(tmp_path):
         "--config", "", "--root", str(root), "--global-dir", str(global_dir),
         "--arena-checkpoint-sessions", "0",
     ]) == 2
+
+
+def test_session_workers_play_each_batch_in_forked_copies(tmp_path, monkeypatch):
+    """`--session-workers N` reaches `play_global_sessions` as `fork_workers`, and the
+    sharded path (`--workers`) is not used."""
+    import pokerlab.rl.benchmark_arena as module
+
+    root, global_dir = anchor_store(tmp_path)
+    forks: list[int] = []
+
+    def play(candidates, mix, *, sessions, fork_workers=1, **k):
+        forks.append(fork_workers)
+        return [{candidates[0].label: 0.0, candidates[1].label: 0.0}] * sessions
+
+    def sharded(*a, **k):
+        raise AssertionError("the sharded path must not run when forks are asked for")
+
+    monkeypatch.setattr(module, "play_global_sessions", play)
+    monkeypatch.setattr(module, "play_sharded", sharded)
+    monkeypatch.setattr(module, "write_snapshot", lambda *a, **k: True)
+
+    assert module.main([
+        "--config", "", *SIX_SEATS, "--root", str(root), "--global-dir", str(global_dir),
+        "--arena-max-sessions", "8", "--arena-min-sessions", "8", "--arena-tolerance", "-1",
+        "--dry-run", "--arena-checkpoint-sessions", "4", "--session-workers", "3",
+        "--workers", "5", "--device", "cpu",
+    ]) == 0
+
+    assert forks == [3, 3]

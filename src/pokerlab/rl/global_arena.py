@@ -36,6 +36,7 @@ from pokerlab.rl.global_store import (
     acquire_locks,
     list_member_labels,
     load_global_registry,
+    load_ranking,
     read_member,
     release_locks,
     remove_member,
@@ -74,11 +75,9 @@ BENCHMARK_DIRNAME = "benchmark"
 MODELS_DIRNAME = "models"
 
 # ~50 population + ~5 benchmark per pass is the composition asked for --
-# see `run_population_sessions`. Both draws are plain uniform random: unlike
-# `sample_population`'s least-played-first bias (still available, just not
-# used here), a pass's whole point now includes deciding who gets deleted,
-# so a uniform draw is the more honest "any tracked model could come up"
-# sampling this decision deserves.
+# see `run_population_sessions`. The benchmark draw is plain uniform random; the
+# population draw is uniform too unless the caller passes `draw=` (every real
+# caller passes `tiered_draw`).
 DEFAULT_POPULATION_SAMPLE = 50
 DEFAULT_BENCHMARK_SAMPLE = 5
 # How a model becomes a frozen anchor (see `add_benchmark_candidates`): at the
@@ -325,31 +324,6 @@ def discover_benchmark_population(root: str | Path = Path("checkpoints")) -> lis
     return list(found.values())
 
 
-def sample_population(
-    population: list[Candidate],
-    ratings: dict[str, dict],
-    count: int,
-    rng: random.Random,
-) -> list[Candidate]:
-    """Pick who plays this pass: the least-played first, then at random.
-
-    Straight uniform sampling would leave a 23,000-model population with a
-    handful of games each after many passes, and a rating from a handful of
-    games is not a rating. Taking the least-played half deterministically and
-    filling the rest at random gives even coverage without freezing the draw
-    into the same faces every pass.
-    """
-    if count >= len(population):
-        return list(population)
-    played = {c.label: ratings.get(c.label, {}).get("games", 0) for c in population}
-    ordered = sorted(population, key=lambda c: (played[c.label], c.label))
-    half = count // 2
-    chosen = ordered[:half]
-    remainder = ordered[half:]
-    rng.shuffle(remainder)
-    return chosen + remainder[: count - half]
-
-
 # The tiers `tiered_draw` splits the ranking by, written like `--parent-tiers`:
 # the best N rated models, or `None` for the whole store. Every tier gets an equal
 # share of the seats, and a tier listed twice gets twice the share. The default is
@@ -406,6 +380,14 @@ def _split_seats(count: int, weights: Sequence[int], rng: random.Random) -> list
             cumulative += share - quotas[index]
             quotas[index] += int(cumulative + point) - int(before + point)
     return quotas
+
+
+def ranking_for_draw(global_dir) -> dict[str, dict]:
+    """The ratings `tiered_draw` ranks by, read fresh from the shared store."""
+    return {
+        label: {"rating": member.rating, "games": member.games}
+        for label, member in load_ranking(global_dir).members.items()
+    }
 
 
 def tiered_draw(
@@ -912,11 +894,8 @@ def play_population_sessions_sharded(
 
     population = discover_population(root)
     benchmark_population = discover_benchmark_population(root)
-    # Uniform by default, and deliberately: a pass decides who might be *deleted*,
-    # so an honest draw is the right fit (see the module header). `draw` is the hook
-    # for a caller that wants coverage instead -- `rl/population_arena.py` passes a
-    # least-played-first draw, because a hand-run rating sweep deletes nothing and
-    # its whole job is to reach models the sampled passes have never seated.
+    # Uniform by default; `draw` is the hook for a caller that wants another rule
+    # (`tiered_draw`, which `train.py` and `rl/population_arena.py` both pass).
     if draw is None:
         population_draw = rng.sample(population, min(population_sample, len(population)))
     else:

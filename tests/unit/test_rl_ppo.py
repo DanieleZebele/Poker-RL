@@ -35,6 +35,7 @@ from pokerlab.rl.ppo import (
     build_model_from_checkpoint,
     critic_weights,
     entropy_coefficient_at,
+    learning_rate_at,
     load_checkpoint,
     ppo_update,
     save_checkpoint,
@@ -1111,7 +1112,7 @@ def test_an_empty_store_ends_the_phase_instead_of_spinning(tmp_path, monkeypatch
 def test_the_ranking_is_re_read_for_every_round(tmp_path, monkeypatch):
     """The previous pass just moved the ratings the top bias is computed from,
     and so did every other machine."""
-    import pokerlab.rl.train as train_module
+    import pokerlab.rl.global_arena as arena_module
     from pokerlab.rl.train import run_elo_fill_in
 
     reads = []
@@ -1119,7 +1120,7 @@ def test_the_ranking_is_re_read_for_every_round(tmp_path, monkeypatch):
         monkeypatch, FakeSessions(sessions_played=1, stop_after=3, stop_file=tmp_path / "FILL_STOP")
     )
     monkeypatch.setattr(
-        train_module,
+        arena_module,
         "load_ranking",
         lambda _dir: reads.append(1) or SimpleNamespace(members={}),
     )
@@ -1352,3 +1353,224 @@ def test_a_validation_pass_gives_the_same_result_whether_forked_copies_play_it_o
         return rate, trainer.learner_rating, trainer.learner_games
 
     assert run(1, "serial") == run(3, "forked")
+
+
+def test_refreshing_the_opponents_changes_who_fills_the_seats_from_the_next_table(tmp_path):
+    from pokerlab.rl.rollout import OpponentPool
+
+    trainer = SelfPlayTrainer(
+        fixed_mix(3), TrainConfig(hands_per_iteration=10, table_hands=5),
+        registry=registry_with_models(tmp_path, 2), **tiny_parts(hidden=32, num_layers=1),
+    )
+    other = registry_with_models(tmp_path / "other", 3)
+    trainer.refresh_opponents([], other)  # no opponents: every seat goes to the learner
+
+    assert len(trainer._pool) == 0 and trainer._registry is other
+    assert trainer.train_iteration()["decisions"] > 0
+    assert isinstance(trainer._pool, OpponentPool)
+
+
+def test_a_refresh_draws_the_whole_pool_again_and_loads_only_the_newcomers(tmp_path):
+    from pokerlab.rl.train import refreshed_opponents
+
+    registry_with_models(tmp_path / "models", 8)
+    args = SimpleNamespace(
+        global_dir=tmp_path / "global", models_dir=tmp_path / "models", pool_models=3,
+        pool_top_share=0.0, pool_top_n=50, device="cpu",
+    )
+    loaded: dict = {}
+    first, opponents, registry = refreshed_opponents(args, small_game(), loaded, random.Random(1))
+    assert len(first) == len(opponents) == 3 and set(loaded) == {m.label for m in first}
+    assert set(registry.members) == {m.label for m in first} and all(m.frozen for m in first)
+
+    kept_objects = dict(loaded)
+    second, opponents, _registry = refreshed_opponents(args, small_game(), loaded, random.Random(2))
+
+    assert {m.label for m in second} != {m.label for m in first}
+    assert set(loaded) == {m.label for m in second}  # the ones that left are freed
+    for member in second:  # one drawn again keeps the object it had: no second load
+        if member.label in kept_objects:
+            assert loaded[member.label] is kept_objects[member.label]
+
+
+def test_the_learning_rate_falls_geometrically_from_the_workers_own_to_the_fleets_final_value():
+    config = PPOConfig(learning_rate=1e-3, learning_rate_final=1e-5,
+                       learning_rate_anneal_iterations=200)
+    assert learning_rate_at(config, 1) == pytest.approx(1e-3)
+    assert learning_rate_at(config, 101) == pytest.approx(math.sqrt(1e-3 * 1e-5))
+    assert learning_rate_at(config, 201) == pytest.approx(1e-5)
+    assert learning_rate_at(config, 9000) == pytest.approx(1e-5)
+
+
+def test_without_annealing_the_learning_rate_is_the_constant():
+    config = PPOConfig(learning_rate=2e-4)
+    assert [learning_rate_at(config, i) for i in (1, 50, 900)] == [2e-4] * 3
+
+
+def test_annealing_the_learning_rate_needs_positive_ends():
+    for start, final in ((0.0, 1e-5), (1e-3, 0.0)):
+        with pytest.raises(ValueError):
+            PPOConfig(learning_rate=start, learning_rate_final=final,
+                      learning_rate_anneal_iterations=10)
+    with pytest.raises(ValueError):
+        PPOConfig(learning_rate_anneal_iterations=-1)
+
+
+def test_every_iteration_updates_with_that_iterations_learning_rate():
+    trainer = SelfPlayTrainer(
+        fixed_mix(3),
+        TrainConfig(hands_per_iteration=10),
+        PPOConfig(epochs=1, minibatch_size=64, learning_rate=1e-3,
+                  learning_rate_final=1e-5, learning_rate_anneal_iterations=2),
+        rng=random.Random(0),
+        **tiny_parts(hidden=32, num_layers=1),
+    )
+    seen = []
+    for _ in range(4):
+        trainer.train_iteration()
+        seen.append(trainer.optimizer.param_groups[0]["lr"])
+    assert seen == pytest.approx([1e-3, 1e-4, 1e-5, 1e-5])
+
+
+
+def test_every_minibatch_is_full_and_the_remainder_is_left_out_of_that_epoch(model):
+    """10 decisions in minibatches of 4: two steps an epoch, never a short third of 2."""
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    stats = ppo_update(model, optimizer, constant_batch(model, 1.0, size=10),
+                       PPOConfig(epochs=3, minibatch_size=4))
+    assert stats["grad_steps"] == 6
+
+
+def test_a_batch_smaller_than_one_minibatch_is_used_whole(model):
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    stats = ppo_update(model, optimizer, constant_batch(model, 1.0, size=5),
+                       PPOConfig(epochs=2, minibatch_size=16))
+    assert stats["grad_steps"] == 2
+
+
+# ---- snapshots: a model published in the middle of a run ------------------------
+
+
+def _snapshot_args(tmp_path, **overrides):
+    return _train_args(
+        scratch_dir=str(tmp_path / "scratch"), models_dir=tmp_path / "models",
+        global_dir=tmp_path / "global", benchmark_dir=tmp_path / "benchmark",
+        archive_prefix="gen0001-w00", global_lock_seconds=60, device="cpu", session_workers=1,
+        session_hands=100, benchmark_resident=2, benchmark_rotate_every=10,
+        snapshot_benchmark_sessions=7, **overrides,
+    )
+
+
+def _snapshot_trainer():
+    return SelfPlayTrainer(
+        fixed_mix(3), TrainConfig(hands_per_iteration=10),
+        PPOConfig(epochs=1, minibatch_size=64), rng=random.Random(0),
+        **tiny_parts(hidden=32, num_layers=1),
+    )
+
+
+def test_a_snapshot_is_published_as_a_model_of_its_own_at_the_rating_the_anchors_give_it(
+    tmp_path, monkeypatch
+):
+    from pokerlab.rl import benchmark as benchmark_module
+    from pokerlab.rl.pool_registry import parse_k_schedule
+    from pokerlab.rl.train import publish_snapshot
+
+    seen = {}
+
+    def fake_rate(model, directory, mix, **kwargs):
+        seen.update(kwargs)
+        return benchmark_module.BenchmarkRating(
+            bb_per_100=4.5, sessions=kwargs["sessions"], hands=700, opponents=3,
+            rating_after=1632.0, games_after=kwargs["games"] + kwargs["sessions"],
+        )
+
+    monkeypatch.setattr(benchmark_module, "rate_against_benchmark", fake_rate)
+    refreshed = []
+    monkeypatch.setattr(
+        "pokerlab.rl.train.write_snapshot", lambda *a, **k: refreshed.append((a, k))
+    )
+    trainer = _snapshot_trainer()
+    trainer.train_iteration()
+    games_before, rating_before = trainer.learner_games, trainer.learner_rating
+    (tmp_path / "scratch").mkdir()
+
+    label = publish_snapshot(
+        _snapshot_args(tmp_path), trainer, fixed_mix(3), run_id="20261014-120000",
+        k_schedule=parse_k_schedule("0:16"),
+    )
+
+    assert label == "host-a-gen0001-w00-agent-20261014-120000-i0001"
+    assert (tmp_path / "models" / f"{label}.pt").exists()
+    # It was rated by a pass of its own, started from the learner's rating and games now.
+    assert seen["sessions"] == 7 and seen["games"] == games_before and seen["rating"] == rating_before
+    # The published model carries what the anchors said, and the registry has it at that rating.
+    import torch
+
+    from pokerlab.rl.global_store import read_member
+
+    checkpoint = torch.load(tmp_path / "models" / f"{label}.pt", map_location="cpu", weights_only=True)
+    metadata = checkpoint["metadata"]
+    assert metadata["publish_rating"] == 1632.0 and metadata["benchmark_bb100"] == 4.5
+    assert metadata["snapshot_iteration"] == 1
+    member = read_member(tmp_path / "global", label)
+    assert member.rating == 1632.0 and member.games == games_before + 7
+    # The learner goes on from the rating the anchors gave the snapshot, with its own session
+    # count, and no file is left under a name the sweep takes.
+    assert trainer.learner_rating == 1632.0 and trainer.learner_games == games_before
+    assert not list((tmp_path / "scratch").glob("*"))
+    # The ranking readers go by is refreshed, or the new model would not show for hours.
+    assert len(refreshed) == 1 and refreshed[0][0][0] == tmp_path / "global"
+    assert refreshed[0][1].get("force") is True
+
+
+def test_the_next_snapshot_starts_from_the_rating_the_previous_one_earned(tmp_path, monkeypatch):
+    from pokerlab.rl import benchmark as benchmark_module
+    from pokerlab.rl.pool_registry import parse_k_schedule
+    from pokerlab.rl.train import publish_snapshot
+
+    starts = []
+    earned = iter([1640.0, 1655.0])
+
+    def fake_rate(model, directory, mix, **kwargs):
+        starts.append(kwargs["rating"])
+        return benchmark_module.BenchmarkRating(
+            bb_per_100=1.0, sessions=kwargs["sessions"], hands=700, opponents=3,
+            rating_after=next(earned), games_after=kwargs["games"] + kwargs["sessions"],
+        )
+
+    monkeypatch.setattr(benchmark_module, "rate_against_benchmark", fake_rate)
+    monkeypatch.setattr("pokerlab.rl.train.write_snapshot", lambda *a, **k: None)
+    trainer = _snapshot_trainer()
+    first_start = trainer.learner_rating
+    (tmp_path / "scratch").mkdir()
+
+    for iteration in (1, 2):
+        trainer.train_iteration()
+        publish_snapshot(
+            _snapshot_args(tmp_path), trainer, fixed_mix(3), run_id=f"20261014-12000{iteration}",
+            k_schedule=parse_k_schedule("0:16"),
+        )
+
+    assert starts == [first_start, 1640.0]
+    assert trainer.learner_rating == 1655.0
+
+
+def test_a_snapshot_with_no_anchors_to_rate_it_is_not_published(tmp_path, monkeypatch):
+    from pokerlab.rl import benchmark as benchmark_module
+    from pokerlab.rl.pool_registry import parse_k_schedule
+    from pokerlab.rl.train import publish_snapshot
+
+    monkeypatch.setattr(benchmark_module, "rate_against_benchmark", lambda *a, **k: None)
+    trainer = _snapshot_trainer()
+    trainer.train_iteration()
+    (tmp_path / "scratch").mkdir()
+
+    label = publish_snapshot(
+        _snapshot_args(tmp_path), trainer, fixed_mix(3), run_id="20261014-120000",
+        k_schedule=parse_k_schedule("0:16"),
+    )
+
+    assert label is None
+    assert not (tmp_path / "models").exists() or not list((tmp_path / "models").glob("*.pt"))
+    assert not list((tmp_path / "scratch").glob("*"))

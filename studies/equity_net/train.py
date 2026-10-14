@@ -53,11 +53,11 @@ def main() -> None:
     parser.add_argument("--clip", type=float, default=1.0, help="gradient norm clip (0 = off)")
     parser.add_argument("--weight-decay", type=float, default=0.0, help="AdamW decay (0 = plain Adam)")
     parser.add_argument("--hidden", type=int, default=512)
-    parser.add_argument("--latent", type=int, default=512)
+    parser.add_argument("--latent", type=int, default=32)
     parser.add_argument("--arch", choices=("sets", "attn"), default="attn", help="sum over players, or attention")
     parser.add_argument("--blocks", type=int, default=4, help="residual blocks in the player encoder (0 = two layers)")
     parser.add_argument("--layers", type=int, default=4, help="attention layers (arch attn)")
-    parser.add_argument("--heads", type=int, default=8, help="attention heads (arch attn)")
+    parser.add_argument("--heads", type=int, default=1, help="attention heads (arch attn)")
     parser.add_argument("--ema", type=float, default=0.999,
                         help="decay of a moving average of the weights, which is what is measured and saved (0 = off)")
     parser.add_argument("--loss", choices=("logscore", "brier"), default="logscore",
@@ -66,7 +66,7 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 6) - 6),
                         help="processes drawing new deals (default: the cores, less six)")
     parser.add_argument("--threads", type=int, default=4, help="CPU threads of the trainer")
-    parser.add_argument("--street-weights", type=float, nargs=4, default=(4.0, 1.0, 1.0, 1.0))
+    parser.add_argument("--street-weights", type=float, nargs=4, default=(1.0, 1.0, 1.0, 1.0))
     parser.add_argument("--eval-every", type=int, default=1000)
     parser.add_argument("--val-deals", type=int, default=DEFAULT_VAL_DEALS)
     parser.add_argument("--val-runouts", type=int, default=DEFAULT_VAL_RUNOUTS, help="preflop completions per validation deal")

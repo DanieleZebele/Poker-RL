@@ -23,6 +23,13 @@ Rules worth knowing:
   reading; the keys are flattened, so a name may appear once in the whole file.
 - **A typo is an error, not a silent no-op**: a key no CLI knows is rejected,
   with the closest real name suggested.
+- **One machine can override some of it** with a file of its own beside the shared one,
+  `config.<machine>.toml` (`config.zebele.toml` next to `config.toml`): the same keys, the same
+  checks, and only the keys it names replace the shared file's. The machine is `--machine` if the
+  command line has it, else this host's short name. A machine with no such file reads the shared
+  file alone. This is for the values that really differ per host (the network's shape, how many
+  forks to use); the rest stays fleet-wide. Per-machine *identity* keys (paths, `machine`,
+  `workers`) are still rejected in both files.
 - **Per-machine settings are rejected** (`LOCAL_ONLY`, and every path): the file
   is shared by the whole fleet through the project directory, so a key that is
   true of one host (`machine`, `workers`, `device`, any directory) would be
@@ -40,6 +47,8 @@ import argparse
 import difflib
 import json
 import math
+import re
+import socket
 import sys
 import tomllib
 from collections.abc import Callable, Mapping, Sequence
@@ -61,6 +70,7 @@ LOCAL_ONLY = frozenset(
         "resume",
         "hp_arm",
         "parent_label",
+        "initial_rating",
         "archive_prefix",
         "fill_stop_file",
         "status",
@@ -92,6 +102,16 @@ class ConfigReport:
 
     path: Path | None = None
     applied: dict[str, Any] = field(default_factory=dict)
+    # The machine's own file, when there is one, and the keys it set (they beat `path`'s).
+    override: Path | None = None
+    overridden: tuple[str, ...] = ()
+
+    @property
+    def files(self) -> str:
+        """The file(s) that were read, as a line of text."""
+        if self.path is None:
+            return ""
+        return f"{self.path} + {self.override}" if self.override is not None else str(self.path)
 
 
 def add_config_arguments(parser: argparse.ArgumentParser) -> None:
@@ -251,6 +271,26 @@ def apply_config(
     return ConfigReport(applied=applied)
 
 
+_MACHINE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def machine_name(argv: Sequence[str]) -> str:
+    """The machine whose override file to look for: `--machine` on the command line, else this
+    host's short name (the default `poker-train` and `poker-loop` give the flag)."""
+    pre = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    pre.add_argument("--machine", default=None)
+    named, _ = pre.parse_known_args(list(argv))
+    return named.machine or socket.gethostname().split(".")[0]
+
+
+def override_path(base: Path, machine: str) -> Path | None:
+    """`config.toml` -> `config.<machine>.toml` beside it; None for a name that is not a plain
+    machine id (it must not be able to point anywhere else)."""
+    if not _MACHINE_NAME.fullmatch(machine):
+        return None
+    return base.with_name(f"{base.stem}.{machine}{base.suffix}")
+
+
 def _config_path(argv: Sequence[str]) -> tuple[Path | None, bool]:
     """The file to read, and whether it was asked for by name."""
     pre = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
@@ -281,13 +321,23 @@ def parse_with_config(
     path, named = _config_path(arguments)
     report = ConfigReport()
     if path is not None and (named or path.is_file()):
+        values = read_config(path)
+        extra = override_path(path, machine_name(arguments))
+        overridden: dict[str, Any] = {}
+        if extra is not None and extra.is_file():
+            overridden = read_config(extra)
+            values = {**values, **overridden}
+        else:
+            extra = None
         report = apply_config(
             parser,
-            read_config(path),
+            values,
             siblings=siblings() if siblings is not None else (),
             lenient=lenient,
         )
-        report = ConfigReport(path=path, applied=report.applied)
+        report = ConfigReport(
+            path=path, applied=report.applied, override=extra, overridden=tuple(overridden)
+        )
     return parser.parse_args(arguments), report
 
 
@@ -309,10 +359,15 @@ def resolve_cli(
     except ConfigError as error:
         parser.exit(2, f"{parser.prog}: config: {error}\n")
     if args.print_config:
-        print(format_config(vars(args), [k for k, v in report.applied.items() if vars(args)[k] == v]))
+        print(format_config(
+            vars(args),
+            [k for k, v in report.applied.items() if vars(args)[k] == v],
+            [k for k in report.overridden if k in report.applied and vars(args)[k] == report.applied[k]],
+            report.override.name if report.override is not None else "machine file",
+        ))
         return None
     if report.path is not None:
-        print(f"config: {report.path}, {len(report.applied)} valori", flush=True)
+        print(f"config: {report.files}, {len(report.applied)} valori", flush=True)
     return args
 
 
@@ -356,14 +411,23 @@ def _toml_value(value: Any) -> str:
     return repr(value)
 
 
-def format_config(values: Mapping[str, Any], from_file: Sequence[str] = ()) -> str:
+def format_config(
+    values: Mapping[str, Any],
+    from_file: Sequence[str] = (),
+    from_override: Sequence[str] = (),
+    override_name: str = "machine file",
+) -> str:
     """`values` as `key = value` lines, ready to paste into the file.
 
     The keys the file set are marked, so what is a default and what was chosen
-    can be told apart at a glance.
+    can be told apart at a glance; the ones the machine's own file set say so.
     """
     lines = []
     for key, value in resolved_settings(values).items():
-        mark = "  # config.toml" if key in from_file else ""
+        mark = ""
+        if key in from_override:
+            mark = f"  # {override_name}"
+        elif key in from_file:
+            mark = "  # config.toml"
         lines.append(f"{key} = {_toml_value(value)}{mark}")
     return "\n".join(lines)

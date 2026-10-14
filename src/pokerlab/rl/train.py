@@ -51,6 +51,7 @@ from pokerlab.rl.global_arena import (
     DEFAULT_POPULATION_SAMPLE,
     DRAW_TIERS,
     draw_tiers_text,
+    ranking_for_draw,
 )
 from pokerlab.rl.global_store import (
     DEFAULT_LOCK_SECONDS,
@@ -58,6 +59,7 @@ from pokerlab.rl.global_store import (
     load_ranking,
     publish_model,
     write_sidecar,
+    write_snapshot,
 )
 from pokerlab.rl.grad_log import ClipReading, GradientReading, format_gradient_line
 from pokerlab.rl.phases import (
@@ -97,6 +99,7 @@ from pokerlab.rl.pool_registry import (
 from pokerlab.rl.ppo import (
     PPOConfig,
     entropy_coefficient_at,
+    learning_rate_at,
     build_batch,
     build_model_from_checkpoint,
     check_compatible,
@@ -408,6 +411,14 @@ class SelfPlayTrainer:
         """The network being trained: what is loaded into, saved and published."""
         return self._model
 
+    def refresh_opponents(self, opponents: Sequence[Opponent], registry: PoolRegistry | None) -> None:
+        """Change who fills the seats the learner is not in -- from the next table on -- and
+        the field the validation passes score against. The learner's own rating and session
+        count are the trainer's, so they carry over untouched."""
+        self._pool = OpponentPool(list(opponents))
+        self._collector.set_pool(self._pool)
+        self._registry = registry
+
     @property
     def play_model(self) -> PokerActorCritic:
         """The network that plays, on the playing device: `model` itself on one device, a
@@ -621,6 +632,16 @@ class SelfPlayTrainer:
         release_free_memory()
         return won / mix.big_blind / (sessions * hands) * 100
 
+    def adopt_rating(self, rating: float) -> None:
+        """Take `rating` as the learner's: the next rated session starts from it.
+
+        The session count is left alone. A snapshot's rating comes from a pass against the
+        pinned anchors, a better reading of where the run stands than the validation's, and
+        the next rating should start from it; but it describes an earlier network, so the
+        count that sets the K stays the learner's own (its validation sessions) and the
+        rating can still travel as the weights improve."""
+        self._learner_rating = float(rating)
+
     def archive(
         self, path: str | Path, *, iteration: int, metadata: dict | None = None
     ) -> None:
@@ -665,6 +686,9 @@ class SelfPlayTrainer:
         ppo = replace(
             self._ppo, entropy_coefficient=entropy_coefficient_at(self._ppo, self._iteration)
         )
+        learning_rate = learning_rate_at(self._ppo, self._iteration)
+        for group in self._optimizer.param_groups:
+            group["lr"] = learning_rate
         stats = ppo_update(self._model, self._optimizer, batch, ppo)
         self.sync_play_model()
         stats["iteration"] = float(self._iteration)
@@ -976,14 +1000,6 @@ DEFAULT_FILL_DEADLINE_MINUTES = 150
 DEFAULT_FILL_SESSIONS = 10
 
 
-def ranking_for_draw(global_dir) -> dict[str, dict]:
-    """The ratings `tiered_draw` ranks by, read fresh from the shared store."""
-    return {
-        label: {"rating": member.rating, "games": member.games}
-        for label, member in load_ranking(global_dir).members.items()
-    }
-
-
 def run_elo_fill_in(args, mix) -> tuple[int, int]:
     """Play rating passes until the rest of the generation catches up.
 
@@ -1083,6 +1099,45 @@ def _prepare_collector_copy(seed: int) -> None:
     torch.set_num_threads(1)
 
 
+def refreshed_opponents(
+    args: argparse.Namespace,
+    mix,
+    loaded: dict[str, Opponent],
+    rng: random.Random,
+) -> tuple[list[PoolMember], list[Opponent], PoolRegistry]:
+    """The training pool drawn again, from the store and the ranking as they are now, with
+    the settings of the first draw (`--pool-top-share`, `--pool-top-n`): the new members, the
+    opponents that play them, and the in-memory registry the validation scores against.
+
+    Only the models not already in memory are loaded from disk: one drawn again keeps the
+    object it had, and the ones that left are dropped from `loaded` so their weights are
+    freed."""
+    ranking = load_ranking(args.global_dir).members
+    members = draw_training_pool(
+        ranking,
+        available_labels(args.models_dir),
+        size=args.pool_models,
+        rng=rng,
+        top_share=args.pool_top_share,
+        top_n=args.pool_top_n,
+    )
+    registry = build_training_registry(args.models_dir, members)
+    for member in members:
+        if member.label not in loaded:
+            for opponent in registry_opponents(
+                registry,
+                mix,
+                device=args.device,
+                members=[member],
+                on_skip=lambda path, why: print(f"skipping {path.name}: {why}"),
+            ):
+                loaded[member.label] = opponent
+    for label in set(loaded) - {member.label for member in members}:
+        del loaded[label]
+    opponents = [loaded[member.label] for member in members if member.label in loaded]
+    return members, opponents, registry
+
+
 def entropy_settings(args: argparse.Namespace) -> dict[str, float | int]:
     """The entropy bonus fields of `PPOConfig`, the same for every worker: the fleet's
     annealing curve from `--entropy-anneal-start` to `--entropy-anneal-final` over
@@ -1095,6 +1150,128 @@ def entropy_settings(args: argparse.Namespace) -> dict[str, float | int]:
             "entropy_anneal_iterations": args.entropy_anneal_iterations,
         }
     return {"entropy_coefficient": args.entropy_anneal_final}
+
+
+def publish_snapshot(
+    args: argparse.Namespace,
+    trainer: SelfPlayTrainer,
+    mix,
+    *,
+    run_id: str,
+    k_schedule,
+) -> str | None:
+    """Publish the model the run has now, at the rating the frozen anchors give it.
+
+    The snapshot is a copy of the weights, rated from the learner's rating and session count at this
+    moment, by a pass of its own (`--snapshot-benchmark-sessions`), and published as a model with a
+    label of its own, so a label still means one set of weights forever. **What the anchors said
+    becomes the learner's rating** (`SelfPlayTrainer.adopt_rating`, not its session count or its
+    optimizer): the next snapshot, and the final model's pass, start from it instead of from the
+    validation's number. Returns the label, or None
+    when it could not be rated (no anchors yet) -- a snapshot is only worth publishing with the
+    rating the anchors give it, so there is no fallback to the pool's number. The file lives under
+    a name the loop's sweep does not publish (`snapshot-*`): a worker that dies mid-pass leaves
+    nothing behind that would enter the ranking on an unearned rating."""
+    from pokerlab.rl.benchmark import rate_against_benchmark
+
+    iteration = trainer.iteration
+    prefix = f"{args.archive_prefix}-" if args.archive_prefix else ""
+    tag = f"i{iteration:04d}"
+    label = f"{args.machine}-{prefix}agent-{run_id}-{tag}"
+    path = Path(args.scratch_dir) / f"snapshot-{run_id}-{tag}.pt"
+    pool_rating = trainer.learner_rating
+    metadata = {
+        **run_metadata(args),
+        "snapshot_iteration": iteration,
+        "run_label": f"{args.machine}-{prefix}agent-{run_id}",
+    }
+    trainer.archive(path, iteration=iteration, metadata=metadata)
+    announce(SERIES)
+    try:
+        anchors = {
+            label_: member.rating
+            for label_, member in load_ranking(args.global_dir).members.items()
+        }
+        rated = rate_against_benchmark(
+            trainer.play_model,
+            args.benchmark_dir,
+            mix,
+            label=label,
+            rating=pool_rating,
+            games=trainer.learner_games,
+            schedule=k_schedule,
+            anchor_ratings=anchors,
+            sessions=args.snapshot_benchmark_sessions,
+            hands=args.session_hands,
+            resident=args.benchmark_resident,
+            rotate_every=args.benchmark_rotate_every,
+            device=args.device,
+            workers=args.session_workers,
+            seed=(args.seed or 0) + iteration,
+            on_skip=lambda path_, why: print(f"  snapshot, saltato {path_}: {why}"),
+            on_progress=PhaseProgress(SERIES),
+        )
+        if rated is None:
+            print(f"        snapshot i{iteration}: niente ancore per valutarlo, non lo pubblico")
+            return None
+        trainer.adopt_rating(rated.rating_after)
+        style, style_hands = merge_style(
+            {name: list(pair) for name, pair in trainer.style_rates.items()},
+            trainer.style_hands,
+            rated.style,
+            rated.style_hands,
+        )
+        trainer.archive(
+            path,
+            iteration=iteration,
+            metadata={
+                **metadata,
+                "pool_rating": pool_rating,
+                "publish_rating": rated.rating_after,
+                "publish_games": rated.games_after,
+                "benchmark_bb100": rated.bb_per_100,
+                "benchmark_bb100_by_size": {
+                    str(n): bb for n, bb in rated.bb_per_100_by_size.items()
+                },
+                "benchmark_hands": rated.hands,
+                "style": style,
+                "style_hands": style_hands,
+            },
+        )
+        published = publish_model(
+            path,
+            models_dir=args.models_dir,
+            global_dir=args.global_dir,
+            name=f"{label}.pt",
+            rating=rated.rating_after,
+            games=rated.games_after,
+            style=style,
+            style_hands=style_hands,
+            machine=args.machine,
+            lock_ttl=args.global_lock_seconds,
+        )
+    finally:
+        path.unlink(missing_ok=True)
+        path.with_suffix(".json").unlink(missing_ok=True)
+    if published is None:
+        print(f"        snapshot i{iteration}: {label} esiste già, non lo ripubblico")
+        return None
+    # The ranking everything reads (`registry.json`, the dashboard, the GUI) is a snapshot
+    # that otherwise waits for the next population pass, which for a long run is hours away:
+    # a model published in the middle of one would not show until then. Forced, whatever the
+    # file's age (it still waits for nobody: if another process is rewriting it, that one's
+    # copy is as fresh).
+    try:
+        write_snapshot(args.global_dir, machine=args.machine, force=True)
+    except OSError as exc:
+        print(f"        snapshot i{iteration}: registry.json non aggiornato: {exc}")
+    print(
+        f"        snapshot i{iteration}: {rated.bb_per_100:+.1f} bb/100 su {rated.sessions} "
+        f"sessioni contro {rated.opponents} ancore, pubblicato {published.label} "
+        f"(rating {rated.rating_after:.0f}, {rated.games_after} partite)",
+        flush=True,
+    )
+    return published.label
 
 
 def inherited_rating(path: str | Path, *, default: float = DEFAULT_RATING) -> float:
@@ -1130,7 +1307,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--iterations", type=int, default=1000)
     parser.add_argument("--hands", type=int, default=256, help="hands collected per iteration")
     add_table_arguments(parser)
-    parser.add_argument("--lr", type=float, default=3e-4)
     add_network_arguments(parser)
     # The two PPO knobs worth sweeping, exposed so a per-worker draw can reach
     # them. `epochs x clip_epsilon` is the classic stability trade -- more
@@ -1175,6 +1351,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--device cpu --update-device cuda a worker collects on the CPU and trains on the GPU",
     )
     parser.add_argument(
+        "--pool-refresh-every", type=int, default=0,
+        help="every this many iterations, draw the opponent pool again from the store as it is "
+        "now, with the same --pool-top-share and --pool-top-n (0: the pool drawn at the start "
+        "stays for the whole run). Fleet-wide: read from config.toml, not swept",
+    )
+    parser.add_argument(
         "--session-workers", type=int, default=1,
         help="forked copies of the process that play the sessions of a rated pass at the same "
         "time -- the validation, the pass against the anchors, the cross-machine Elo passes "
@@ -1202,6 +1384,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--entropy-anneal-final", type=float, default=0.0001,
         help="entropy bonus once the annealing is over (the whole run's, without annealing)",
+    )
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument(
+        "--lr-anneal-iterations", type=int, default=0,
+        help="iterations over which the learning rate falls from --lr (the worker's own, swept "
+        "value) to --lr-anneal-final, geometrically, counted from the start of THIS run; "
+        "0 = constant. Fleet-wide: read from config.toml, not swept",
+    )
+    parser.add_argument(
+        "--lr-anneal-final", type=float, default=1e-5,
+        help="the learning rate once the annealing is over, an absolute value (unused "
+        "without annealing)",
     )
     parser.add_argument(
         "--device", default="auto",
@@ -1301,6 +1495,12 @@ def build_parser() -> argparse.ArgumentParser:
         "sweep log the optimizer learns from (`rl/sweep_log.py`)",
     )
     parser.add_argument(
+        "--initial-rating", type=float, default=None,
+        help="the rating this run starts from, given by `poker-loop`: its parent's rating in "
+        "the ledger now. Without it a resumed run starts from the rating its checkpoint was "
+        "published with, and a fresh one from the baseline",
+    )
+    parser.add_argument(
         "--eval-every", type=int, default=100,
         help="iterations between validation passes (0 disables)",
     )
@@ -1348,6 +1548,19 @@ def build_parser() -> argparse.ArgumentParser:
         "published (0 disables). The rating it earns there is what it is "
         "published with, and its session count continues the one the validation "
         "passes built",
+    )
+    parser.add_argument(
+        "--snapshot-every", type=int, default=0,
+        help="every this many iterations the run publishes the model it has at that moment "
+        "(0 = only the final one, at the end). Each snapshot plays "
+        "--snapshot-benchmark-sessions rated sessions against the frozen anchors first and is "
+        "published with the rating that earns, as a model of its own (the label ends in "
+        "-i<iteration>); the learner's own rating and the run go on untouched",
+    )
+    parser.add_argument(
+        "--snapshot-benchmark-sessions", type=int, default=DEFAULT_BENCHMARK_SESSIONS,
+        help="rated sessions of --session-hands hands a snapshot plays against the frozen "
+        "anchors to earn its published rating (the final model plays --benchmark-sessions)",
     )
     parser.add_argument(
         "--benchmark-resident", type=int, default=DEFAULT_RESIDENT_ANCHORS,
@@ -1443,10 +1656,15 @@ def main() -> None:
     args.device = resolve_device(args.device)
     args.update_device = resolve_update_device(args.update_device, args.device)
     if args.print_config:
-        print(format_config(vars(args), [k for k, v in report.applied.items() if vars(args)[k] == v]))
+        print(format_config(
+            vars(args),
+            [k for k, v in report.applied.items() if vars(args)[k] == v],
+            [k for k in report.overridden if k in report.applied and vars(args)[k] == report.applied[k]],
+            report.override.name if report.override is not None else "machine file",
+        ))
         return
     if report.path is not None:
-        print(f"config: {report.path}, {len(report.applied)} valori", flush=True)
+        print(f"config: {report.files}, {len(report.applied)} valori", flush=True)
 
     if args.seed is not None:
         torch.manual_seed(args.seed)
@@ -1521,6 +1739,8 @@ def main() -> None:
         ),
         PPOConfig(
             learning_rate=args.lr,
+            learning_rate_anneal_iterations=args.lr_anneal_iterations,
+            learning_rate_final=args.lr_anneal_final,
             **entropy_settings(args),
             epochs=args.ppo_epochs,
             clip_epsilon=args.clip_epsilon,
@@ -1537,7 +1757,11 @@ def main() -> None:
         critic=critic,
         extra_opponents=archived,
         registry=registry,
-        initial_rating=inherited_rating(args.checkpoint) if args.resume else DEFAULT_RATING,
+        initial_rating=(
+            args.initial_rating
+            if args.initial_rating is not None
+            else inherited_rating(args.checkpoint) if args.resume else DEFAULT_RATING
+        ),
         k_schedule=k_schedule,
     )
     # What the parent was trained with and published at: the other half of the
@@ -1600,7 +1824,37 @@ def main() -> None:
             f"over {args.entropy_anneal_iterations} iterations",
             flush=True,
         )
+    if args.lr_anneal_iterations:
+        print(
+            f"learning rate: {args.lr:g} -> {args.lr_anneal_final:g} "
+            f"over {args.lr_anneal_iterations} iterations",
+            flush=True,
+        )
+    live_members = list(registry.members.values())
+    live_opponents = {opponent.label: opponent for opponent in archived}
     for _ in range(args.iterations):
+        if (
+            args.pool_refresh_every > 0
+            and args.pool_models > 0
+            and trainer.iteration > 0
+            and trainer.iteration % args.pool_refresh_every == 0
+        ):
+            before = {member.label for member in live_members}
+            live_members, opponents, live_registry = refreshed_opponents(
+                args, mix, live_opponents, draw_rng
+            )
+            trainer.refresh_opponents(opponents, live_registry)
+            changed = len({member.label for member in live_members} - before)
+            ratings = [member.rating for member in live_members]
+            print(f"pool refreshed: {changed} of {len(live_members)} models are new", flush=True)
+            if ratings:
+                # The same line, in the same shape, as after the first draw: the watcher keeps
+                # the last one, so the `pool` column follows the field the run faces now.
+                print(
+                    f"pool rating: media {statistics.fmean(ratings):.0f} "
+                    f"min {min(ratings):.0f} max {max(ratings):.0f}",
+                    flush=True,
+                )
         stats = trainer.train_iteration()
         print(
             f"iter {int(stats['iteration']):4}  "
@@ -1669,6 +1923,13 @@ def main() -> None:
                 args.checkpoint, trainer.model, trainer.optimizer, iteration=trainer.iteration
             )
             print(f"        saved {args.checkpoint}")
+
+        if (
+            args.snapshot_every
+            and iteration % args.snapshot_every == 0
+            and iteration < args.iterations
+        ):
+            publish_snapshot(args, trainer, mix, run_id=run_id, k_schedule=k_schedule)
 
     # **The model that is kept is the one the run ends with**, and it is written
     # once, here. It has to be written before the benchmark pass: that pass

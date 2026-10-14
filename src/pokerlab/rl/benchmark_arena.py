@@ -359,6 +359,13 @@ def build_parser() -> argparse.ArgumentParser:
         "nothing for this workload, while one process per core scales with the "
         "core count. Shards are launched with OMP_NUM_THREADS=1",
     )
+    parser.add_argument(
+        "--session-workers", type=int, default=1,
+        help="forked copies of this process that play each batch of sessions (1 = none). The "
+        "anchors are loaded once per batch and shared copy-on-write, so there is no shard "
+        "startup to pay, and the result is identical whatever the number. Wins over --workers "
+        "when both are above 1. cpu only",
+    )
     add_table_arguments(parser)
     parser.add_argument(
         "--device", default="auto", help="cpu, cuda or auto (the default): the GPU if there is one"
@@ -417,7 +424,12 @@ def main(argv: list[str] | None = None) -> int:
     # length, and at --session-hands 1000 the default 10,000 sessions are ten
     # million hands. Printing the projection is what stops a run being launched
     # with a two-day budget by accident.
-    workers = max(1, min(args.workers, max(1, args.arena_max_sessions)))
+    forked = args.session_workers > 1
+    if forked and resolve_device(args.device).startswith("cuda"):
+        print("--session-workers gioca in copie fork: serve --device cpu (un contesto CUDA non sopravvive a un fork)")
+        return 2
+    workers = max(1, min(args.session_workers if forked else args.workers,
+                         max(1, args.arena_max_sessions)))
 
     def projected_hours(sessions: int) -> float:
         minutes = sessions * args.session_hands / 80.0 / 60.0 / workers   # ~80 hands/s per core
@@ -428,14 +440,14 @@ def main(argv: list[str] | None = None) -> int:
         # goes roughly with their product rather than with one shard's startup. The
         # 0.0039 min per checkpoint load is calibrated on a single point, so read the
         # projection as an order of magnitude.
-        if workers > 1:
+        if workers > 1 and not forked:
             minutes += -(-sessions // args.arena_checkpoint_sessions) * workers * len(anchors_list) * 0.0039
         return minutes / 60.0
 
     first_possible = max(args.arena_min_sessions, args.arena_window)
     print(f"{len(anchors_list)} modelli benchmark in {series_count} cartelle, "
           f"sessioni da {args.session_hands} mani, {workers} "
-          f"{'processi' if workers > 1 else 'processo'}")
+          f"{'copie fork' if forked else 'processi' if workers > 1 else 'processo'}")
     print(f"minimo {args.arena_min_sessions:,} sessioni = ~{projected_hours(args.arena_min_sessions):.1f} h, "
           f"tetto {args.arena_max_sessions:,} = ~{projected_hours(args.arena_max_sessions):.1f} h; "
           f"prima convergenza possibile dopo {first_possible:,} sessioni "
@@ -466,7 +478,7 @@ def main(argv: list[str] | None = None) -> int:
     while total_sessions < args.arena_max_sessions:
         batch = min(args.arena_checkpoint_sessions, args.arena_max_sessions - total_sessions)
         started = time.time()
-        if args.workers > 1:
+        if args.workers > 1 and not forked:
             # Same fan-out the population pass uses, and for the same reason:
             # playing parallelises perfectly, rating does not. `play_sharded`
             # splits the games exactly and forces OMP_NUM_THREADS=1 in each
@@ -490,6 +502,7 @@ def main(argv: list[str] | None = None) -> int:
                 device=resolve_device(args.device),
                 seed=rng.randrange(2**31),
                 on_skip=lambda path, why: print(f"  saltato {path}: {why}"),
+                fork_workers=workers if forked else 1,
             )
         applied = apply_sessions(anchors, sessions, k_schedule)
         if applied == 0:

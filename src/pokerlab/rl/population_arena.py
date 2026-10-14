@@ -1,13 +1,9 @@
 """Update every model's Elo by hand: the end-of-training-run rating, on demand.
 
 `train.py` plays one cross-population Elo pass when a run finishes, which is
-how ratings normally accumulate. That pass **samples**: ~50 models out of a
-store holding ~9,200, drawn uniformly. It is the right rule there -- the same
-pass can decide who gets deleted, so an honest draw matters more than coverage --
-but it means a given model waits a long time for its turn. At ~1,000 new models
-a generation and 55 seated per pass, a model has roughly a 0.5% chance of being
-drawn in any one pass, so a rating can sit on the number it was published with
-for many generations.
+how ratings normally accumulate. That pass **samples**: ~20-50 models out of a
+store holding hundreds or thousands, so a given model waits a long time for its
+turn and a rating can sit on the number it was published with for many generations.
 
 This module is the manual counterpart: the identical machinery, run until a
 total number of sessions has been played, and with the two differences that
@@ -17,12 +13,10 @@ successive draws of `--global-sessions` of them (each draw is one sample of ~55
 models held in memory, which is what makes a draw a unit of play), the last draw
 taking whatever is left.
 
-- **Least-played first** (`--elo-coverage played`, the default). `sample_population`
-  takes the least-played half deterministically and fills the rest at random, so
-  consecutive draws reach different models instead of re-drawing the same faces.
-  That function has existed and been tested all along, unused, precisely because
-  the automatic passes want a uniform draw; here coverage is the whole point.
-  `--elo-coverage random` restores the uniform draw.
+- **The draw is the end-of-run pass's own** (`global_arena.tiered_draw`, `--draw-tiers`, read
+  from `config.toml` like everywhere else): each tier of the ranking gets an equal share of
+  the seats, the ranking being re-read for every draw. The top is what the fleet reads, so the
+  top is what is rated most.
 - **Pruning off** (`--prune` to allow it). Elimination physically deletes
   checkpoints, and it fires when the on-disk population reaches
   `--global-trigger-size`; a tool whose job is to refresh ratings must not delete
@@ -70,11 +64,13 @@ from pokerlab.rl.global_arena import (
     DEFAULT_GLOBAL_DIR,
     DEFAULT_GLOBAL_SESSIONS,
     DEFAULT_POPULATION_SAMPLE,
+    DRAW_TIERS,
     NO_PRUNE_TRIGGER,
-    Candidate,
     discover_population,
+    draw_tiers_text,
+    ranking_for_draw,
     run_population_sessions,
-    sample_population,
+    tiered_draw,
 )
 from pokerlab.rl.global_store import (
     DEFAULT_LOCK_SECONDS,
@@ -92,15 +88,7 @@ from pokerlab.rl.pool_registry import (
 )
 from pokerlab.rl.siblings import sibling_parsers
 from pokerlab.rl.table_mix import add_table_arguments, table_mix_from_args
-
-
-def least_played_draw(ratings: dict[str, dict]):
-    """A `draw` callable for `run_population_sessions` biased to the least played."""
-
-    def draw(population: list[Candidate], count: int, rng: random.Random):
-        return sample_population(population, ratings, count, rng)
-
-    return draw
+from pokerlab.rl.training_pool import format_parent_tiers, parse_parent_tiers
 
 
 def rating_summary(global_dir: Path) -> str:
@@ -160,9 +148,17 @@ def build_parser() -> argparse.ArgumentParser:
         "parallelismo va preso qui, non alzando i thread di torch",
     )
     parser.add_argument(
-        "--elo-coverage", choices=("played", "random"), default="played",
-        help="played: i meno giocati per primi, per coprire la popolazione. "
-        "random: estrazione uniforme, come quella automatica di fine training",
+        "--session-workers", type=int, default=1,
+        help="copie fork di questo processo che giocano le sessioni di un'estrazione (1 = "
+        "nessuna). I modelli estratti si caricano una volta per estrazione e le copie li "
+        "condividono; il risultato non dipende dal numero di copie. Vince su --workers se "
+        "sono entrambi sopra 1. Solo cpu",
+    )
+    parser.add_argument(
+        "--draw-tiers", type=draw_tiers_text, default=format_parent_tiers(DRAW_TIERS),
+        help="chi siede nelle estrazioni, come nelle passate di fine training: i tagli "
+        "della classifica, ognuno con una quota uguale dei posti ('10, 100, all' = un "
+        "terzo ciascuno ai primi 10, ai posti 11-100 e a tutti gli altri)",
     )
     parser.add_argument(
         "--prune", action="store_true",
@@ -218,16 +214,22 @@ def main(argv: list[str] | None = None) -> int:
 
     seated = min(args.global_sample, len(population)) + args.global_benchmark_sample
     batch_size = max(1, args.global_sessions)
-    workers = max(1, min(args.workers, batch_size))
+    forked = args.session_workers > 1
+    if forked and resolve_device(args.device).startswith("cuda"):
+        print("--session-workers gioca in copie fork: serve --device cpu "
+              "(un contesto CUDA non sopravvive a un fork)")
+        return 2
+    workers = max(1, min(args.session_workers if forked else args.workers, batch_size))
     hours = args.elo_sessions * args.session_hands / 80.0 / 60.0 / workers / 60.0
     draws_for_full_sweep = -(-len(population) // max(1, min(args.global_sample, len(population))))
     draws_planned = -(-args.elo_sessions // batch_size)
 
     print(f"{len(population):,} modelli nello store, {seated} seduti per estrazione "
-          f"({args.elo_coverage})")
+          f"(fasce {args.draw_tiers})")
     print(f"{args.elo_sessions:,} sessioni da {args.session_hands} mani = "
           f"{args.elo_sessions * args.session_hands:,} mani, {workers} "
-          f"{'processi' if workers > 1 else 'processo'} -> ~{hours:.1f} h")
+          f"{'copie fork' if forked else 'processi' if workers > 1 else 'processo'} "
+          f"-> ~{hours:.1f} h")
     print(f"{draws_planned} estrazioni da {batch_size} sessioni; per coprire tutta la "
           f"popolazione ne servirebbero ~{draws_for_full_sweep}")
     print("pruning DISATTIVATO: nessun file verra' cancellato" if not args.prune
@@ -240,14 +242,11 @@ def main(argv: list[str] | None = None) -> int:
     while played_sessions < args.elo_sessions:
         started = time.time()
         batch = min(batch_size, args.elo_sessions - played_sessions)
-        draw = None
-        if args.elo_coverage == "played":
-            # Re-read the ranking for every draw: the previous one just changed the
-            # game counts this draw is ordered by, and other machines are merging
-            # into the same store meanwhile.
-            ranking = load_ranking(args.global_dir)
-            counts = {label: {"games": m.games} for label, m in ranking.members.items()}
-            draw = least_played_draw(counts)
+        # Re-read the ranking for every draw: the previous one just moved the ratings
+        # the tiers are cut by, and other machines are merging into the same store.
+        draw = tiered_draw(
+            ranking_for_draw(args.global_dir), tiers=parse_parent_tiers(args.draw_tiers)
+        )
         report = run_population_sessions(
             global_dir=args.global_dir,
             root=args.root,
@@ -259,7 +258,8 @@ def main(argv: list[str] | None = None) -> int:
             session_hands=args.session_hands,
             device=resolve_device(args.device),
             seed=rng.randrange(2**31),
-            workers=min(workers, batch),
+            workers=1 if forked else min(workers, batch),
+            fork_workers=min(workers, batch) if forked else 1,
             draw=draw,
             lock_ttl=args.global_lock_seconds,
             trigger_size=args.global_trigger_size if args.prune else NO_PRUNE_TRIGGER,

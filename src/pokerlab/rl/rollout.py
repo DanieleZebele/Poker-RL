@@ -378,6 +378,10 @@ class SelfPlayCollector:
             for seat in range(mix.max_players)
         ]
 
+    def set_pool(self, pool: OpponentPool | None) -> None:
+        """Seat other opponents from the next table on: the tables already open keep theirs."""
+        self._pool = pool
+
     def _record_style(self, learner_seats: set[int]) -> None:
         """Add what the learner's seats did in the hand just played to its style."""
         hand = self._bank.last_hand

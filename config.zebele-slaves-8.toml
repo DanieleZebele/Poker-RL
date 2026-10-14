@@ -1,0 +1,9 @@
+# Overrides for the machine only: whatever is set here replaces the same key in
+# config.toml for this host, and every key not named here stays the shared file's.
+# Read next to config.toml, re-read by the supervisor at every generation.
+# Per-machine identity keys (machine, workers, paths) are refused here as in config.toml.
+
+
+# [fleet]
+worker_ceiling = 5
+collect_workers = 30     # forked copies of each worker that play its hands
