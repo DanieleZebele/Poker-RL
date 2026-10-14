@@ -2417,6 +2417,12 @@ dependency (Flask, etc.) — it ships with Python. Architecture:
     goes to `StatsTracker.record_hand` as the engine's own records (`SpotState.records`: the
     blinds and the scripted actions only, not the passive ones the replayer plays to finish the
     hand). A spot built by hand is never recorded. Readings stay every 0.5 s.
+  - **The hand joined midway is not counted** (`SpotFrame._hand_start_seen`): a hand is
+    recorded only if its start was seen, i.e. a hand boundary came after an earlier reading.
+    The first reading looks like a new hand (no button seen before it) but is only where the
+    screen started watching, usually mid-hand, with the early actions never read. The box
+    says "(mano presa a metà: non contata nelle statistiche)". Reset with the table size.
+    Tests that need a counted hand start with `_watch_from_the_hand_before`.
   - **One deal, two signs: recorded once** (`_hand_boundary`, `SAME_DEAL_SECONDS` 5). The
     button moving and your new cards often arrive a reading or two apart; recorded at both,
     every real hand counted twice -- the second time as what `action_sync` made of the deal
@@ -2464,7 +2470,11 @@ dependency (Flask, etc.) — it ships with Python. Architecture:
   lines follow, unbolded: one line a model (its likeliest action), every option only for
   the first. The panel is `ADVICE_LINES` (12) high at the bottom of the side column; the
   list of actions takes the rest, with a scrollbar, and scrolls to its last line at
-  every rewrite (`_write_log`).
+  every rewrite (`_write_log`). It keeps the last `KEPT_HANDS` (30) hands read off the screen
+  above the current one, each closed by `HAND_SEPARATOR` (archived at the hand boundary,
+  `_archive_hand_log`, where the statistics are recorded). A heading opens each street after
+  the preflop ("FLOP: Ks 8d 3h", `_street_heading`), the street read off the engine's own
+  records of the replayed hand (`SpotState.records` past the forced ones, one per `taken`).
 - **The bold line** (`_write(bold_lines=)`).
   Two Tk traps made it show plain for a long time while the test (tag ranges only) passed:
   `tkfont.Font(font=..., weight="bold")` copies the font and *ignores* `weight`, and a `Font`
@@ -2547,7 +2557,8 @@ collected in the vision screen; the accuracies quoted are against the crops in
   giocatori)" section sets one zone per seat (`regions.dealer_region_name`,
   `dealer_6_<seat>` in `regions.json`; seat 0 is you at the bottom, then
   clockwise on screen from your left, the spot screen's chair order; 6-max and
-  8-max, each with zones of its own, chosen by a "Tavolo" switch on both screens). "Salva dealer" captures every zone set and
+  8-max, and 3-max, each with zones of its own, chosen by a "Tavolo" switch on both screens;
+  `regions.DEFAULT_TABLE_SIZE` 6 is where they open). "Salva dealer" captures every zone set and
   opens `DealerLabeler`: all crops side by side, each "Presente"/"Non presente",
   at most one present (none is fine, between hands). On "Conferma" *every* crop
   is written -- the absent ones are examples too -- to **`vision_data/dealer/`**
@@ -2720,7 +2731,10 @@ collected in the vision screen; the accuracies quoted are against the crops in
     out; facing a bet with nothing changed it is still not guessed. **Your own check
     the same way**: when the engine waits on you and your bar, seen for that decision
     (`SpotFrame._my_turn_mark`, `TableView.my_turn_seen`), is gone with nothing in front
-    of you and nothing to call, you checked -- before this the screen waited on you
+    of you, nothing to call **and your stack unchanged**, you checked (the client takes the
+    chips off the stack a moment before it draws them in front: without that guard a bet
+    became a check and the hand was lost; the inferred checks of the others have the same
+    guard) -- before this the screen waited on you
     until someone after you acted or the next card came. The bar has to have been seen:
     a bar the client has not drawn yet would otherwise read as a check never made.
     **A bar up means "you are deciding" only on the engine's street**: with the board
@@ -2758,10 +2772,30 @@ collected in the vision screen; the accuracies quoted are against the crops in
     against a default 100 BB, a stack read later would "drop" by a bet nobody made. A
     stack read as 0 is not used (empty zone or all-in). Amounts within half of the
     0,1 BB the screen writes count as equal (`TableView.tolerance`).
+  - **A showdown closes the betting** (`TableView.shown`, from `SeatReading.face_up`: an
+    opponent in the hand with *no magenta card back* -- white does not tell face up from face
+    down, both have it). **Only with the whole board out** (`SpotFrame._table_view`): at the 3-seat client
+    the card backs are not magenta, cards held face down read as face up, and taken as a
+    showdown every hand became calls and checks the moment it was dealt (the engine on the
+    flop, the bets in front never drawn). The log line carries `shown=`. Read like a new card: whoever still holds cards called what it faced
+    or checked, whoever is out folded. On the river no card comes and a call goes straight into
+    the pot, so before this the rebuild waited on it for ever; a river call with the cards
+    mucked is read off the stack drop (facing a bet, nothing in front, stack down). The actions
+    box then ends with "Showdown: X e Y" (everyone the rebuilt hand still has in).
+  - **At the next deal the last hand is completed from the stacks** (`SpotFrame._complete_hand`,
+    `TableView.hand_over`, before it is recorded and archived): the end of a hand is where the
+    rebuild falls short -- on the river no card proves a call, and a player who mucks reads
+    "out" like one who folded. Each pending decision is read off that player's stack in the
+    last picture of the hand: up (won the pot: called, or checked), down (called or bet that
+    much), unchanged (folded facing a bet, checked otherwise). Only the stack: no stack read,
+    nothing guessed, and the rebuild stops there. The actions box adds "(fine mano dedotta
+    dagli stack)".
   - **A wrong FOLD or ALL_IN is taken back** (`SpotFrame._heal_script`, before every
     rebuild): one the screen contradicts for `HEAL_READINGS` (3) readings in a row --
     the player still holding cards (`in_hand`), still chips behind -- goes, with all
-    that came after it, and `action_sync` rebuilds from there. Before, nothing scripted
+    that came after it, and `action_sync` rebuilds from there. **Never an ALL_IN once the
+    rebuilt hand is over**: the pot is paid, a winning shover has chips again, and taking it
+    back recorded the hand without the shove (a VPIP of 0). Before, nothing scripted
     was ever undone: one fold from a misread frame ended the rebuilt hand while the real
     one went on, nobody lit up, your turn was not seen, until the next deal. A rebuilt
     hand that is over now says "mano conclusa" on the status line instead of nothing.
@@ -2787,7 +2821,8 @@ collected in the vision screen; the accuracies quoted are against the crops in
   `._read_dealer`, `ScreenReading.dealer` = client seat). Client seats map to
   the spot's 8 chairs by nearest angle (`spot_table.CLIENT_SEAT_CHAIRS`: 8-max seat k
   is chair k; 6-max is 0,1,3,4,5,7, each 15 degrees off its chair but seat 3, straight
-  across, on chair 4). A move puts the button on that chair, **seating a player there if it
+  across, on chair 4; 3-max is 0,3,5, the other two in the top corners -- assumed, not
+  measured on the client). A move puts the button on that chair, **seating a player there if it
   was empty** (the button is always in front of someone), and clears the
   actions (a new hand) -- unless the screen reads that seat empty (`libero`): its
   player has gone (a dead button), nobody is seated for it and the button passes to

@@ -27,7 +27,8 @@ USER_CHAIR = 0
 # 45 degrees apart like them. 6-max seats are 60 degrees apart, so seat 3,
 # straight across, lands exactly (chair 4) and the others 15 degrees off theirs,
 # symmetrically (chairs 1, 3 on the left, 5, 7 on the right).
-CLIENT_SEAT_CHAIRS = {6: (0, 1, 3, 4, 5, 7), 8: tuple(range(8))}
+# 3-max: you at the bottom, the other two at the top-left and top-right corners.
+CLIENT_SEAT_CHAIRS = {3: (0, 3, 5), 6: (0, 1, 3, 4, 5, 7), 8: tuple(range(8))}
 
 
 def chair_for_client_seat(players: int, seat: int) -> int:

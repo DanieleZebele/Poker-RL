@@ -425,6 +425,83 @@ def test_a_fold_the_screen_keeps_contradicting_is_taken_back(app):
         gc.collect()
 
 
+def test_an_all_in_that_won_the_pot_is_not_taken_back(app):
+    """UTG shoves and everyone folds: the hand is over, and UTG's stack shows chips again
+    (it won the pot). That is the payout, not a wrong all-in -- taken back, the hand was
+    recorded without it and the shove never reached UTG's VPIP."""
+    from pokerlab.gui.spot_view import HEAL_READINGS, SpotFrame
+
+    frame = SpotFrame(app)
+    frame._consult = lambda state, spot: None
+    try:
+        frame.apply_reading(full_reading(_bets(), board=[]))
+        shove = full_reading(_bets(s3=100.0), board=[])
+        shove.stacks = {0: 100.0, 1: 99.5, 2: 99.0, 3: 0.0, 4: 100.0, 5: 100.0}
+        frame.apply_reading(shove)
+        folded = full_reading(_bets(s3=100.0), out={0, 1, 2, 4, 5}, board=[])
+        folded.stacks = shove.stacks
+        frame.apply_reading(folded)
+        assert frame.state.finished and frame.script[0].action_type is ActionType.ALL_IN
+        for _ in range(HEAL_READINGS + 1):
+            paid = full_reading(_bets(s3=0.0, s1=0.0, s2=0.0), out={0, 1, 2, 4, 5}, board=[])
+            paid.stacks = {**shove.stacks, 3: 101.5}
+            frame.apply_reading(paid)
+        assert frame.script[0].action_type is ActionType.ALL_IN
+        assert "tolto" not in frame.screen_var.get()
+    finally:
+        frame.destroy()
+        gc.collect()
+
+
+def test_cards_turned_face_up_close_the_hand_and_say_showdown(app):
+    """UTG raises, the BB calls, checked to the river; the BB bets, UTG's call goes
+    straight into the pot, but both their cards turn face up: the call is taken, and the
+    actions box says who went to showdown."""
+    from pokerlab.gui.spot_view import SpotFrame
+
+    frame = SpotFrame(app)
+    frame._consult = lambda state, spot: None
+    out = {0, 1, 4, 5}
+    board = ["Ks", "8d", "3h", "2c", "9h"]
+    try:
+        frame.apply_reading(full_reading(_bets(), board=[]))
+        frame.apply_reading(full_reading(_bets(s3=3.0), out=out, board=[]))
+        frame.apply_reading(full_reading(_bets(s3=3.0, s2=3.0), out=out, board=[]))  # BB calls
+        cleared = _bets(s1=0.0, s2=0.0)
+        for cards in (3, 4, 5):  # each new card proves the checks before it
+            frame.apply_reading(full_reading(cleared, out=out, board=board[:cards]))
+        frame.apply_reading(full_reading(_bets(s1=0.0, s2=2.0), out=out, board=board))  # BB bets
+        assert frame.state.to_act == frame.layout.seat_of(chair_of_client(3))  # UTG to act
+        showdown = full_reading(cleared, out=out, board=board)
+        showdown.shown = {2, 3}
+        frame.apply_reading(showdown)
+        assert frame.script[-1].action_type is ActionType.CALL and frame.state.finished
+        log = frame.log.get("1.0", "end")
+        assert "Showdown:" in log and "(UTG)" in log.split("Showdown:")[1] and "(BB)" in log.split("Showdown:")[1]
+    finally:
+        frame.destroy()
+        gc.collect()
+
+
+def test_cards_read_face_up_before_the_river_are_not_a_showdown(app):
+    """At the 3-seat client the card backs are not magenta, so cards held face down read
+    as face up. Taken as a showdown, every hand became calls and checks the moment it was
+    dealt (and the engine moved to the flop, so the bets in front were never drawn)."""
+    from pokerlab.gui.spot_view import SpotFrame
+
+    frame = SpotFrame(app)
+    frame._consult = lambda state, spot: None
+    try:
+        frame.apply_reading(full_reading(_bets(), board=[]))
+        dealt = full_reading(_bets(), board=[])
+        dealt.shown = {1, 2, 3, 4, 5}
+        frame.apply_reading(dealt)
+        assert frame.script == [] and "Showdown" not in frame.log.get("1.0", "end")
+    finally:
+        frame.destroy()
+        gc.collect()
+
+
 def test_a_hand_rebuilt_as_over_says_so(app):
     from pokerlab.gui.spot_view import SpotFrame
 
@@ -466,8 +543,16 @@ def chair_of_client(seat):
     return chair_for_client_seat(6, seat)
 
 
+def _watch_from_the_hand_before(frame):
+    """The screen starts watching during the hand before (the button on seat 5), so the
+    next deal is a hand seen from its start: the first one, joined midway, is never
+    counted in the statistics."""
+    frame.apply_reading(full_reading({s: 0.0 for s in range(6)}, board=[], dealer=5))
+
+
 def _play_a_hand_then_move_the_button(frame):
     """UTG (client seat 3) raises, seat 4 folds; then the button moves: a new hand."""
+    _watch_from_the_hand_before(frame)
     frame.apply_reading(full_reading(_bets(), board=[]))
     frame.apply_reading(full_reading(_bets(s3=3.0), out={4}, board=[]))
     assert len(frame.script) == 2
@@ -575,7 +660,8 @@ def test_a_hand_built_by_hand_is_not_counted(app):
         frame.add_player(3)
         frame._append(Action(ActionType.RAISE, 6))
         frame.set_dealer(3)  # editing the table clears the script without any hand having been seen
-        frame._clear()
+        frame.script.clear()
+        frame.refresh()
         assert all(frame.stats.hands(f"chair{c}") == 0 for c in range(8))
     finally:
         frame.destroy()
@@ -934,6 +1020,141 @@ def test_every_player_s_statistics_are_always_on_screen(app):
         frame.refresh()
         assert frame.state.finished
         assert "statistiche su 1 mani" in frame.chair_ui[chair(6, 3)].info.cget("text")
+    finally:
+        frame.destroy()
+        gc.collect()
+
+
+def test_the_actions_box_keeps_the_last_hand_above_a_separator(app):
+    """A new hand is written below the one before, not over it."""
+    from pokerlab.gui.spot_view import HAND_SEPARATOR, SpotFrame
+
+    frame = SpotFrame(app)
+    frame._consult = lambda state, spot: None
+    try:
+        frame.apply_reading(full_reading(_bets(), board=[]))
+        frame.apply_reading(full_reading(_bets(s3=3.0), board=[]))  # UTG raises
+        assert HAND_SEPARATOR not in frame.log.get("1.0", "end")
+        moved = {0: 0.0, 1: 0.0, 2: 0.5, 3: 1.0, 4: 0.0, 5: 0.0}  # the button on seat 1
+        frame.apply_reading(full_reading(moved, board=[], dealer=1))
+        frame.apply_reading(full_reading({**moved, 4: 3.0}, board=[], dealer=1))  # UTG raises
+        log = frame.log.get("1.0", "end")
+        before, after = log.split(HAND_SEPARATOR)
+        assert "Raise" in before.title() and "1." in before
+        assert "Raise" in after.title() and "1." in after
+    finally:
+        frame.destroy()
+        gc.collect()
+
+
+def test_the_actions_box_names_each_street(app):
+    """Preflop actions, then a "FLOP" heading with its cards, then the flop's actions."""
+    from pokerlab.gui.spot_view import SpotFrame
+
+    frame = SpotFrame(app)
+    frame._consult = lambda state, spot: None
+    try:
+        frame.apply_reading(full_reading(_bets(), board=[]))
+        frame.apply_reading(full_reading(_bets(s3=3.0), out={0, 1, 4, 5}, board=[]))
+        frame.apply_reading(full_reading(_bets(s3=3.0, s2=3.0), out={0, 1, 4, 5}, board=[]))  # BB calls
+        flop = ["Ks", "8d", "3h"]
+        frame.apply_reading(full_reading(_bets(s1=0.0, s2=0.0), out={0, 1, 4, 5}, board=flop))
+        frame.apply_reading(full_reading(_bets(s1=0.0, s2=2.0), out={0, 1, 4, 5}, board=flop))  # BB bets
+        lines = frame.log.get("1.0", "end").strip().splitlines()
+        heading = next(i for i, line in enumerate(lines) if line.startswith("FLOP"))
+        assert heading > 0 and lines[heading - 1].endswith("call 2 BB")  # 3 BB, 1 already in
+        assert "bet" in lines[heading + 1].lower()
+        assert len(lines[heading].split(":", 1)[1].split()) == 3  # the three flop cards
+        assert not any(line.startswith("PREFLOP") for line in lines)
+    finally:
+        frame.destroy()
+        gc.collect()
+
+
+def test_a_new_hand_completes_the_last_one_from_the_stacks(app):
+    """UTG raises to 3 BB, everyone folds to the BB; its call goes straight into the pot
+    and the cards are mucked, so nothing proves it -- until the next deal, when the last
+    picture shows the BB's stack up: it won the pot, so it called. The hand is completed
+    before it is recorded, and the actions box says it was deduced."""
+    from pokerlab.gui.spot_view import HAND_SEPARATOR, SpotFrame
+
+    frame = SpotFrame(app)
+    frame._consult = lambda state, spot: None
+    try:
+        stacks = {0: 100.0, 1: 99.5, 2: 99.0, 3: 100.0, 4: 100.0, 5: 100.0}
+        _watch_from_the_hand_before(frame)
+        start = full_reading(_bets(), board=[])
+        start.stacks = stacks
+        frame.apply_reading(start)
+        raised = full_reading(_bets(s3=3.0), out={0, 1, 4, 5}, board=[])
+        raised.stacks = {**stacks, 3: 97.0}
+        frame.apply_reading(raised)
+        won = full_reading(_bets(s1=0.0, s2=0.0), out={0, 1, 4, 5}, board=[])
+        won.stacks = {**stacks, 2: 103.5, 3: 97.0}  # the BB's stack went up: it won
+        frame.apply_reading(won)
+        assert frame.state.to_act == frame.layout.seat_of(chair_of_client(2))  # not proven yet
+        moved = full_reading({0: 0.0, 1: 0.0, 2: 0.5, 3: 1.0, 4: 0.0, 5: 0.0}, board=[], dealer=1)
+        frame.apply_reading(moved)
+        before = frame.log.get("1.0", "end").split(HAND_SEPARATOR)[0]
+        assert "call 2 BB" in before and "(fine mano dedotta dagli stack)" in before
+        assert frame.stats.hands(f"chair{chair_of_client(2)}") == 1
+        assert frame.stats.rates(f"chair{chair_of_client(2)}")["vpip"] == (1, 1)
+    finally:
+        frame.destroy()
+        gc.collect()
+
+
+def test_the_hand_joined_midway_is_not_counted_the_next_one_is(app):
+    """The screen opens on a hand already under way: its early actions were never read, so
+    it is left out of the statistics (and the actions box says so). The next hand, seen
+    from its deal, counts."""
+    from pokerlab.gui.spot_table import chair_for_client_seat as chair
+    from pokerlab.gui.spot_view import SpotFrame
+
+    frame = SpotFrame(app)
+    frame._consult = lambda state, spot: None
+    try:
+        utg = f"chair{chair(6, 3)}"
+        frame.apply_reading(full_reading(_bets(s3=3.0), out={4}, board=[]))  # joined midway
+        assert frame.script
+        moved = {0: 0.0, 1: 0.0, 2: 0.5, 3: 1.0, 4: 0.0, 5: 0.0}
+        frame.apply_reading(full_reading(moved, board=[], dealer=1))
+        assert frame.stats.hands(utg) == 0
+        assert "non contata nelle statistiche" in frame.log.get("1.0", "end")
+        frame.apply_reading(full_reading({**moved, 4: 3.0}, board=[], dealer=1))
+        frame.apply_reading(full_reading(_bets(), board=[], dealer=2))  # the next deal
+        assert frame.stats.hands(utg) == 1
+    finally:
+        frame.destroy()
+        gc.collect()
+
+
+def test_a_three_seat_client_has_zones_and_chairs_of_its_own(app, tmp_path):
+    """3-max: you at the bottom, the other two in the top corners; its own zones; and the
+    spot screen seats three players from a reading of three seats."""
+    pytest.importorskip("numpy")
+    from pokerlab.gui import screen_reader
+    from pokerlab.gui.spot_table import chair_for_client_seat
+    from pokerlab.gui.spot_view import SpotFrame
+
+    assert [chair_for_client_seat(3, seat) for seat in range(3)] == [0, 3, 5]
+    reader = screen_reader.ScreenReader(crops_dir=tmp_path)
+    reader.players = 3
+    zones = reader._zones_read()
+    assert {"dealer_3_2", "player_3_2", "bet_3_2", "stack_3_2"} <= zones
+    assert not any("_6_" in name or "_3_3" in name for name in zones)
+
+    frame = SpotFrame(app)
+    frame._consult = lambda state, spot: None
+    try:
+        assert frame.set_table_size(3)
+        reading = ScreenReading(
+            hole=None, board=[], dealer=1, seats={0: "in_gioco", 1: "in_gioco", 2: "in_gioco"},
+            bets={0: 0.0, 1: 0.0, 2: 0.0}, pot=0.0,
+        )
+        frame.apply_reading(reading)
+        assert sorted(frame.layout.chairs) == [0, 3, 5]
+        assert frame.layout.dealer == 3
     finally:
         frame.destroy()
         gc.collect()

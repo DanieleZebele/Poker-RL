@@ -26,9 +26,11 @@ REGION_NAMES = (HOLE_CARDS, BOARD)
 # Where the dealer button can appear, one zone per seat, and the seat positions
 # depend on how many players the table seats. Seat 0 is you (the client draws
 # you at the bottom), then clockwise *as seen on screen* from your left -- the
-# same order as the chairs of the spot screen. 6-max and 8-max are mapped, each
-# with zones of its own (`dealer_6_3` and `dealer_8_3` are different places).
-DEALER_TABLE_SIZES = (6, 8)
+# same order as the chairs of the spot screen. 3-max, 6-max and 8-max are mapped,
+# each with zones of its own (`dealer_6_3` and `dealer_8_3` are different places).
+DEALER_TABLE_SIZES = (3, 6, 8)
+# The size the screens open on when nothing else was chosen.
+DEFAULT_TABLE_SIZE = 6
 # A dealer zone is drawn round the button alone (measured 36-41 px a side). One
 # twice that is almost certainly a player box drawn in the wrong section -- it
 # happened, seat 5 at 149x111 -- and the gold of that player's stack chip could
