@@ -3,6 +3,12 @@
 # Read next to config.toml, re-read by the supervisor at every generation.
 # Per-machine identity keys (machine, workers, paths) are refused here as in config.toml.
 
+# Other things that usually differ per host (uncomment to use):
+# [fleet]
+collect_workers = 40     # forked copies of each worker that play its hands
+session_workers = 40     # the same for the rated passes
+worker_ceiling = 1
+
 [network]
 # Same values as config.toml today, so this file changes nothing yet. Change them here to
 # give only this machine another network: its workers start from scratch until the store
@@ -12,11 +18,18 @@ num_layers = 5
 head_hidden = 256
 head_layers = 1
 
-# Other things that usually differ per host (uncomment to use):
-# [fleet]
-worker_ceiling = 3
-collect_workers = 40     # forked copies of each worker that play its hands
-session_workers = 40     # the same for the rated passes
 
-# hands = 20000                # per iteration 
-# equity_model = "equity_evaluator/distill-lat32_h256_h1.pt"  # attn-l-lat512_h512_b4_l4_h8
+hands = 20000                # per iteration 
+minibatch_size = 10000
+
+# equity_model = "equity_evaluator/distill-lat32_h256_h1.pt"  
+equity_model = "equity_evaluator/attn-l-lat512_h512_b4_l4_h8.pt"
+
+pool_models = 100
+
+pool_top_share = 1.0
+pool_top_n = 100
+
+entropy_anneal_start = 0.00001
+
+style_share = 0.0

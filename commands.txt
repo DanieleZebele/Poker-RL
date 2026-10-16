@@ -129,7 +129,7 @@ PYTHONUNBUFFERED=1 OMP_NUM_THREADS=1 PYTHONPATH=src:studies/equity_net   .venv/b
 
 analysis:
 PYTHONPATH=src:studies/equity_net .venv/bin/python studies/equity_net/analyze.py \
-  --model equity_evaluator/distill-lat32_h256_h1.pt
+  --model equity_evaluator/attn-l-lat512_h512_b4_l4_h8.pt
 
 PYTHONPATH=src:studies/equity_net .venv/bin/python studies/equity_net/analyze.py \
   --model studies/equity_net/runs/distill-lat64_h128_h16.pt 
