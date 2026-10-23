@@ -20,7 +20,7 @@ import torch
 from torch import Tensor, nn
 
 from pokerlab.rl.action_space import ACTION_DIM
-from pokerlab.rl.features import FEATURE_VERSION, OBS_DIM
+from pokerlab.rl.features import SUPPORTED_VERSIONS, observation_dim
 from pokerlab.rl.policy import SHAPE_KEYS, PokerActorCritic
 from pokerlab.rl.rollout import HandTrajectory
 
@@ -307,9 +307,9 @@ def save_checkpoint(
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "obs_dim": OBS_DIM,
+            "obs_dim": model.obs_dim,
             "action_dim": ACTION_DIM,
-            "feature_version": FEATURE_VERSION,
+            "feature_version": model.feature_version,
             **model.shape,
             # The per-player encoder of the equity network the model was built with; its
             # weights are in `model`'s state, frozen.
@@ -330,24 +330,27 @@ class IncompatibleCheckpointError(ValueError):
 
 
 def check_compatible(checkpoint: dict[str, Any], source: str = "checkpoint") -> None:
-    if checkpoint.get("obs_dim") != OBS_DIM or checkpoint.get("action_dim") != ACTION_DIM:
+    """Whether this build can serve the checkpoint: any feature version it still encodes
+    (`SUPPORTED_VERSIONS`), at the dimension that version has."""
+    saved_version = checkpoint.get("feature_version", 0)
+    if saved_version not in SUPPORTED_VERSIONS:
+        raise IncompatibleCheckpointError(
+            f"{source} was trained on feature version {saved_version}, this build serves "
+            f"{SUPPORTED_VERSIONS} -- a different encoding, so the weights would read the "
+            f"wrong thing from every slot"
+        )
+    expected = observation_dim(saved_version)
+    if checkpoint.get("obs_dim") != expected or checkpoint.get("action_dim") != ACTION_DIM:
         raise IncompatibleCheckpointError(
             f"{source} was trained on obs_dim={checkpoint.get('obs_dim')} "
-            f"action_dim={checkpoint.get('action_dim')}, but this build uses "
-            f"{OBS_DIM}/{ACTION_DIM} -- the encoding changed since it was saved"
+            f"action_dim={checkpoint.get('action_dim')}, but feature version {saved_version} "
+            f"is {expected}/{ACTION_DIM} -- the encoding changed since it was saved"
         )
     if any(key not in checkpoint for key in (*SHAPE_KEYS, "equity")) or checkpoint["equity"] is None:
         raise IncompatibleCheckpointError(
             f"{source} was saved before every network read the cards through an equity "
             "encoder, and its weights are named for the old layout, so it cannot be "
             "loaded into this build's network"
-        )
-    saved_version = checkpoint.get("feature_version", 0)
-    if saved_version != FEATURE_VERSION:
-        raise IncompatibleCheckpointError(
-            f"{source} was trained on feature version {saved_version}, this build is "
-            f"{FEATURE_VERSION} -- the features have the same shape but a different "
-            f"meaning, so the weights would read the wrong thing from every slot"
         )
 
 
@@ -360,6 +363,12 @@ def load_checkpoint(
 ) -> dict[str, Any]:
     checkpoint = torch.load(path, map_location=device, weights_only=True)
     check_compatible(checkpoint, str(path))
+    if checkpoint["feature_version"] != model.feature_version:
+        raise IncompatibleCheckpointError(
+            f"{path} reads feature version {checkpoint['feature_version']}, this network "
+            f"{model.feature_version}: their inputs are not the same, so the weights cannot "
+            "be exchanged"
+        )
     if checkpoint["equity"] != model.equity:
         raise IncompatibleCheckpointError(
             f"{path} was built with equity encoder {checkpoint['equity']}, this network "
@@ -383,7 +392,11 @@ def build_model_from_checkpoint(
     inference. Used to seat previously trained agents as opponents."""
     checkpoint = torch.load(path, map_location=device, weights_only=True)
     check_compatible(checkpoint, str(path))
-    model = PokerActorCritic(**checkpoint_shape(checkpoint), equity=checkpoint["equity"])
+    model = PokerActorCritic(
+        **checkpoint_shape(checkpoint),
+        equity=checkpoint["equity"],
+        feature_version=checkpoint["feature_version"],
+    )
     model.load_state_dict(checkpoint["model"])
     model.to(device).eval()
     for parameter in model.parameters():

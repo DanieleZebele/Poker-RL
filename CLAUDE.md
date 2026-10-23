@@ -143,7 +143,7 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
   rebuilds at the recorded shape (so models of different shapes coexist at a table), and
   a checkpoint without the head keys or the encoder is refused by `check_compatible`
   with a clear message. **Parents are chosen among the models of the worker's own
-  network** (`inheritance_plan(accept_path=)`, see "Every worker inherits weights"), so after
+  network, the same feature version included** (`inheritance_plan(accept_path=)`, see "Every worker inherits weights"), so after
   the shape in the file changes the workers start from scratch until the store holds a model
   of the new shape, and then inherit from it: the new shape's lineage grows on its own, and
   its rating is judged among the best of *its* shape. A parent that still turns out to have
@@ -169,19 +169,63 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
   `players/__init__.py` without dragging torch into the core install. **torch is
   imported in exactly one module, `rl/policy.py`.** A regression here is easy to
   catch: `import pokerlab.players` must leave `torch` out of `sys.modules`.
-- **`OBS_DIM` is 660** (`FEATURE_VERSION` 3; it was 1380 while each seat had 100 statistics
-  slots, 80 of them reserved and always zero, and 480 before the statistics, see "Opponent
-  statistics" below, its own section), defined as the sum of named per-section constants so it
-  cannot silently drift. Cards are **6 binary 4x13 planes** (hole, flop, turn,
-  river, whole board, hole∪board): a street not yet dealt is an all-zero plane,
-  which solves the 0/3/4/5-board-cards problem for free and keeps the door open
-  to a `Conv2d` over `(6, 4, 13)` with no change to `encode_observation`.
+- **The encoding is versioned: new models are built at `FEATURE_VERSION` 3 (`OBS_DIM` 660), and
+  version 4 (`OBS_DIM_V4` 1222) is still served** -- back to 3 on 2026-10-19, by the user's choice:
+  version 4 was never shown to play better, and its 221 models in the store (all zebele's) keep
+  sitting as opponents until the pruning takes them; nothing builds it. The names without a suffix
+  (`OBS_DIM`, `SEAT_FEATURES`, ...) are the built version's layout, version 4's carry `_V4`
+  (`features.SUPPORTED_VERSIONS`, `observation_dim(version)`;
+  `encode_observation(..., version=)`). A model carries its version (`PokerActorCritic.feature_version`,
+  recorded in the checkpoint); `make_policy_fn` puts it on the policy function and `RLAgentPlayer`
+  encodes with it (`feature_version=` overrides), so models of different versions sit at one
+  table, each fed its own vector: the pool stays full, the anchors keep their ratings. The
+  version-3 code is untouched and pinned by `tests/unit/test_rl_features.py` (its constants are
+  the `_V3` names); version 4 is in `test_rl_features_v4.py`. `check_compatible` accepts any
+  supported version at that version's dimension; `load_checkpoint` refuses to load weights of one
+  version into a network of another, and **a parent must read the same version**
+  (`same_network_filter`, `parent_shape_mismatch`: a worker whose store holds only v3 models starts
+  from scratch and its v4 lineage grows next to them). New models are built at the newest version.
+  The layout is the sum of named per-section constants, so it cannot silently drift. Cards are
+  **6 binary 4x13 planes** (hole, flop, turn, river, whole board, hole∪board): a street not yet dealt
+  is an all-zero plane, which solves the 0/3/4/5-board-cards problem for free and keeps the door
+  open to a `Conv2d` over `(6, 4, 13)` with no change to `encode_observation`. Cards then the
+  street come first in every version (`CARDS_DIM`, `STREET_DIM`: the model's equity encoder and
+  `value_diagnostics` read them by offset), the legal-action mask is last.
   Seats are indexed **relative to me** (slot 0 is always me), so the encoding is
-  invariant to absolute seat numbering. Action history is aggregated per street,
-  **not sequenced**, which loses the order, who did each action, and the
-  individual bet sizes — the planned replacement (the next feature version) is a flat
-  positional encoding of the last 20 actions behind a versioned encoder, not a
-  GRU; see the action-sequence entry in the TODO section.
+  invariant to absolute seat numbering.
+  - **Version 4: one scale for every amount.** Every quantity in chips is `_amount`: big blinds
+    through `log1p` over a fixed 1000 bb (a 1 bb stack 0.10, a 100 bb stack 0.67, a 900 bb pot
+    0.98), where version 3 mixed three units (the starting stack, the big blind, the pot) with a
+    clip at 1 that made a 3x-pot bet the same number as a pot-sized one and 4 of the 24 SPR
+    features constant at 1 preflop. A quantity with no unit (pot odds, stack-to-pot ratios, the
+    min-raise over the pot) is `_squash`, `r / (r + scale)`, which never saturates. The scalars are 17
+    (nine amounts, six ratios, two flags) instead of 24, and **version 4 does not read the starting
+    stack at all** (`encode_observation` still takes it, for version 3): no `feature_stack_bb`
+    constant to carry for a model that is only played at a table. The effective stack is given twice,
+    against the shortest and against the deepest live opponent (one all-in opponent used to zero
+    the only one there was).
+  - **Version 4: the actions are a sequence.** The last `SEQUENCE_LENGTH` (20) actions, 28
+    numbers a row (`_action_sequence`), oldest first and **right-aligned** (the most recent action
+    always sits in the same place; padding rows are all zero, and a flag says a row is real):
+    action type (fold, check, call, bet, raise, all-in, forced post), the actor's slot relative to
+    me, the street, the chips it put in and the street total it took the actor to (each as an
+    `_amount` and as a share of the pot before it), **what it faced** (the bet it had to meet, over
+    the pot before), whether it left the actor all-in and how deep (stack over the pot after).
+    Blinds and antes are rows. A hand is median 12 actions, max ~25: the 40 per-street aggregates
+    stay for what falls out of the window. This is what the aggregates lost (order inside a street,
+    who did what, each bet's size); a shove is a row of its own, where `_history_aggregates` never
+    counted an all-in as aggression.
+  - **Version 4: every seat says whether it still has to respond** (`_seats_to_act`, the tenth
+    base feature of a seat block): derived from the street's records, the engine's `to_act` without
+    its `raise_barred` refinement (a short all-in raise reopens it for the callers here). It
+    answers "who is still to speak behind me", which nothing in version 3 did. Pinned by a fuzz: a
+    seat that is asked to act is always in the set.
+  - **Cost, measured** (6 seats, 2,362 decisions): encoding 61 -> 98 us a decision (a forward is
+    ~1.6 ms); the vector nearly doubles, 660 -> 1222 Python floats, so the compact-array note under
+    "A worker's memory is handed back" gets more pressing; the first `Linear` of the policy goes
+    from 380 to 942 inputs and the critic's from 357 to 919, about +1.1M parameters on the
+    shipped shape. **Whether it plays better is not measured**: it needs an ablation at equal
+    compute against version 3.
 - **`encode_observation` takes `big_blind` and `starting_stack` as keyword
   arguments** because `Observation` deliberately carries no table config. Do
   *not* try to recover the blind from the `POST_BLIND` records: a short blind
@@ -531,12 +575,13 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
   as `registry_opponents`. Tests: `tests/unit/test_rl_pool_registry.py`,
   `test_rl_training_pool.py` (no torch) plus the pool section of `test_rl_ppo.py`.
 - **`FEATURE_VERSION` (in `features.py`) must be bumped whenever the *meaning*
-  of a feature changes, even when `OBS_DIM` does not.** The position fix
-  reordered what slot 340 means while keeping the vector exactly as long, so a
-  dimension check alone would have happily loaded a model that reads the wrong
-  thing from every slot. Checkpoints record it and `check_compatible` rejects a
-  mismatch. Checkpoints also record `hidden`/`num_layers`, so
-  `build_model_from_checkpoint` can rebuild an archived agent at whatever shape
+  of a feature changes, even when `OBS_DIM` does not**, and the old version is kept in
+  `SUPPORTED_VERSIONS` rather than rejected (see the versioned encoding above). The position fix
+  reordered what slot 340 means while keeping the vector exactly as long, so a dimension check
+  alone would have happily loaded a model that reads the wrong thing from every slot. Checkpoints
+  record `feature_version` and `obs_dim`; `check_compatible` refuses a version this build does not
+  serve and a dimension that is not that version's. Checkpoints also record `hidden`/`num_layers`, so
+  `build_model_from_checkpoint` can rebuild an archived agent at whatever shape and version
   it was trained with.
 - Rough health indicators for a run (re-check them when the encoder or the
   reward scale changes): `value` around 1 and flat, `kl` well under 0.05 per
@@ -1972,6 +2017,103 @@ plays), `hud_study.py` (whether the opponents' HUD changes what it does) and
   Run on seven models (#1 to #130): the known/unknown shift is 12-20% in all of them, in a
   direction that differs by model, and the profile-to-profile changes are small and
   inconsistent between models -- nobody bets more for value against a calling station.
+- **`search_study.py`: does the search beat the policy?** (`rl/search.py`.) The same model in the
+  hero's seat twice on the same hands -- stacks, cards (`Table` only shuffles with its rng) and the
+  network's sampling seed identical -- once with the search on the chosen streets, once without; the
+  paired difference, hand by hand, is the search's alone, over every hand and over the ones where it
+  spoke. `--opponent-model` (who really sits there) and `--sim-model` (who the search believes) tell
+  how much survives being wrong. `--exhaustive`, `--ranges`, `--world-threshold`, `--min-ess`,
+  `--streets`, `--save`, `--combine` (report several saved runs together, e.g. blocks of 3,000
+  hands that each fit the 10-minute limit of a tool call). **`--null`** is the control. **`--players mix`** draws a table size every hand
+  with the training's weights (`table_weights` of `config.toml` and of the machine's own file, or
+  `--table-weights`) and the hero's seat at random, from a stream of its own, so a fixed size deals
+  what it always dealt; the report then splits by 2-3 / 4-6 / 7-9 players. The seed,
+  stacks and hero seat of a hand are `deal_of`, shared with `search_distill.py`: the same `--seed` is
+  the same hands. Slow by nature: `--jobs` forked copies.
+- **`search_distill.py`: can what the search finds be taught to the policy?** Three resumable phases,
+  each its own process (the generation and the evaluation fork, a CUDA context does not survive
+  it): *generate* plays hands with the model and, at the hero's decisions on `--streets` (flop, turn
+  and river by default), asks the search what each candidate is worth and keeps the state and the
+  values (the **policy's** move is played, so the states are the ones the policy meets), one file per
+  block of hands; `--minutes` stops starting blocks after that long and a rerun resumes. *train*
+  fine-tunes a copy of the policy (trunk and head only) on the cross-entropy to the softmax of the
+  values over the candidates plus a KL to the original policy, and reports the held-out loss and the
+  agreement with the search by street. *evaluate* sits the original and the distilled model in the
+  hero's seat on the same hands and reports the paired difference over every hand and over the hands
+  that saw the flop, the turn and the river. The model is resolved once and pinned in
+  `<out>/meta.json` (the ranking moves while the fleet trains). **What made it work** (first run: 10,000 hands, 9,254 labels, 1,000 worlds, the old `soft` target):
+  the distilled model *lost* 16.9 +- 8.9 bb/100, though the search itself wins ~75 at the same
+  tables. Two faults of the training, both measured: (1) the KL held the policy only on the labelled
+  states, so the network moved freely elsewhere -- the preflop, which no label covers, by a KL of
+  0.40 (fold 60% -> 44%); (2) the `soft` target (softmax of the values) ignores the policy, so
+  candidates the search finds equal within its noise get equal mass: it put 66% of the mass on
+  candidates the policy plays under 5% (all-in on the river doubled). Fixes: `--anchor-hands` (KL
+  also on the decisions of self-play hands, every street) and `--target improve` (the policy times
+  `exp(value / tau)`: equal values leave it as it was). On the *same* labels: soft + anchor -1.6 +-
+  6.2, best + anchor +5.9 +- 6.1, **improve + anchor +9.2 +- 3.4** (tau 1; tau 0.5 +10.2 +- 4.3,
+  tau 2 +3.1 +- 2.8), positive at every table size. The held-out agreement with the search's best
+  barely moves (28% -> 30-33%): what transfers is a small step where the values differ, not the
+  search's choices. The real run is `--hands 10000 --minutes 180 --jobs 45 --train-device cuda` on the machine with the
+  cores (`--players mix` for the training's table sizes; the evaluation then reports by size group). **Cost**: on ranges, a flop decision is ~40 s of one core (the range of each opponent is
+  ~1,100 replays, then `worlds` x `candidates` rollouts of three streets), 1-2 labelled decisions a
+  hand heads-up; the river alone is much cheaper. Pure parts tested in
+  `tests/unit/test_study_search_distill.py`.
+- **Against the anchors the first distilled models are *weaker*** (500 sessions each, the same
+  sessions, from the original's rating 2035): original 2046 / +52.8 bb/100, improve-anchor 2016 /
+  +42.7, improve tau 0.5 2009 / +39.4, best 1935 / +24.9. The search believed every opponent was the
+  original, so the distillation learnt to beat that model (+10 head to head) and lost against the
+  field. Published anyway (`zebele-distill-*-agent-20261017-193628`), by the user's choice: a model
+  more never hurts. Hence **`--opponents pool`**: the other seats are models of the store (the
+  `--pool-top-n` 50 best-rated, anchors left out, pinned in `meta.json`), `--block-models` 8 per
+  block of hands; the search believes each seat is the model sitting there
+  (`Searcher.choose(seat_models=)`); the anchor states and the evaluation (blocks of `--eval-block`
+  hands) face the same field. **Nobody has statistics, in every phase** (the user's choice: every
+  opponent unknown; no tracker, no warm-up), so the labels are the states of a session's first hand,
+  while a rated session is mostly played with statistics.
+- **`rate_and_publish.py`**: the pass against the anchors a published model gets (500 sessions),
+  for any checkpoints, all from one starting rating (`--reference` or `--start-rating`) on the same
+  sessions, so they are paired; `--publish --prefix` puts each in the store at the rating it earned.
+  The loop of search rounds is: generate (pool) -> train -> evaluate -> rate and publish, with the
+  new model as the next hero. **Only by hand on zebele**: nothing of the fleet runs it; if it ever
+  goes into the loop it is a per-machine switch (`config.zebele.toml`), off in the shared file.
+- **`search_iterate.py`: rounds of search and distillation, each from the model the round before
+  made** (generate -> train -> evaluate against the parent -> rate against the anchors and publish).
+  A chain is who sits opposite: `self`, `pool` (top 50), `mix` (25 top + 25 random of the store,
+  `--pool-random`), each with an optional `@tau` (`self@3`). A table is one block of work
+  (`--table-hands` 200, one size, a live `StatsTracker` from nothing, as in training), smallest tables
+  first (they have the most decisions and take longest); 27,000 hands a round is ~15-21k labels in
+  ~45-65 minutes on 45 cores. **What the night of 2026-10-17 found** (all from `zebele-gen0033`, every
+  number in `checkpoints/studies/search_iterate/NOTES.md`):
+  - every round beats its parent by ~5-9 bb/100, in every chain, and *every* chain falls against the
+    anchors: `self` tau 1 from +52.8 to +45.6, 37.6, 30.7, 28.1, 24.1 bb/100 in five rounds; `pool`
+    and `mix` the same after two; `self@3` slower (48.4, 46.9, 41.9, 40.5, 37.3);
+  - with tau 1 the gains do not add up (round 4 against the original: +5.6); with tau 3 they do
+    (+2.9, 4.6, 9.8, 16.6, 20.5 over five rounds) -- but only against the original: the same model is
+    -3.7 against it with the top 50 at the table and -20.1 with the anchors (river, small tables);
+  - the decision-time search against the anchors gains +42.8 (turn/river) and +38.5 (flop) knowing
+    who sits where, -1.9 believing they are the hero's model, -6.1 believing random top-50 models,
+    -14.1 believing the store model of the nearest HUD style (`search_study --field anchors
+    --believe exact|sim|top|style`). **The search's gain is a best response to a known opponent**:
+    distilled, it teaches the policy to beat the opponents it believed, at a cost against others.
+  - noise of the anchor pass: the original with seeds 0/1/2 rates 2045.8/2034.8/2028.7 (+52.8/50.6/49.8).
+- **The second night (2026-10-18/19): pool rounds with small steps** (`checkpoints/studies/search_iterate2`
+  and `search_iterate3`, `NOTES.md` in the first). What was added: `--keep-best` (a round starts from the
+  chain's best so far by bb/100 against the anchors, the start counting as `--start-bb100`); a wide pool
+  (`--pool-top-n 100 --pool-random 100`); the labels of every round made by the same model pooled
+  (`search_distill --extra-data`); each gap's standard error kept in the labels (`Choice.errors`) and
+  `--min-z` to learn only the gaps the search is sure of (chain `pool@3/2`); styled opponents
+  (`--style-share`, chain `styled`: half the opponents play a random `rl/styles.py` style, the weak
+  and odd players the pruned store lacks -- the anchors span 1296-2035, the store 1838-2040); a
+  population belief (`--believe random --relative-threshold`, chain `blind`: each seat believed to be
+  a random pool model, so the labels are worth what an action is against the population); pool
+  models deleted by the fleet's pruning are left out. **Nothing beat the original against the
+  anchors**: with tau 3-10 and a wide field the distilled models are *equal* to it (three seeds:
+  original 2036.4 / +51.1, pool@3 r1 2039.6 / +51.3, styled@3 r1 2040.2 / +51.1, pool@5 r1 2043.3 /
+  +49.9; on 1,500-session passes original 2039.0 / +46.2, every later round 44.5-45.8), and against
+  their own field they gain ~0 on average (-7 to +6); with tau 1 or the unsure gaps dropped (`pool@1/3`)
+  they lose. More labels for one step (48-60k) did not help. Reading: the search's values are a best
+  response to the believed opponents, and a policy that cannot tell its opponents apart learns at best
+  their average, which is worth nothing measurable.
 - **`archetype_study.py`: real archetypes, a real HUD, and what reading it earns.** The
   opponents are the model (or `--opponent-model`) with a fixed push on its logits
   (`ARCHETYPE_BIASES` x `--strength`, by situation: preflop / checked to / facing a bet):
@@ -1990,6 +2132,110 @@ plays), `hud_study.py` (whether the opponents' HUD changes what it does) and
   to a bet with nothing 42% instead of 62%), wrong against the nit and the station (calls
   their bets lighter, bluffs the station more) -- and it earns nothing measurable: -3.7 +-
   5.9 (nit), -1.7 +- 11.2 (maniaco), +2.4 +- 9.9 (station) bb/100.
+
+## Search at the moment of a decision (`rl/search.py`) -- a layer around a model, nothing is trained
+
+The network answers from one forward pass. `Searcher` spends computation on one decision instead:
+it samples *worlds* (the hands the opponents might hold, the cards still to come), plays each
+candidate action in each world to the end of the hand with the models in every seat, and picks the
+action that earned the most. `SearchPlayer` wraps a `RLAgentPlayer` with it. Torch-free (callables
+and players only), tests in `tests/unit/test_rl_search.py`.
+
+- **The engine is the simulator, and the decision is rebuilt from the `Observation` alone**
+  (`_reconstruct`): a fresh `Table` with the stacks the hand started with (a seat that has not acted
+  has put nothing in), the seats relabelled so the button is seat 0 (which is where a new `Table`
+  puts it), the actions already taken *replayed* as a script in the engine's own order, and the deck
+  dealt as the world says (`engine/arranged_deal.py`: `ArrangingRandom`, `deal_positions`, moved out
+  of `gui/spot.py` so `rl/` does not import the GUI). Pinned by a fuzz at every table size: the
+  replay reaches the hero's turn in a state identical to the real one (pot, stacks, bets, legal
+  actions, history). The hero's candidate is played at the first decision after the script; from
+  there every seat, the hero's included, plays its model -- so a candidate's value assumes the hero
+  *plays its policy afterwards*, never a second search.
+- **The opponents in the simulation are a belief** (`make_player`): the hero's own model unless
+  told otherwise, exactly right only when that is who sits there. The search is a best response to
+  that model, not an equilibrium, and it can be exploited by a wrong one. **Measured: the gain is
+  there against the model it believes and mostly gone against another** (see below).
+- **Belief by weighing.** A world is as likely as the probability that the opponents' models would
+  have taken the actions they took, with those cards (`_ReplayPlayer`, `action_probabilities`, the
+  bin nearest the action taken; a floor of 1e-9 so a log exists). `belief="uniform"` weighs nothing.
+  `min_ess` (effective worlds) below which the decision goes back to the policy. Only the
+  opponents **still in the hand** are imagined or weighed (a folded seat gets leftover cards):
+  one opponent left is 990 hands at the river, however many sat down.
+- **A world can be dropped** (`world_threshold`, 0 = never): once the product of the probabilities
+  the opponents' models gave their actions *so far* falls under it, that replay stops and none of its
+  rollouts is played. A dropped world is not a world with a small weight; with `ranges` the dropped
+  *hands* are replaced.
+- **Ranges (`ranges=True`)**: an opponent's actions depend on its own cards and the public state,
+  never on another opponent's cards, so the likelihood of a world is a product of one per
+  opponent. Each live opponent's range is found alone over every hand it could hold (~1,000, one
+  replay each); `worlds` worlds are then *drawn* from the ranges, redrawing when two opponents would
+  hold one card (exact: it is the card removal of the true posterior; about 9% of draws), and every
+  world counts the same, because the weighing was the drawing. **Do not weigh again**: that would
+  count the likelihood twice. The cost grows with the *sum* of the ranges, not their product (a
+  table of nine has 5e22 river worlds; `exhaustive=True` enumerates only when the count is under
+  `max_exhaustive`, heads-up river).
+- **Variance**: every candidate is played in the *same* worlds, so the comparison between actions
+  is paired and the luck of the cards cancels. The candidates are the policy's `candidates` likeliest
+  bins; the policy's likeliest wins a tie.
+- **Measured (`studies/agents/search_study.py`, #1 against itself, heads-up, 20-100 bb stacks, paired
+  hands, bb/100 over every hand)**: river with 100 sampled worlds weighed +18 +- 8 (uniform: -2 +- 13);
+  turn +29 +- 12; flop +62 +- 27 (1,500 hands only); river with every world and a 1% threshold
+  **+63 +- 11** (+355 on the 18% of hands where it spoke); river on ranges with 1,000 worlds +48 +- 18 (1,500
+  hands). **Against a different opponent (#50, the search believing #1) the gain is not established**:
+  +1 +- 3 (the weighing finds nothing credible and declines 87% of decisions), +9 +- 8 with a lower
+  `min_ess`, +15 +- 12 with uniform worlds. A decision costs ~10-25 s of one core at the river
+  heads-up; the flop and the preflop are worse and are untested (preflop never run). Multiway not
+  yet measured: the ranges mode exists for it.
+- **Spending less** (`SearchConfig`, all off by default so earlier measurements reproduce; the
+  studies' `--optimized` turns on what was validated). Profile first (6 seats, ranges, 300 worlds,
+  23 s a decision): rollouts 73% and ranges 27% of the time; the model's batch-1 forward 52% of it
+  (the card encoder 15%, `Categorical` 8%), the showdown evaluator 8%, the features 9%, replaying the
+  hand's start a few per cent.
+  - `stop_z`/`min_worlds`/`check_every`: every `check_every` worlds, a candidate more than `stop_z`
+    standard errors (of its paired difference from the best) behind is dropped; one left ends the
+    search. Exhaustive worlds are shuffled first so a prefix is a random sample.
+  - `dedup`: a world drawn twice is played once and counted twice; one opponent at the river, the
+    worlds are its range's hands, each weighed by its likelihood.
+  - `min_pot_bb`: no search in a smaller pot (`skipped_small_pot`).
+  - Ranges are **carried from one decision of a hand to the next** (always, with `ranges`): the old
+    actions' probabilities do not change, so only the new ones are weighed, and only for the hands
+    still standing (a weight only goes down; a hand holding a new board card is out). Pinned equal to
+    the range worked out afresh.
+  - `branch`/`branch_min`: the first answer to the candidate is not drawn, every answer of at least
+    `branch_min` is played and averaged with its probability (`branched_rollout`, `_probe`).
+  - `rl/policy.py::make_search_policy_fn`: the model's own probabilities (pinned equal), with the card
+    encoder's output remembered by (hole, board) and no `Categorical`; `batch_distribution` answers many
+    decisions in one forward. Real seats keep `make_policy_fn`, so paired comparisons are untouched.
+  - `threads`/`SimModel`/`BatchGate`: rollouts and range replays in threads, every question of a
+    simulated seat through the gate, which evaluates them together when every running thread is
+    waiting. The engine stays serial (the GIL); the forward passes are what gets shared. One thread is
+    deterministic; with threads the draws depend on the scheduling.
+  - `leaf`/`leaf_value` (`make_leaf_value`, `load_leaf_value` in the study): a rollout stops at the
+    hero's next decision and the model's critic (with the equity network named in its metadata, value
+    times `stack_max_bb`) says what it is worth. **Measured harmful: off.**
+  - **Not done: resuming a hand from a saved state** (no replay of the hand's start per rollout): the
+    profile puts the replay at a few per cent and it needs `Table.play_hand` to resume mid-hand.
+  - **Measured** on 32 decisions at 6 seats (flop/turn/river, ranges, 300 worlds), each choice judged by
+    a 2,000-world reference (what it loses by the reference's own values): plain 31.8 s, 27/32 as the
+    reference, 0.14 bb a decision; optimized (`stop_z` 3, dedup, the fast policy) 14.6 s, 27/32,
+    0.06 bb; **optimized + 16 threads 8.6 s, 26/32, 0.05 bb**; + branch 10.1 s, 28/32, 0.07 bb (no
+    measurable gain); + leaf 7.7 s, **20/32, 1.08 bb** (the critic is not precise enough to stand in
+    for the rest of the hand). So `--optimized` is `--stop-z 3 --dedup --fast-sim --threads 16`.
+- **Measured at the training's table mix** (`--players mix`, #1 against itself, `--optimized` minus
+  threads, ranges, 300 worlds, `min_ess` 3): turn and river +78 +- 14 bb/100 over every hand (8,000
+  hands; positive at 2-3, 4-6 and 7-9 players), flop +73 +- 23 (4,000 hands). A searched decision
+  changes the policy's move 61-69% of the time. ~7 minutes for 8,000 hands on 45 cores.
+- **`relative_threshold`** (`--relative-threshold`, ranges only): the threshold drops a hand that
+  much less likely than its range's likeliest, instead of under an absolute probability. An
+  absolute 1% drops every hand that mixes once a line is long (seven actions at 50% are 0.8%);
+  measured on turn and river it made no difference to the gain (+76 relative, +78 absolute).
+- `_map` counts every worker at the `BatchGate` before starting any (`enter(count)`): a worker
+  that asked before the others had entered was answered alone, and the batching test was flaky.
+- **Where it could go in training** (not built): the search's values as lower-variance advantages for
+  PPO, or distilled into the policy. In training the opponents are the pool's own models, which are
+  known, so the belief can be exact -- the favourable case. Risks: the policy learns to exploit the pool
+  and not to play, and a deterministic target collapses its entropy. `studies/agents/search_distill.py`
+  is the cheap offline test (below); nothing goes into PPO before it says the network can absorb it.
 
 ## Player embedder (`studies/player_embedding/`) -- a study, nothing in `src/` uses it
 
@@ -3278,59 +3524,20 @@ do the numbers.
   - **Long term**: styles *trained* with the constraint in the PPO loss (the entry on style
     constraints above) have no artificial defects to exploit, unlike a push on the logits;
     the push is the cheap way to get diversity now.
-- **Encode the action *sequence*, not per-street aggregates (the next feature version).**
-  Postponed in favour of the opponent statistics, which took version 3. Today
-  `_history_aggregates` compresses the whole betting history into 40 numbers — 4
-  streets x 10 counters — and what it throws away is exactly what poker is played
-  on:
-  - **The order inside a street.** "check, bet, raise" and "bet, raise, check"
-    produce the identical vector. Initiative, who opened, who reacted to whom —
-    all gone.
-  - **Who did what.** Only the *last* aggressor of each street is identified (by
-    relative seat) plus the agent's own participation.
-  - **Individual bet sizes.** Only the street's *maximum*, relative to the pot.
-  - Per-opponent *amounts* do survive, in the 81 seat slots (`current_bet / pot`
-    and `committed / pot`); it is the action *types* and their order that are
-    lost.
-
-  Why it matters: bet-sizing patterns are the signature of what the agent most
-  obviously cannot do. Small on the flop then large on the turn is value building;
-  large on the flop then giving up on the turn is an abandoned bluff. To the
-  current encoder those are nearly the same vector. The information is all there
-  already: `Observation.action_history` is a list of `ActionRecord` carrying
-  `street`, `seat`, `player_id`, `action_type`, `amount`, `stack_before/after`,
-  `pot_before`. **No engine change is needed** — only `features.py`.
-
-  **The prerequisite.** `check_compatible` (`rl/ppo.py`) rejects a checkpoint
-  whose `obs_dim` *or* `feature_version` differs, so any encoder change makes
-  every stored model, the frozen anchors and the Elo scale built on them
-  unloadable at once. That is a population reset, not a migration. So the work is
-  in two parts, in this order:
-  - **Part 1, a versioned encoder.** `encode_observation` takes a `version`; the
-    current code becomes the `version=3` branch, untouched. `RLAgentPlayer` reads
-    the version off the checkpoint it wraps and encodes at that version.
-    `check_compatible` accepts any version this build can serve rather than only
-    the newest. Then models of different versions sit at the same table, each fed
-    its own vector: the pool stays full, the anchors stay valid, the ratings keep
-    meaning something. Small, no behaviour change, directly testable. Worth doing
-    on its own merits.
-  - **Part 2, the new features.** Keep the 40 aggregates and append a flat
-    positional encoding of the **last 20 actions**, 24 features each: action type
-    one-hot (7), actor's seat relative to me (9), street one-hot (4),
-    `amount / pot_before` (1), `log(amount / big_blind)` (1), was-it-me (1),
-    slot-occupied/padding (1). 480 new features, so `OBS_DIM` 660 → 1140. The
-    window of 20 was sized from the distribution of actions per hand (median 12,
-    max ~25 including blinds): re-measure it if the table size or stack depth
-    changes. When a hand truncates it keeps the most recent actions.
-  - **Fix how each new feature is scaled, in the same change as the version.**
-    Every feature in `features.py` is a bounded ratio (`_clip01`, with chip
-    amounts divided by the big blind and passed through `log1p` over a fixed
-    scale), and the network has no input normalisation beyond the `LayerNorm`
-    after each `Linear`. The per-action features must follow the same convention:
-    `amount / pot_before` and `log(amount / big_blind)` clipped to [0, 1] with a
-    stated scale, the one-hots left as they are. A feature left unbounded would
-    dominate the first `Linear` and change what `FEATURE_VERSION` means without
-    anyone noticing, so the scale is part of the version's definition.
+- **Encode the action *sequence*, not per-street aggregates -- done in feature version 4** (the
+  parts that remain are below). Version 3's `_history_aggregates` compressed the whole betting
+  history into 40 numbers, which lost the order inside a street, who did what and each bet's size.
+  Version 4 keeps them and appends the last 20 actions as rows, behind a **versioned encoder**
+  (version 3 is still served; see "The encoding is versioned" in the RL section for what was
+  built, how it is scaled and what it costs). Still to do:
+  - **Measure it.** An ablation of version 4 against version 3 at equal compute (rating against
+    the anchors, `ancore/100`), one factor at a time if it does not win: the sequence, the single
+    scale, the `to_act` flag. Nothing says yet that the extra inputs are used; the HUD statistics
+    were not (see the `hud_study` findings).
+  - **Re-measure the window of 20** if the table size or stack depth changes (median 12 actions a
+    hand, max ~25 with the blinds): a nine-handed preflop with raises can already truncate.
+  - **The memory of the features** (1222 Python floats a decision): the compact `array('f')` in the
+    memory note.
   - **The direction for later (the user's): an embedding of the player's past actions,
     from an encoder of its own.** The plan is to pass the policy a learned vector that
     represents how each player has played, the way it is already passed the equity

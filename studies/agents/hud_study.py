@@ -487,7 +487,8 @@ def evaluate_variants(
             chunk = range(start, min(start + batch, len(states)))
             features = [
                 encode_observation(change(states[i][0]), big_blind=big_blind,
-                                   starting_stack=starting_stack, legal_mask=masks[i])
+                                   starting_stack=starting_stack, legal_mask=masks[i],
+                                   version=model.feature_version)
                 for i in chunk
             ]
             with torch.no_grad():

@@ -16,7 +16,7 @@ from pokerlab.engine.actions import Action, LegalAction
 from pokerlab.engine.state import PlayerStatus
 from pokerlab.players.base import Observation, Player
 from pokerlab.rl.action_space import action_index_to_action, legal_action_mask
-from pokerlab.rl.features import card_index, chips_at_stake, encode_observation
+from pokerlab.rl.features import FEATURE_VERSION, card_index, chips_at_stake, encode_observation
 
 
 @dataclass(frozen=True)
@@ -112,9 +112,18 @@ class RLAgentPlayer(Player):
         on_decision: Callable[[DecisionRecord], None] | None = None,
         deal_holes: Callable[[], dict[int, tuple[Card, Card]]] | None = None,
         style: Callable[[Observation], tuple[list[float], float]] | None = None,
+        feature_version: int | None = None,
     ) -> None:
         super().__init__(player_id, name)
         self._policy_fn = policy_fn
+        # The encoding the policy was trained on (`rl/features.py`): given, else the policy's own
+        # (`make_policy_fn` sets it from the model), else the newest. Models of different
+        # versions sit at one table, each fed its own vector.
+        self._feature_version = (
+            feature_version
+            if feature_version is not None
+            else getattr(policy_fn, "feature_version", FEATURE_VERSION)
+        )
         self._big_blind = big_blind
         self._starting_stack = starting_stack
         self._on_decision = on_decision
@@ -136,6 +145,24 @@ class RLAgentPlayer(Player):
             return self._big_blind, self._starting_stack
         return big_blind, self._starting_stack * big_blind / self._big_blind
 
+    def features_for(
+        self, observation: Observation, legal_actions: list[LegalAction]
+    ) -> tuple[list[float], list[bool]]:
+        """What the policy is fed for this decision: the features (at this player's version, with
+        its normalisers) and the mask of the action bins it may choose. The one place the two are
+        built, so whatever wants to ask the model the same question -- a spectator, a search, a
+        study that keeps the inputs -- cannot ask a different one."""
+        mask = legal_action_mask(observation, legal_actions)
+        big_blind, starting_stack = self._normalisers(observation)
+        features = encode_observation(
+            observation,
+            big_blind=big_blind,
+            starting_stack=starting_stack,
+            legal_mask=mask,
+            version=self._feature_version,
+        )
+        return features, mask
+
     def action_probabilities(
         self, observation: Observation, legal_actions: list[LegalAction]
     ) -> list[float] | None:
@@ -146,25 +173,14 @@ class RLAgentPlayer(Player):
         distribution = getattr(self._policy_fn, "distribution", None)
         if distribution is None:
             return None
-        mask = legal_action_mask(observation, legal_actions)
-        big_blind, starting_stack = self._normalisers(observation)
-        features = encode_observation(
-            observation, big_blind=big_blind, starting_stack=starting_stack, legal_mask=mask
-        )
+        features, mask = self.features_for(observation, legal_actions)
         if self._style is None:
             return distribution(features, mask)
         bias, temperature = self._style(observation)
         return distribution(features, mask, bias, temperature)
 
     def act(self, observation: Observation, legal_actions: list[LegalAction]) -> Action:
-        mask = legal_action_mask(observation, legal_actions)
-        big_blind, starting_stack = self._normalisers(observation)
-        features = encode_observation(
-            observation,
-            big_blind=big_blind,
-            starting_stack=starting_stack,
-            legal_mask=mask,
-        )
+        features, mask = self.features_for(observation, legal_actions)
         if self._style is None:
             decision = self._policy_fn(features, mask)
         else:
@@ -184,7 +200,7 @@ class RLAgentPlayer(Player):
                     action_index=decision.action_index,
                     log_prob=decision.log_prob,
                     value=decision.value,
-                    stake_bb=chips_at_stake(observation) / big_blind,
+                    stake_bb=chips_at_stake(observation) / self._normalisers(observation)[0],
                     critic_view=(
                         deal_view(observation, self._deal_holes())
                         if self._deal_holes is not None

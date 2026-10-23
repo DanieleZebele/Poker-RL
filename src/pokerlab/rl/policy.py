@@ -16,7 +16,7 @@ from torch import Tensor, nn
 from pokerlab.players.rl_agent import DealView, PolicyDecision, PolicyFn
 from pokerlab.rl.action_space import ACTION_DIM
 from pokerlab.rl.equity_net import CARDS, EquityEncoder, EquityNet
-from pokerlab.rl.features import CARDS_DIM, MAX_SEATS, OBS_DIM
+from pokerlab.rl.features import CARDS_DIM, FEATURE_VERSION, MAX_SEATS, observation_dim
 from pokerlab.rl.rollout import CriticFns
 
 # Not -inf: with only one legal action, -inf makes log_softmax return -inf for
@@ -77,7 +77,7 @@ class PokerActorCritic(nn.Module):
 
     def __init__(
         self,
-        obs_dim: int = OBS_DIM,
+        obs_dim: int | None = None,
         action_dim: int = ACTION_DIM,
         hidden: int = DEFAULT_HIDDEN,
         num_layers: int = DEFAULT_NUM_LAYERS,
@@ -85,8 +85,20 @@ class PokerActorCritic(nn.Module):
         head_layers: int = DEFAULT_HEAD_LAYERS,
         *,
         equity: dict[str, int],
+        feature_version: int = FEATURE_VERSION,
     ) -> None:
         super().__init__()
+        # The encoding the model reads (`rl/features.py`): its input has that many numbers, and
+        # whoever feeds it encodes at that version. `obs_dim` is for a caller who wants to say
+        # it; it can only agree with the version.
+        expected = observation_dim(feature_version)
+        if obs_dim is not None and obs_dim != expected:
+            raise ValueError(
+                f"feature version {feature_version} has {expected} features, not obs_dim={obs_dim}"
+            )
+        obs_dim = expected
+        self.feature_version = feature_version
+        self.obs_dim = obs_dim
         if hidden < 1 or num_layers < 1 or head_hidden < 1 or head_layers < 0:
             raise ValueError(
                 "a network needs hidden >= 1, num_layers >= 1, head_hidden >= 1 and "
@@ -204,7 +216,116 @@ def make_policy_fn(
             return torch.softmax(logits, dim=-1)[0].tolist()
 
     policy_fn.distribution = distribution  # type: ignore[attr-defined]
+    # What `RLAgentPlayer` encodes with when it is not told otherwise: the model's own version.
+    policy_fn.feature_version = model.feature_version  # type: ignore[attr-defined]
     return policy_fn
+
+
+def make_search_policy_fn(
+    model: PokerActorCritic, *, device: str | torch.device = "cpu", cache_size: int = 200_000
+) -> PolicyFn:
+    """The policy of `make_policy_fn`, for the rollouts of a search (`rl/search.py`), faster.
+
+    The probabilities are the same (the same layers, in the same order: pinned by a test). What
+    changes is the cost of asking:
+
+    - the card encoder's output depends on the hole cards and the board alone, and a search asks
+      about the same cards on the same board thousands of times, so it is remembered by those
+      cards (up to `cache_size` of them, then started afresh);
+    - the action is drawn from the softmax directly: no `Categorical`, no log-probability and no
+      value, which a search does not keep (the decision carries 0 for both).
+
+    The draw comes from torch's stream, like `make_policy_fn`'s, so `torch_seeded` still governs
+    it. Not for training: PPO needs the log-probability this leaves out."""
+    model.to(device)
+    latents: dict[tuple[tuple[int, ...], tuple[int, ...]], Tensor] = {}
+    hole_slice = slice(HOLE_PLANE * PLANE, (HOLE_PLANE + 1) * PLANE)
+    board_slice = slice(BOARD_PLANE * PLANE, (BOARD_PLANE + 1) * PLANE)
+
+    def cards_of(features: list[float]) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        hole = tuple(index for index, value in enumerate(features[hole_slice]) if value)
+        board = tuple(index for index, value in enumerate(features[board_slice]) if value)
+        return hole, board
+
+    def latents_of(keys: list[tuple[tuple[int, ...], tuple[int, ...]]]) -> Tensor:
+        """The encoder's output for each `(hole, board)`, those not remembered in one call."""
+        missing = list(dict.fromkeys(key for key in keys if key not in latents))
+        if missing:
+            if len(latents) + len(missing) > cache_size:
+                latents.clear()
+                missing = list(dict.fromkeys(keys))
+            holes = torch.zeros(len(missing), PLANE, device=device)
+            boards = torch.zeros(len(missing), PLANE, device=device)
+            for row, (hole, board) in enumerate(missing):
+                holes[row, list(hole)] = 1.0
+                boards[row, list(board)] = 1.0
+            with torch.no_grad():
+                encoded = model.equity_encoder(holes, boards)
+            for row, key in enumerate(missing):
+                latents[key] = encoded[row : row + 1]
+        return torch.cat([latents[key] for key in keys])
+
+    def latent_of(features: list[float]) -> Tensor:
+        return latents_of([cards_of(features)])
+
+    def logits_of(
+        features: list[float], mask: list[bool], bias: list[float] | None, temperature: float
+    ) -> Tensor:
+        with torch.no_grad():
+            rest = torch.tensor([features[CARDS_DIM:]], dtype=torch.float32, device=device)
+            logits = model.policy_head(model.trunk(torch.cat([rest, latent_of(features)], dim=-1)))
+            logits = logits.masked_fill(~torch.tensor([mask], dtype=torch.bool, device=device), MASK_FILL)
+            if bias is not None:
+                logits = (logits + torch.tensor([bias], dtype=logits.dtype, device=device)) / temperature
+            return logits
+
+    def policy_fn(
+        features: list[float], mask: list[bool], bias: list[float] | None = None, temperature: float = 1.0
+    ) -> PolicyDecision:
+        probabilities = torch.softmax(logits_of(features, mask, bias, temperature), dim=-1)
+        return PolicyDecision(action_index=int(torch.multinomial(probabilities, 1).item()))
+
+    def distribution(
+        features: list[float], mask: list[bool], bias: list[float] | None = None, temperature: float = 1.0
+    ) -> list[float]:
+        return torch.softmax(logits_of(features, mask, bias, temperature), dim=-1)[0].tolist()
+
+    def batch_distribution(features: list[list[float]], masks: list[list[bool]]) -> list[list[float]]:
+        """`distribution` for many decisions in one forward pass (what `rl/search.py`'s
+        `BatchGate` evaluates): the same probabilities, row by row."""
+        with torch.no_grad():
+            latent = latents_of([cards_of(row) for row in features])
+            rest = torch.tensor([row[CARDS_DIM:] for row in features], dtype=torch.float32, device=device)
+            logits = model.policy_head(model.trunk(torch.cat([rest, latent], dim=-1)))
+            logits = logits.masked_fill(~torch.tensor(masks, dtype=torch.bool, device=device), MASK_FILL)
+            return torch.softmax(logits, dim=-1).tolist()
+
+    policy_fn.distribution = distribution  # type: ignore[attr-defined]
+    policy_fn.batch_distribution = batch_distribution  # type: ignore[attr-defined]
+    policy_fn.feature_version = model.feature_version  # type: ignore[attr-defined]
+    return policy_fn
+
+
+def make_leaf_value(
+    model: PokerActorCritic, equity_net: EquityNet, *, value_unit: float, device: str | torch.device = "cpu"
+):
+    """What a decision is worth to the player deciding, in big blinds, by the model's critic: the
+    `leaf_value` of `rl/search.py`.
+
+    The critic reads the decision's features and every player's equity (from `equity_net`, the
+    full network the critic was trained with), so it needs every player's cards: a search's world
+    knows them. It estimates the player's result for the whole hand in the training reward's
+    unit; `value_unit` turns that into big blinds (1 / the reward scale: with the default scale,
+    big blind over the deepest stack, it is that stack in big blinds)."""
+    from pokerlab.players.rl_agent import deal_view
+
+    critic = make_critic_fns(model, equity_net, device=device)
+
+    def leaf_value(features: list[float], observation, holes) -> float:
+        extra = critic.equity([deal_view(observation, holes)])[0]
+        return critic.value([features], [extra])[0] * value_unit
+
+    return leaf_value
 
 
 def deal_tensors(views: Sequence[DealView]) -> tuple[Tensor, Tensor, Tensor]:

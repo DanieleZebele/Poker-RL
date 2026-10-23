@@ -34,6 +34,7 @@ from pokerlab.rl.benchmark import (
     DEFAULT_RESIDENT_ANCHORS,
 )
 from pokerlab.rl.device import resolve_device, resolve_update_device
+from pokerlab.rl.features import FEATURE_VERSION
 from pokerlab.rl.forking import run_in_copies, torch_seeded
 from pokerlab.rl.memory import release_free_memory
 from pokerlab.rl.equity_net import (
@@ -791,17 +792,25 @@ def network_shape(args: argparse.Namespace) -> dict[str, int]:
     }
 
 
-def parent_shape_mismatch(path: str | Path, shape: dict[str, int], equity: dict[str, int]) -> dict | None:
+def parent_shape_mismatch(
+    path: str | Path,
+    shape: dict[str, int],
+    equity: dict[str, int],
+    feature_version: int = FEATURE_VERSION,
+) -> dict | None:
     """The shape of the checkpoint at `path` if it is not `shape` (with `equity`, the shape of
-    the equity encoder it is built with), else None.
+    the equity encoder it is built with, and `feature_version`, the encoding it reads), else None.
 
-    Raises `IncompatibleCheckpointError` for a checkpoint that is not this build's at
-    all (another encoding or feature version): that is a broken parent, not a
-    different one, and resuming from it was never going to work.
+    Raises `IncompatibleCheckpointError` for a checkpoint that is not one this build serves
+    at all: that is a broken parent, not a different one, and resuming from it was never going
+    to work. One of another feature version is served but different: its input is not the
+    same, so the weights cannot be exchanged.
     """
     parent = torch.load(path, map_location="cpu", weights_only=True)
     check_compatible(parent, str(path))
     found = checkpoint_shape(parent)
+    if parent["feature_version"] != feature_version:
+        return {**found, "feature_version": parent["feature_version"]}
     if found != shape:
         return found
     # The same shape, but built with another equity encoder: the weights cannot be exchanged.
@@ -813,16 +822,20 @@ _NETWORK_OF: dict[str, tuple | None] = {}
 
 
 def same_network_filter(
-    shape: dict[str, int], equity: dict[str, int]
+    shape: dict[str, int], equity: dict[str, int], feature_version: int = FEATURE_VERSION
 ) -> Callable[[str | Path], bool]:
     """A test for "this checkpoint can be resumed into a network of `shape` and `equity`":
-    the same trunk and head sizes, the same equity encoder, and this build's encoding.
+    the same trunk and head sizes, the same equity encoder, and the same feature version.
 
     A published checkpoint never changes, so what is read from one is remembered for the
     life of the process (the supervisor asks about every model of the store each
     generation, and a read is ~7 ms). A file that cannot be read or is not this build's
     is simply not a parent."""
-    wanted = (*(shape[key] for key in sorted(shape)), tuple(sorted(equity.items())))
+    wanted = (
+        *(shape[key] for key in sorted(shape)),
+        tuple(sorted(equity.items())),
+        feature_version,
+    )
 
     def accepts(path: str | Path) -> bool:
         key = str(path)
@@ -834,6 +847,7 @@ def same_network_filter(
                 _NETWORK_OF[key] = (
                     *(found[name] for name in sorted(found)),
                     tuple(sorted(checkpoint["equity"].items())),
+                    checkpoint["feature_version"],
                 )
             except Exception:  # noqa: BLE001 - torch raises whatever the mount felt like
                 _NETWORK_OF[key] = None

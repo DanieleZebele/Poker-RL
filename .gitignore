@@ -9,3 +9,6 @@ htmlcov/
 hand_histories/
 checkpoints/
 studies/equity_net/runs/*.pt
+
+# too big for GitHub (>100 MB); lives on the shared volume only
+equity_evaluator/attn-l-lat512_h512_b4_l4_h8.pt

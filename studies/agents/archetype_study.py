@@ -146,7 +146,8 @@ class PushedAgent(Player):
 
         mask = legal_action_mask(observation, legal_actions)
         features = encode_observation(observation, big_blind=self.big_blind,
-                                      starting_stack=self.starting_stack, legal_mask=mask)
+                                      starting_stack=self.starting_stack, legal_mask=mask,
+                                      version=self.model.feature_version)
         with torch.no_grad():
             logits, _value = self.model(torch.tensor([features], dtype=torch.float32),
                                         torch.tensor([mask], dtype=torch.bool))

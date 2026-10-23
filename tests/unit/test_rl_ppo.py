@@ -16,7 +16,7 @@ from pokerlab.engine.config import GameConfig
 from pokerlab.engine.table import Table
 from pokerlab.players.rl_agent import DecisionRecord
 from pokerlab.rl.action_space import ACTION_DIM
-from pokerlab.rl.features import FEATURE_VERSION, OBS_DIM
+from pokerlab.rl.features import FEATURE_VERSION, OBS_DIM, SUPPORTED_VERSIONS
 from pokerlab.rl.global_store import read_sidecar
 from pokerlab.rl.policy import EQUITY_SLOTS, PokerActorCritic
 from pokerlab.rl.pool_registry import (
@@ -33,6 +33,7 @@ from pokerlab.rl.ppo import (
     TrainingBatch,
     build_batch,
     build_model_from_checkpoint,
+    check_compatible,
     critic_weights,
     entropy_coefficient_at,
     learning_rate_at,
@@ -45,6 +46,7 @@ from pokerlab.rl.train import (
     SelfPlayTrainer,
     TrainConfig,
     entropy_settings,
+    parent_shape_mismatch,
     registry_opponents,
 )
 
@@ -292,7 +294,7 @@ def test_a_checkpoint_from_a_stale_feature_version_is_rejected(model, tmp_path):
     path = tmp_path / "old.pt"
     save_checkpoint(path, model)
     stale = torch.load(path, weights_only=True)
-    stale["feature_version"] = FEATURE_VERSION + 1
+    stale["feature_version"] = max(SUPPORTED_VERSIONS) + 1  # a version this build does not serve
     torch.save(stale, path)
 
     with pytest.raises(IncompatibleCheckpointError, match="different"):
@@ -321,7 +323,7 @@ def test_a_stale_or_unreadable_checkpoint_is_skipped_not_fatal(tmp_path):
     stale_path = tmp_path / "stale.pt"
     save_checkpoint(stale_path, tiny_model(hidden=32, num_layers=1))
     stale = torch.load(stale_path, weights_only=True)
-    stale["feature_version"] = FEATURE_VERSION + 1
+    stale["feature_version"] = max(SUPPORTED_VERSIONS) + 1  # a version this build does not serve
     torch.save(stale, stale_path)
 
     registry = PoolRegistry(directory=tmp_path)
@@ -1574,3 +1576,106 @@ def test_a_snapshot_with_no_anchors_to_rate_it_is_not_published(tmp_path, monkey
     assert label is None
     assert not (tmp_path / "models").exists() or not list((tmp_path / "models").glob("*.pt"))
     assert not list((tmp_path / "scratch").glob("*"))
+
+
+# ---- feature versions: the other version stays servable -------------------------------
+
+
+def test_a_model_of_the_other_feature_version_saves_loads_and_keeps_its_input_size(tmp_path):
+    from pokerlab.rl.features import OBS_DIM_V4
+
+    old = tiny_model(hidden=32, num_layers=1, feature_version=4)
+    assert (old.feature_version, old.obs_dim) == (4, OBS_DIM_V4)
+    path = tmp_path / "v4.pt"
+    save_checkpoint(path, old)
+
+    saved = torch.load(path, weights_only=True)
+    assert (saved["feature_version"], saved["obs_dim"]) == (4, OBS_DIM_V4)
+    check_compatible(saved, str(path))  # still served by this build
+
+    rebuilt, _checkpoint = build_model_from_checkpoint(path)
+    assert (rebuilt.feature_version, rebuilt.obs_dim) == (4, OBS_DIM_V4)
+    for before, after in zip(old.parameters(), rebuilt.parameters()):
+        assert torch.equal(before, after)
+
+    newest = tiny_model(hidden=32, num_layers=1)
+    assert (newest.feature_version, newest.obs_dim) == (FEATURE_VERSION, OBS_DIM)
+    assert newest.trunk[0].in_features != old.trunk[0].in_features
+
+
+def test_weights_of_another_feature_version_are_not_loaded_into_this_network(tmp_path):
+    path = tmp_path / "v4.pt"
+    save_checkpoint(path, tiny_model(hidden=32, num_layers=1, feature_version=4))
+
+    with pytest.raises(IncompatibleCheckpointError, match="feature version 4"):
+        load_checkpoint(path, tiny_model(hidden=32, num_layers=1))
+
+
+def test_a_model_cannot_claim_a_size_its_version_does_not_have():
+    with pytest.raises(ValueError, match="has .* features"):
+        PokerActorCritic(obs_dim=OBS_DIM + 1, equity=tiny_model().equity)
+    with pytest.raises(ValueError, match="not one this build serves"):
+        tiny_model(feature_version=99)
+
+
+def test_a_parent_must_read_the_same_feature_version(tmp_path):
+    from pokerlab.rl.train import same_network_filter
+
+    old = tiny_model(hidden=32, num_layers=1, feature_version=4)
+    new = tiny_model(hidden=32, num_layers=1)
+    save_checkpoint(tmp_path / "old.pt", old, None, iteration=0)
+    save_checkpoint(tmp_path / "new.pt", new, None, iteration=0)
+
+    accepts = same_network_filter(new.shape, new.equity)
+    assert accepts(tmp_path / "new.pt") and not accepts(tmp_path / "old.pt")
+    assert same_network_filter(old.shape, old.equity, 4)(tmp_path / "old.pt")
+
+    # a run that resumes from it starts from scratch instead, naming what differs
+    found = parent_shape_mismatch(tmp_path / "old.pt", new.shape, new.equity)
+    assert found is not None and found["feature_version"] == 4
+    assert parent_shape_mismatch(tmp_path / "new.pt", new.shape, new.equity) is None
+
+
+def test_the_policy_function_carries_the_version_of_its_model():
+    from pokerlab.rl.policy import make_policy_fn
+
+    assert make_policy_fn(tiny_model(feature_version=4)).feature_version == 4
+    assert make_policy_fn(tiny_model()).feature_version == FEATURE_VERSION
+
+
+def test_a_learner_trains_against_pool_models_of_the_other_feature_version(tmp_path):
+    """The store keeps its version-4 models: a run on version 3 draws them as
+    opponents like any other, and each is fed the vector it was trained on (a model given
+    another version's would fail on the shape of its first layer, not play badly)."""
+    from pokerlab.rl.features import OBS_DIM_V4
+
+    game = fixed_mix(3)
+    save_checkpoint(tmp_path / "veteran.pt", tiny_model(hidden=32, num_layers=1, feature_version=4))
+    registry = PoolRegistry(directory=tmp_path)
+    registry.members["veteran"] = PoolMember(label="veteran", ref="veteran.pt")
+    opponents = registry_opponents(registry, game, count=1)
+    assert [o.label for o in opponents] == ["veteran"]
+
+    widths: set[int] = set()
+
+    def record(module, args, _output):
+        if isinstance(module, PokerActorCritic):
+            widths.add(args[0].shape[1])
+
+    handle = torch.nn.modules.module.register_module_forward_hook(record)
+    try:
+        trainer = SelfPlayTrainer(
+            game,
+            TrainConfig(hands_per_iteration=12, opponent_probability=1.0),
+            PPOConfig(epochs=1, minibatch_size=64),
+            rng=random.Random(0),
+            **tiny_parts(hidden=32, num_layers=1),
+            extra_opponents=opponents,
+        )
+        stats = trainer.train_iteration()
+    finally:
+        handle.remove()
+
+    assert stats["decisions"] > 0
+    assert trainer.model.feature_version == FEATURE_VERSION
+    assert widths == {OBS_DIM, OBS_DIM_V4}, "the learner read its own vector, the veteran its own"

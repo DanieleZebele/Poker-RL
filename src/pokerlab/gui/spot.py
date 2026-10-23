@@ -37,7 +37,6 @@ randomising it puts any card anywhere, and the engine deals normally from it.
 
 from __future__ import annotations
 
-import random
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
@@ -49,6 +48,7 @@ from pokerlab.engine.actions import (
     IllegalActionError,
     LegalAction,
 )
+from pokerlab.engine.arranged_deal import ArrangingRandom, deal_positions
 from pokerlab.engine.config import GameConfig
 from pokerlab.engine.state import ActionRecord, Street
 from pokerlab.engine.table import Table
@@ -108,52 +108,6 @@ def format_card(card: Card) -> str:
     symbol = {v: k for k, v in _RANK_BY_SYMBOL.items()}[card.rank]
     suit = {v: k for k, v in _SUIT_BY_SYMBOL.items()}[card.suit]
     return f"{symbol}{suit}"
-
-
-class ArrangingRandom(random.Random):
-    """A `random.Random` whose `shuffle` deals the cards you asked for.
-
-    `Deck.shuffle()` calls `rng.shuffle(cards)` on a freshly ordered 52-card
-    list, and that is the only thing a hand uses its rng for. Overriding it is
-    therefore enough to control the whole deal without any engine change, and it
-    keeps the engine dealing normally rather than being handed a rigged deck.
-
-    `placements` maps a position in the deal order to a card. Positions the caller
-    left out are filled with whatever is left, shuffled by the underlying
-    generator so two unspecified opponents do not always hold the same hand.
-    """
-
-    def __init__(self, placements: dict[int, Card], seed: int | None = None) -> None:
-        super().__init__(seed)
-        self._placements = dict(placements)
-
-    def shuffle(self, x, random=None) -> None:
-        wanted = set(self._placements.values())
-        if len(wanted) != len(self._placements):
-            raise ValueError("la stessa carta e' stata assegnata a due posizioni")
-        rest = [card for card in x if card not in wanted]
-        super().shuffle(rest)
-        spare = iter(rest)
-        arranged = [self._placements.get(index) or next(spare) for index in range(len(x))]
-        x[:] = arranged
-
-
-def deal_positions(num_players: int) -> dict[str, list[int]]:
-    """Where each thing sits in the deal order `play_hand` consumes.
-
-    Two cards per seated player in seat order, then the flop, the turn and the
-    river with no burn card. Pinned by a test that plays a hand and checks the
-    cards came out where this says they would -- if the engine's dealing ever
-    changes, that is the test that fails.
-    """
-    hole = {seat: [2 * seat, 2 * seat + 1] for seat in range(num_players)}
-    board = 2 * num_players
-    return {
-        **{f"seat{seat}": slots for seat, slots in hole.items()},
-        "flop": [board, board + 1, board + 2],
-        "turn": [board + 3],
-        "river": [board + 4],
-    }
 
 
 @dataclass
@@ -565,7 +519,7 @@ def advise(
     labels = bin_labels()
 
     mask = legal_action_mask(observation, legal_actions)
-    by_stack: dict[int, list[float]] = {}  # features per normalisation constant
+    by_encoding: dict[tuple[int, int], list[float]] = {}  # features per (version, normalisation constant)
     actions = [
         action_index_to_action(index, observation, legal_actions) if legal else None
         for index, legal in enumerate(mask)
@@ -575,11 +529,16 @@ def advise(
     for label, rating, model in models:
         model.to(device)
         starting_stack = round(getattr(model, "feature_stack_bb", DEFAULT_STACK_MAX_BB) * big_blind)
-        if starting_stack not in by_stack:
-            by_stack[starting_stack] = encode_observation(
-                observation, big_blind=big_blind, starting_stack=starting_stack, legal_mask=mask
+        version = model.feature_version
+        if (version, starting_stack) not in by_encoding:
+            by_encoding[(version, starting_stack)] = encode_observation(
+                observation,
+                big_blind=big_blind,
+                starting_stack=starting_stack,
+                legal_mask=mask,
+                version=version,
             )
-        features = by_stack[starting_stack]
+        features = by_encoding[(version, starting_stack)]
         with torch.no_grad():
             logits, value = model(
                 torch.tensor([features], dtype=torch.float32, device=device),

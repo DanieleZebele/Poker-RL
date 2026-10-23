@@ -1,3 +1,10 @@
+"""The version-3 layout of the observation encoding, pinned as it was.
+
+Version 3 is still served (a published model of that version keeps playing), so these tests
+stay as its regression suite: the names below are its sizes, and everything is encoded with
+`version=3`. The newest encoding is in `test_rl_features_v4.py`.
+"""
+
 from __future__ import annotations
 
 import dataclasses
@@ -23,17 +30,17 @@ from pokerlab.rl.features import (
     HISTORY_DIM,
     MASK_DIM,
     MAX_SEATS,
-    OBS_DIM,
-    POT_SCALARS_DIM,
-    SEAT_BASE_FEATURES,
-    SEAT_FEATURES,
-    SEATS_DIM,
     STREET_DIM,
     _card_index,
     chips_at_stake,
     committed_by_seat,
     encode_observation,
 )
+from pokerlab.rl.features import OBS_DIM_V3 as OBS_DIM
+from pokerlab.rl.features import POT_SCALARS_DIM_V3 as POT_SCALARS_DIM
+from pokerlab.rl.features import SEAT_BASE_FEATURES_V3 as SEAT_BASE_FEATURES
+from pokerlab.rl.features import SEAT_FEATURES_V3 as SEAT_FEATURES
+from pokerlab.rl.features import SEATS_DIM_V3 as SEATS_DIM
 
 BIG_BLIND = 2
 STARTING_STACK = 200
@@ -50,6 +57,7 @@ def encode(observation: Observation, legal_actions: list[LegalAction]) -> list[f
         big_blind=BIG_BLIND,
         starting_stack=STARTING_STACK,
         legal_mask=legal_action_mask(observation, legal_actions),
+        version=3,
     )
 
 
@@ -326,3 +334,4 @@ def test_more_statistics_than_the_encoding_has_room_for_is_an_error_not_a_trunca
     too_many = tuple([0.5] * (STAT_SLOTS + 1))
     with pytest.raises(ValueError, match="room for"):
         encode(dataclasses.replace(build_observation(hs, 0), seat_stats={1: too_many}), legal)
+

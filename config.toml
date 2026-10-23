@@ -25,17 +25,17 @@ allin_runouts = 20      # a hand all-in before the river trains on its expected 
 critic_stack_power = 1.4  # the critic's loss weighs a decision by (chips at stake in bb)^-1.4: the target's sd grows ~stake^0.7 (0: off)
 
 lr_anneal_iterations = 1000   # every worker's learning rate falls geometrically from its own lr (swept/inherited, [starting-point]) to lr_anneal_final over its run's first 500 iterations, then stays (0: constant lr)
-lr_anneal_final = 0.0001  # the rate at the end of the annealing (absolute value, the same for every worker)
-entropy_anneal_iterations = 200  # every worker's entropy bonus falls geometrically over its run's first 500 iterations, then stays final (0: no annealing, the bonus is entropy_anneal_final throughout)
-entropy_anneal_start = 0.01       # the bonus at the first iteration of every run, inherited parent or not
+lr_anneal_final = 0.00003  # the rate at the end of the annealing (absolute value, the same for every worker)
+entropy_anneal_iterations = 100  # every worker's entropy bonus falls geometrically over its run's first 500 iterations, then stays final (0: no annealing, the bonus is entropy_anneal_final throughout)
+entropy_anneal_start = 0.005       # the bonus at the first iteration of every run, inherited parent or not
 entropy_anneal_final = 0.00001    
 
 [styles]
-style_share = 0.0   # share of the opponent seats (pool models) that play with a random style for a table's hands; 0 = off
+style_share = 0.5   # share of the opponent seats (pool models) that play with a random style for a table's hands; 0 = off
 style_spread = 0.75               # sd of each style axis (normal around 0, cut at +-1): most styles are mild, few extreme
 style_temperature_spread = 0.2   # sd of the log of a style's temperature (cut to a factor of 2 either way)
 style_jitter = 0.1               # sd of the noise on the shape of a style's push
-style_scales = [10.0, 16.0, 16.0, 8.0, 10.0]
+style_scales = [5.0, 8.0, 8.0, 4.0, 8.0]
 
 [network]
 hidden = 512        # width of each trunk's layers (policy and critic have one each, same shape, separate weights)
@@ -57,7 +57,7 @@ parent_tiers = "5, 10, 100, all"   # Where a worker's parent comes from.
 [starting-point]
 lr = 0.0001
 hands = 20000                # per iteration 
-opponent_probability = 0.5
+opponent_probability = 0.8
 ppo_epochs = 5
 clip_epsilon = 0.2
 minibatch_size = 10000
@@ -69,9 +69,9 @@ pool_top_share = 0.8
 pool_top_n = 100
 
 [sweep]
-inherit_hyperparameters = false    # true: a worker perturbs its parent's settings (the sweep). false: every worker uses exactly [starting-point], no perturbation, no optimizer
+inherit_hyperparameters = true    # true: a worker perturbs its parent's settings (the sweep). false: every worker uses exactly [starting-point], no perturbation, no optimizer
 hp_multipliers = [0.8, 1.0, 1.3]
-sweep_optimizer = false    # true: steer the multipliers by Elo gained per unit of CPU (uniform until warmed up). false: uniform draw, the estimate is still logged
+sweep_optimizer = true    # true: steer the multipliers by Elo gained per unit of CPU (uniform until warmed up). false: uniform draw, the estimate is still logged
 sweep_explore = 0.35       # chance an axis is drawn uniformly anyway (keeps every effect measurable)
 sweep_warmup = 150         # children observed before the optimizer steers
 sweep_window = 1500        # most recent children it reads
@@ -102,7 +102,7 @@ fill_sessions = 10
 
 [pruning]
 global_trigger_size = 500
-global_eliminate_fraction = 0.05
+global_eliminate_fraction = 0.1
 global_protect_percentile = 0.0
 
 [anchors]

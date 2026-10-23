@@ -473,7 +473,8 @@ def _ask(model, spots: Sequence[tuple[Observation, list[LegalAction]]]) -> list[
     from pokerlab.rl.features import encode_observation
 
     masks = [legal_action_mask(obs, legal) for obs, legal in spots]
-    features = [encode_observation(obs, big_blind=BIG_BLIND, starting_stack=STACK, legal_mask=mask)
+    features = [encode_observation(obs, big_blind=BIG_BLIND, starting_stack=STACK, legal_mask=mask,
+                                   version=model.feature_version)
                 for (obs, _legal), mask in zip(spots, masks, strict=True)]
     with torch.no_grad():
         logits, _value = model(torch.tensor(features, dtype=torch.float32), torch.tensor(masks, dtype=torch.bool))
