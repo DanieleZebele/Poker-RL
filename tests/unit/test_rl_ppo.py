@@ -873,6 +873,10 @@ def _train_args(**overrides):
         "opponent_probability": 0.5,
         "minibatch_size": 1024, "gae_lambda": 0.95, "value_coef": 0.5, "policy_max_grad_norm": 0.5, "critic_max_grad_norm": 1.0,
         "pool_models": 20, "table_hands": 200, "concurrent_tables": 8, "pool_top_share": 0.5, "pool_top_n": 100,
+        "lr_anneal_final": 1e-5, "lr_anneal_iterations": 500, "entropy_anneal_start": 0.1,
+        "entropy_anneal_final": 1e-4, "entropy_anneal_iterations": 500, "style_share": 0.3,
+        "style_spread": 0.5, "style_temperature_spread": 0.2, "style_jitter": 0.1,
+        "critic_stack_power": 1.4,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -890,6 +894,9 @@ def test_run_metadata_records_every_swept_axis():
         "lr", "hands", "ppo_epochs", "clip_epsilon",
         "opponent_probability", "pool_top_share", "pool_top_n",
         "minibatch_size", "gae_lambda", "value_coef", "policy_max_grad_norm", "critic_max_grad_norm",
+        "lr_anneal_final", "lr_anneal_iterations", "entropy_anneal_start", "entropy_anneal_final",
+        "entropy_anneal_iterations", "style_share", "style_spread", "style_temperature_spread",
+        "style_jitter", "critic_stack_power",
     ):
         assert axis in recorded, axis
     assert (recorded["lr"], recorded["hands"], recorded["ppo_epochs"]) == (7e-4, 1024, 2)

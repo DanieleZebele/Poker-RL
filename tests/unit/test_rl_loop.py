@@ -11,6 +11,7 @@ import importlib.util
 import json
 import os
 import random
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -630,6 +631,13 @@ def test_a_parent_that_vanished_leaves_the_worker_fresh(tmp_path, monkeypatch):
 # ---- the per-worker hyperparameter sweep -----------------------------------------
 
 
+# A parent with the annealing curves and the styled opponents switched on.
+SWITCHED_ON = {
+    "lr_anneal_iterations": 500, "entropy_anneal_iterations": 500, "style_share": 0.3,
+    "critic_stack_power": 1.4,
+}
+
+
 def a_parent(**overrides):
     """A parent's run metadata, sitting on the fleet's own default settings."""
     values = {
@@ -645,6 +653,16 @@ def a_parent(**overrides):
         "gae_lambda": 0.95,
         "value_coef": 0.5,
         "policy_max_grad_norm": 0.5, "critic_max_grad_norm": 1.0,
+        "lr_anneal_final": 1e-5,
+        "lr_anneal_iterations": 0,
+        "entropy_anneal_start": 0.1,
+        "entropy_anneal_final": 1e-4,
+        "entropy_anneal_iterations": 0,
+        "style_share": 0.0,
+        "style_spread": 0.5,
+        "style_temperature_spread": 0.2,
+        "style_jitter": 0.1,
+        "critic_stack_power": 0.0,
     }
     values.update(overrides)
     return values
@@ -756,6 +774,72 @@ def test_a_count_axis_never_reaches_zero():
         perturb_hyperparameters(a_parent(), random.Random(seed)).ppo_epochs
         for seed in range(40)
     } == {3, 4, 5}
+
+
+def test_a_switched_off_annealing_or_style_stays_off():
+    """0 annealing iterations is "no annealing", not a short curve, and a 0 share is
+    no styled seats: a step must not switch either on. Above 0 they move as usual."""
+    off = a_parent(
+        lr_anneal_iterations=0, entropy_anneal_iterations=0, style_share=0.0, style_jitter=0.0,
+        critic_stack_power=0.0,
+    )
+    children = [perturb_hyperparameters(off, random.Random(seed)) for seed in range(60)]
+    assert all(
+        (c.lr_anneal_iterations, c.entropy_anneal_iterations, c.style_share, c.style_jitter,
+         c.critic_stack_power)
+        == (0, 0, 0.0, 0.0, 0.0)
+        for c in children
+    )
+    on = [perturb_hyperparameters(a_parent(**SWITCHED_ON), random.Random(seed)) for seed in range(60)]
+    assert {c.lr_anneal_iterations for c in on} == {400, 500, 600}
+    assert {c.entropy_anneal_iterations for c in on} == {400, 500, 600}
+    assert len({c.style_share for c in on}) == 3
+    assert {round(c.critic_stack_power, 6) for c in on} == {1.12, 1.4, 1.68}
+
+
+def test_the_style_share_is_capped_at_one():
+    children = [perturb_hyperparameters(a_parent(style_share=1.0), random.Random(s)) for s in range(40)]
+    assert max(c.style_share for c in children) == 1.0
+
+
+def test_an_axis_the_parent_recorded_only_in_its_settings_is_inherited():
+    """A model published before an axis joined the sweep has it only in the `settings`
+    it resolved to; that is what it trained with, so its child inherits it instead of
+    falling back to the file for every axis."""
+    parent = a_parent(**SWITCHED_ON)
+    settings = {axis: parent.pop(axis) for axis in ("style_share", "entropy_anneal_start")}
+    parent["settings"] = settings
+    child = perturb_hyperparameters(parent, random.Random(0))
+    assert child is not None and child.arm == HP_ARM_INHERITED
+    assert any(child.style_share == pytest.approx(0.3 * m) for m in HP_MULTIPLIERS)
+
+
+def test_a_worker_trains_with_its_own_annealing_and_style(tmp_path, monkeypatch):
+    hp = replace(
+        perturb_hyperparameters(a_parent(), random.Random(0)),
+        lr_anneal_final=2e-5, lr_anneal_iterations=700, entropy_anneal_start=0.05,
+        entropy_anneal_final=3e-4, entropy_anneal_iterations=90, style_share=0.25,
+        style_spread=0.6, style_temperature_spread=0.15, style_jitter=0.07,
+        critic_stack_power=1.12,
+    )
+    command, _ = capture_launch(tmp_path, monkeypatch, hp=hp)
+
+    def value(flag):
+        return command[command.index(flag) + 1]
+
+    assert value("--lr-anneal-final") == "2e-05"
+    assert value("--lr-anneal-iterations") == "700"
+    assert value("--entropy-anneal-start") == "0.05"
+    assert value("--entropy-anneal-final") == "0.0003"
+    assert value("--entropy-anneal-iterations") == "90"
+    assert value("--style-share") == "0.25"
+    assert value("--style-spread") == "0.6"
+    assert value("--style-temperature-spread") == "0.15"
+    assert value("--style-jitter") == "0.07"
+    assert value("--critic-stack-power") == "1.12"
+    # The calibrated scales are the fleet's, not the worker's.
+    scales = command.index("--style-scales")
+    assert command[scales + 1 : scales + 6] == ["1.0"] * 5
 
 
 def test_a_parent_whose_settings_are_unknown_is_not_inherited_from():
@@ -904,6 +988,9 @@ def test_the_settings_are_read_back_out_of_a_real_checkpoint(tmp_path):
         clip_epsilon=0.25, opponent_probability=0.62,
         pool_models=20, table_hands=200, concurrent_tables=8, pool_top_share=0.5, pool_top_n=100,
         minibatch_size=1024, gae_lambda=0.95, value_coef=0.5, policy_max_grad_norm=0.5, critic_max_grad_norm=1.0,
+        lr_anneal_final=1e-5, lr_anneal_iterations=500, entropy_anneal_start=0.1, entropy_anneal_final=1e-4,
+        entropy_anneal_iterations=500, style_share=0.3, style_spread=0.5, style_temperature_spread=0.2,
+        style_jitter=0.1, critic_stack_power=1.4,
     )
     path = tmp_path / "agent.pt"
     save_checkpoint(path, tiny_model(), iteration=100, metadata=run_metadata(args))

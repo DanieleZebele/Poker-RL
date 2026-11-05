@@ -169,13 +169,33 @@ def test_too_few_children_fit_nothing():
     assert fit_estimate(synthetic(MIN_FIT - 1, beta={}), AXES, COMPLEMENT) is None
 
 
-def test_a_child_with_no_cpu_time_or_a_missing_axis_is_not_used():
+def test_a_child_with_no_cpu_time_or_an_axis_on_one_side_only_is_not_used():
     good = synthetic(MIN_FIT + 5, beta={})
+    without_hands = {axis: value for axis, value in BASE.items() if axis != "hands"}
     bad = [
         SweepObservation("z0", "p", 1500, 1500, 0.0, dict(BASE), dict(BASE)),
-        SweepObservation("z1", "p", 1500, 1500, 5.0, {"lr": 1.0}, {"lr": 1.0}),
+        # The parent's `hands` is unknown, so the step is.
+        SweepObservation("z1", "p", 1500, 1500, 5.0, dict(BASE), without_hands),
     ]
     assert fit_estimate(good + bad, AXES, COMPLEMENT).observations == len(good)
+
+
+def test_children_observed_before_an_axis_joined_the_sweep_still_count():
+    """An axis added to the sweep is on neither side of the children already observed:
+    they ran it at the fleet's value, so it is a step of 0 for them, and they still
+    say what the other axes did. Without this every new axis would throw the whole
+    evidence away."""
+    old = synthetic(400, beta={"lr": 30.0}, seed=3)
+    for child in old:
+        del child.settings["clip_epsilon"], child.parent_settings["clip_epsilon"]
+    new = synthetic(40, beta={"lr": 30.0}, seed=4)
+    estimate = fit_estimate(old + new, AXES, COMPLEMENT)
+    assert estimate.observations == 440
+    lr = AXES.index("lr")
+    assert estimate.beta[lr] > 2 * estimate.beta_sd(lr)
+    # Only the 40 children that have it inform the new axis: still close to the prior.
+    clip = AXES.index("clip_epsilon")
+    assert estimate.beta_sd(clip) > estimate.beta_sd(lr)
 
 
 def test_the_gain_a_unit_of_cost_is_worth_never_goes_below_the_floor():
@@ -322,6 +342,10 @@ def test_the_plan_with_a_policy_still_has_every_axis_and_every_worker():
             lr=3e-4, hands=512, opponent_probability=0.5, ppo_epochs=4, clip_epsilon=0.2,
             pool_top_share=0.5, pool_top_n=100, minibatch_size=1024, gae_lambda=0.95,
             value_coef=0.5, policy_max_grad_norm=0.5, critic_max_grad_norm=1.0,
+            lr_anneal_final=1e-5, lr_anneal_iterations=500, entropy_anneal_start=0.1,
+            entropy_anneal_final=1e-4, entropy_anneal_iterations=500, style_share=0.3,
+            style_spread=0.5, style_temperature_spread=0.2, style_jitter=0.1,
+            critic_stack_power=1.4,
         )
     )
     plan = hyperparameter_plan(5, [None] * 5, start, rng=random.Random(1), policy=policy)
@@ -375,6 +399,34 @@ def test_a_worker_with_no_step_to_report_leaves_nothing(tmp_path, extra, parent_
         parent_settings=parent_settings, rating=1510.0, cpu_seconds=10.0,
     )
     assert read_observations(tmp_path) == []
+
+
+def test_the_annealing_and_style_settings_are_steps_of_the_observation(tmp_path):
+    from pokerlab.rl.train import record_sweep_observation
+
+    args = train_args(
+        tmp_path, "--resume", "--parent-label", "p", "--entropy-anneal-start", "0.02",
+        "--lr-anneal-iterations", "300", "--style-share", "0.4", "--style-jitter", "0.05",
+    )
+    record_sweep_observation(
+        args, label="c", parent_rating=1500.0, parent_settings=PARENT_SETTINGS,
+        rating=1510.0, cpu_seconds=10.0,
+    )
+    [seen] = read_observations(tmp_path)
+    assert seen.settings["entropy_anneal_start"] == 0.02
+    assert seen.settings["lr_anneal_iterations"] == 300
+    assert seen.settings["style_share"] == 0.4 and seen.settings["style_jitter"] == 0.05
+    assert set(HP_AXES) <= set(seen.settings)
+
+
+def test_a_parent_published_before_an_axis_was_swept_is_read_from_its_settings():
+    """The value it trained with is in the `settings` it recorded, so its step is
+    known: the top level wins where both have it."""
+    from pokerlab.rl.train import recorded_axes
+
+    metadata = {"lr": 3e-4, "hp_arm": "inherited", "settings": {"lr": 9.0, "style_share": 0.5, "machine_note": "x"}}
+    assert recorded_axes(metadata) == {"lr": 3e-4, "style_share": 0.5}
+    assert recorded_axes(None) == {} and recorded_axes({"settings": "junk"}) == {}
 
 
 def test_the_parent_is_recorded_in_the_published_model(tmp_path):

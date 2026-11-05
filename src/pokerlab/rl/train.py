@@ -746,7 +746,48 @@ REPORTED_AXES = (
     # which is the strength these two actually produced.
     "pool_top_share",
     "pool_top_n",
+    # The annealing curves (the learning rate starts at `lr`) and how the styled
+    # opponents are drawn: swept like the rest.
+    "lr_anneal_final",
+    "lr_anneal_iterations",
+    "entropy_anneal_start",
+    "entropy_anneal_final",
+    "entropy_anneal_iterations",
+    "style_share",
+    "style_spread",
+    "style_temperature_spread",
+    "style_jitter",
+    "critic_stack_power",
 )
+
+# Where the annealing curves start when neither a flag nor `config.toml` says,
+# shared by `poker-train` and `poker-loop`.
+DEFAULT_ENTROPY_ANNEAL_START = 0.1
+DEFAULT_ENTROPY_ANNEAL_FINAL = 0.0001
+DEFAULT_LR_ANNEAL_FINAL = 1e-5
+
+
+def recorded_axes(metadata: dict | None) -> dict[str, float]:
+    """The numeric value of every reported axis a run's metadata records.
+
+    An axis is read at the top level of the metadata, and failing that from the
+    `settings` the run resolved to (`config.resolved_settings`): an axis that joined
+    the sweep after a model was published is not at the top level of its metadata,
+    but the value it trained with is in its settings, so its children still inherit
+    it and its step still counts as evidence for the sweep optimizer.
+    """
+    if not isinstance(metadata, dict):
+        return {}
+    settings = metadata.get("settings")
+    sources = [metadata, settings if isinstance(settings, dict) else {}]
+    found: dict[str, float] = {}
+    for axis in REPORTED_AXES:
+        for source in sources:
+            value = source.get(axis)
+            if isinstance(value, int | float) and not isinstance(value, bool):
+                found[axis] = value
+                break
+    return found
 
 
 def add_network_arguments(parser: argparse.ArgumentParser) -> None:
@@ -917,6 +958,16 @@ def run_metadata(args: argparse.Namespace) -> dict:
         "concurrent_tables": args.concurrent_tables,
         "pool_top_share": args.pool_top_share,
         "pool_top_n": args.pool_top_n,
+        "lr_anneal_final": args.lr_anneal_final,
+        "lr_anneal_iterations": args.lr_anneal_iterations,
+        "entropy_anneal_start": args.entropy_anneal_start,
+        "entropy_anneal_final": args.entropy_anneal_final,
+        "entropy_anneal_iterations": args.entropy_anneal_iterations,
+        "style_share": args.style_share,
+        "style_spread": args.style_spread,
+        "style_temperature_spread": args.style_temperature_spread,
+        "style_jitter": args.style_jitter,
+        "critic_stack_power": args.critic_stack_power,
         # Everything else the run resolved to (evaluation, population pass,
         # fill-in...): with a config file, a run's settings are no longer
         # recoverable from its command line.
@@ -942,12 +993,7 @@ def record_sweep_observation(
     """
     if not (args.resume and args.parent_label and parent_settings):
         return
-    recorded = run_metadata(args)
-    settings = {
-        axis: recorded[axis]
-        for axis in REPORTED_AXES
-        if isinstance(recorded.get(axis), int | float) and not isinstance(recorded.get(axis), bool)
-    }
+    settings = recorded_axes(run_metadata(args))
     try:
         write_observation(
             args.global_dir,
@@ -1153,10 +1199,11 @@ def refreshed_opponents(
 
 
 def entropy_settings(args: argparse.Namespace) -> dict[str, float | int]:
-    """The entropy bonus fields of `PPOConfig`, the same for every worker: the fleet's
-    annealing curve from `--entropy-anneal-start` to `--entropy-anneal-final` over
-    `--entropy-anneal-iterations`, or, with 0 iterations, the final value from the first
-    update. None of it is swept or inherited: it is read from `config.toml`."""
+    """The entropy bonus fields of `PPOConfig`: the annealing curve from
+    `--entropy-anneal-start` to `--entropy-anneal-final` over `--entropy-anneal-iterations`,
+    or, with 0 iterations, the final value from the first update. All three are axes of
+    the sweep: `poker-loop` hands each worker its own, inherited from its parent and
+    perturbed (`config.toml` is where a worker with no parent starts)."""
     if args.entropy_anneal_iterations:
         return {
             "entropy_coefficient": args.entropy_anneal_start,
@@ -1388,15 +1435,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="iterations over which the entropy bonus falls from --entropy-anneal-start to "
         "--entropy-anneal-final, geometrically, counted from the start of THIS run (a worker "
         "that inherited a trained parent starts the curve again); 0 = no annealing, the bonus "
-        "is --entropy-anneal-final from the first update. Fleet-wide: read from config.toml, "
-        "not swept",
+        "is --entropy-anneal-final from the first update. An axis of poker-loop's sweep",
     )
     parser.add_argument(
-        "--entropy-anneal-start", type=float, default=0.1,
+        "--entropy-anneal-start", type=float, default=DEFAULT_ENTROPY_ANNEAL_START,
         help="entropy bonus at a run's first iteration (unused without annealing)",
     )
     parser.add_argument(
-        "--entropy-anneal-final", type=float, default=0.0001,
+        "--entropy-anneal-final", type=float, default=DEFAULT_ENTROPY_ANNEAL_FINAL,
         help="entropy bonus once the annealing is over (the whole run's, without annealing)",
     )
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -1404,10 +1450,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--lr-anneal-iterations", type=int, default=0,
         help="iterations over which the learning rate falls from --lr (the worker's own, swept "
         "value) to --lr-anneal-final, geometrically, counted from the start of THIS run; "
-        "0 = constant. Fleet-wide: read from config.toml, not swept",
+        "0 = constant. An axis of poker-loop's sweep",
     )
     parser.add_argument(
-        "--lr-anneal-final", type=float, default=1e-5,
+        "--lr-anneal-final", type=float, default=DEFAULT_LR_ANNEAL_FINAL,
         help="the learning rate once the annealing is over, an absolute value (unused "
         "without annealing)",
     )
@@ -1493,7 +1539,7 @@ def build_parser() -> argparse.ArgumentParser:
         "blinds to this power, negated (0: every decision alike). The target's spread "
         "grows with the stake, so without it the critic learns the deep hands and "
         "ignores the short ones; a weight on the state alone leaves the policy's "
-        "objective unchanged",
+        "objective unchanged. An axis of poker-loop's sweep",
     )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
@@ -1787,13 +1833,7 @@ def main() -> None:
         # the file is the source of truth for the frozen encoder
         load_encoder_weights(trainer.model.equity_encoder, equity_saved)
         trainer.sync_play_model()
-        parent_settings = {
-            axis: value
-            for axis, value in (resumed.get("metadata") or {}).items()
-            if axis in REPORTED_AXES
-            and isinstance(value, int | float)
-            and not isinstance(value, bool)
-        }
+        parent_settings = recorded_axes(resumed.get("metadata"))
         print(
             f"resumed from {args.checkpoint} "
             f"(rating ereditato {trainer.learner_rating:.0f})"

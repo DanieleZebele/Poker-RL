@@ -18,24 +18,13 @@ sb = 50
 bb = 100
 
 [training]
-iterations = 2000
+iterations = 1000
 table_hands = 100       # hands a training table keeps the same players: the opponent statistics fill in over them
 concurrent_tables = 8   # tables played in turn, so a batch is not the same few opponents
 allin_runouts = 20      # a hand all-in before the river trains on its expected result over this many boards (0: the real chips)
-critic_stack_power = 1.4  # the critic's loss weighs a decision by (chips at stake in bb)^-1.4: the target's sd grows ~stake^0.7 (0: off)
-
-lr_anneal_iterations = 1000   # every worker's learning rate falls geometrically from its own lr (swept/inherited, [starting-point]) to lr_anneal_final over its run's first 500 iterations, then stays (0: constant lr)
-lr_anneal_final = 0.00003  # the rate at the end of the annealing (absolute value, the same for every worker)
-entropy_anneal_iterations = 100  # every worker's entropy bonus falls geometrically over its run's first 500 iterations, then stays final (0: no annealing, the bonus is entropy_anneal_final throughout)
-entropy_anneal_start = 0.005       # the bonus at the first iteration of every run, inherited parent or not
-entropy_anneal_final = 0.00001    
 
 [styles]
-style_share = 0.5   # share of the opponent seats (pool models) that play with a random style for a table's hands; 0 = off
-style_spread = 0.75               # sd of each style axis (normal around 0, cut at +-1): most styles are mild, few extreme
-style_temperature_spread = 0.2   # sd of the log of a style's temperature (cut to a factor of 2 either way)
-style_jitter = 0.1               # sd of the noise on the shape of a style's push
-style_scales = [5.0, 8.0, 8.0, 4.0, 8.0]
+style_scales = [5.0, 8.0, 8.0, 4.0, 8.0]   # the unit of each style axis, from the calibration study: fleet-wide, not swept (share, spread, temperature and jitter are in [starting-point])
 
 [network]
 hidden = 512        # width of each trunk's layers (policy and critic have one each, same shape, separate weights)
@@ -67,6 +56,18 @@ policy_max_grad_norm = 0.7  # the policy's gradient clip
 critic_max_grad_norm = 0.5   # the critic's gradient clip: its own, the two networks share no weight
 pool_top_share = 0.8
 pool_top_n = 100
+# the annealing curves, counted from the start of each worker's own run (0 iterations: no annealing; 0 stays 0 under the sweep)
+lr_anneal_iterations = 1000   # the learning rate falls geometrically from the worker's lr to lr_anneal_final over this many iterations, then stays
+lr_anneal_final = 0.00003     # the rate at the end of the annealing (absolute value)
+entropy_anneal_iterations = 100  # the entropy bonus falls geometrically from start to final over this many iterations, then stays final
+entropy_anneal_start = 0.005  # the bonus at a run's first iteration, inherited parent or not
+entropy_anneal_final = 0.00001
+# the opponents with a random style (0 share: none, and it stays 0 under the sweep)
+style_share = 0.5             # share of the opponent seats (pool models) that play with a random style for a table's hands (capped at 1)
+style_spread = 0.75           # sd of each style axis (normal around 0, cut at +-1): most styles are mild, few extreme
+style_temperature_spread = 0.2  # sd of the log of a style's temperature (cut to a factor of 2 either way)
+style_jitter = 0.1            # sd of the noise on the shape of a style's push
+critic_stack_power = 1.1      # the critic's loss weighs a decision by (chips at stake in bb)^-power; inverse variance is 2x the exponent of sd ~ stake^a (a = 0.70 when set, 0.55 on 2026-11-05) (0: off, stays 0)
 
 [sweep]
 inherit_hyperparameters = true    # true: a worker perturbs its parent's settings (the sweep). false: every worker uses exactly [starting-point], no perturbation, no optimizer
@@ -106,14 +107,14 @@ global_eliminate_fraction = 0.1
 global_protect_percentile = 0.0
 
 [anchors]
-benchmark_games_percentile = 95.0
-benchmark_margin = 50.0
+benchmark_games_percentile = 90.0
+benchmark_margin = 30.0
 
 [benchmark-arena]
 arena_min_sessions = 10000      # never declare convergence before this many rated sessions
 arena_max_sessions = 100000     # safety cap, not a failure
 arena_tolerance = 1.0           # rating points of net drift over the window
-arena_window = 4000             # sessions the drift is measured across
+arena_window = 10000             # sessions the drift is measured across
 arena_checkpoint_sessions = 200  # sessions between two writes of the ratings (and convergence tests)
 
 

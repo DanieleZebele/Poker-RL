@@ -314,8 +314,8 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
   new target, so their explained variance jumps when it is switched on: do not compare
   readings across the change. Pinned in `tests/unit/test_rl_allin_reward.py`.
 - **The critic's loss weighs each decision by its stake** (`ppo.critic_weights`,
-  `--critic-stack-power`, `critic_stack_power` in `config.toml` `[training]`, 1.4; 0 = off,
-  forwarded by `poker-loop`): the squared error is multiplied by `stake_bb ** -power`,
+  `--critic-stack-power`, `critic_stack_power` in `config.toml` `[starting-point]`, 1.4; 0 = off;
+  an axis of the sweep, each lineage its own, 0 stays 0): the squared error is multiplied by `stake_bb ** -power`,
   rescaled to mean 1 over the batch, where the stake (`features.chips_at_stake`,
   `DecisionRecord.stake_bb`) is my chips for the hand (stack plus what I put in) against
   the deepest opponent still in it, floored at `MIN_STAKE_BB` 1. Why: the target's sd
@@ -588,23 +588,23 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
   iteration, a moderate `clip` fraction, and `entropy` drifting slowly down
   (ln 11 ≈ 2.4 is the uniform-over-all-bins ceiling). A climbing value loss or a
   `kl` above ~0.05 per iteration means the step size is too large.
-- **The entropy bonus is a curve the whole fleet follows, not a swept setting**
-  (`ppo.entropy_coefficient_at`, `train.entropy_settings`, `[training]` in `config.toml`:
-  `entropy_anneal_start` 0.1, `entropy_anneal_final` 0.0001, `entropy_anneal_iterations` 500).
+- **The entropy bonus is a curve over a run, and its three numbers are sweep axes**
+  (`ppo.entropy_coefficient_at`, `train.entropy_settings`, `[starting-point]` in `config.toml`:
+  `entropy_anneal_start`, `entropy_anneal_final`, `entropy_anneal_iterations`).
   It falls geometrically from the start to the final value over the first N iterations *of a
   worker's own run*, then stays there; N = 0 is no annealing, the bonus being the final value
-  throughout. Every worker follows it, an inheriting one included, so a child restarts at the high
-  end however trained its parent is. `--entropy-coef` no longer exists: it was a sweep axis, and
-  an inherited 0 stayed 0 under any multiplier, so it could not be the start for everyone (that
-  also removed `_HP_SEED_FROM_ZERO` and the seed step in `sweep_optimizer.log_step`). A parent's
-  metadata may still carry the old key; nothing reads it. Pinned in `test_rl_ppo.py`
+  throughout. Every worker restarts the curve, an inheriting one included, so a child starts at the
+  high end however trained its parent is -- but the start, the end and N are the worker's own,
+  inherited from its parent and perturbed like every axis (`HP_AXES`); the file is where a worker
+  with no parent starts. N = 0 stays 0 under any multiplier (`_HP_ZERO_IS_OFF_AXES`): switching
+  annealing on is the file's decision. `--entropy-coef` no longer exists (a constant bonus is
+  N = 0); a parent's metadata may still carry the old key and nothing reads it. Pinned in `test_rl_ppo.py`
   (`test_the_entropy_bonus_falls_geometrically...`, `test_every_iteration_updates_with...`).
 - **The learning rate falls over a run too** (`ppo.learning_rate_at`, `--lr-anneal-iterations`,
-  `--lr-anneal-final`, `[training]` in `config.toml`: 500 iterations, final 1e-5). Unlike the
-  entropy bonus, `lr` stays a swept axis: the worker's own value (`--lr`, perturbed/inherited as
-  before) is where *its* curve starts, and the fleet-wide setting is the *absolute* rate every
-  run ends at, reached geometrically over the first N iterations *of the run*, then flat; N = 0
-  is a constant rate (the worker's `lr`). A worker whose swept `lr` ends up below the final
+  `--lr-anneal-final`, `[starting-point]` in `config.toml`). All three numbers are sweep axes: the
+  worker's own `lr` is where *its* curve starts, `lr_anneal_final` the *absolute* rate it ends at,
+  reached geometrically over the first `lr_anneal_iterations` iterations *of the run*, then flat;
+  N = 0 is a constant rate (the worker's `lr`) and stays 0 under the sweep. A worker whose swept `lr` ends up below the final
   value would see its rate rise toward it: nothing clamps that. `train_iteration` writes the rate into the optimizer's param groups before each
   update. The recorded `lr` (metadata, `iperparametri:`, the sweep's observations) is the starting
   one, so a lineage's drift in `lr` keeps its meaning. Pinned in `test_rl_ppo.py`.
@@ -703,8 +703,11 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
 - **Two gradient-norm clips, one per network** (`ppo.py`): `policy_max_grad_norm` (the old
   `max_grad_norm`) on the policy's trunk and head, `critic_max_grad_norm` on the critic's;
   both are axes of the sweep, starting from `config.toml` `[starting-point]`. A parent
-  published before an axis existed has no value for it, so its child starts from the file
-  (`sampled-fallback`) and an old sweep observation is left out of the optimizer's fit. The two networks share no weight, and their gradients live on
+  published before an axis existed is read from the `settings` its metadata recorded
+  (`train.recorded_axes`): what the fleet ran it with, which is what it trained with; only one
+  with the axis in neither place makes its child start from the file (`sampled-fallback`). A
+  sweep observation written before an axis existed has it on neither side and counts as a step
+  of 0 on it (`fit_estimate`); one with the axis on one side only is left out. The two networks share no weight, and their gradients live on
   different scales -- the policy's loss is of order 1 on normalised advantages, the
   critic's a squared error in the reward's unit -- so one clip over both cut each by a
   factor the other decided. Measured before the split, on a real worker: policy norm
@@ -1237,8 +1240,16 @@ and run at the speed of one), organised into generations.
   attributed afterwards to the settings that produced it.
   - **The axes** (`HP_AXES`): `--lr`, `--hands`, `--opponent-probability`,
     `--ppo-epochs`, `--clip-epsilon`, `--minibatch-size`, `--gae-lambda`,
-    `--value-coef`, `--policy-max-grad-norm`, `--critic-max-grad-norm` and the two that decide
-    how strong a field the worker draws, `--pool-top-share` and `--pool-top-n`.
+    `--value-coef`, `--policy-max-grad-norm`, `--critic-max-grad-norm`, the two that decide
+    how strong a field the worker draws, `--pool-top-share` and `--pool-top-n`, the annealing
+    curves (`--lr-anneal-final`, `--lr-anneal-iterations`, `--entropy-anneal-start`,
+    `--entropy-anneal-final`, `--entropy-anneal-iterations`) and how the styled opponents are
+    drawn (`--style-share`, `--style-spread`, `--style-temperature-spread`, `--style-jitter`),
+    and `--critic-stack-power`: 22 axes. **`--style-scales` is held fixed**: it is the calibration of each style axis's unit
+    (`style_calibration.py`), not a setting, and `--style-spread` already widens them all.
+    An axis at 0 stays at 0 (a float times anything; the two annealing counts by
+    `_HP_ZERO_IS_OFF_AXES`, where 0 is "off"), so a style share or an annealing switched off in
+    the file stays off.
     **`--pool-models`, `--global-sample` and `--global-sessions` are held fixed**:
     the first is the field's *size*, which is also what a run's cost scales with,
     and the last two are how the whole fleet's ratings are earned, so varying them
@@ -1271,7 +1282,7 @@ and run at the speed of one), organised into generations.
       generations). Accepted as it is.
     - **Only two limits survive, and neither is a range.** A probability axis is
       capped at 1.0 (`_HP_PROBABILITY_AXES`: `opponent_probability`,
-      `pool_top_share`), because a probability above 1 is not one and both reach
+      `pool_top_share`, `style_share`), because a probability above 1 is not one and both reach
       code that would quietly do something odd with it. And a **count axis moves
       by at least 1** whenever the multiplier is not 1.0, floored at 1
       (`_moved_count`).
@@ -1367,7 +1378,7 @@ and run at the speed of one), organised into generations.
       regression carries the parent's rating as a nuisance term for that.
     - **The model**: a Bayesian ridge regression of gain on the *realised* log-steps
       of every axis (`log_step`: the GAE lambda on its complement, a move off exactly
-      0 as a fixed step), prior sd `PRIOR_SD` 15 Elo per unit log-step so twelve noisy
+      0 as a fixed step), prior sd `PRIOR_SD` 15 Elo per unit log-step so twenty-two noisy
       coefficients do not chase noise; plus a ridge regression of log CPU on the log
       *levels*, which gives each axis a **cost elasticity**. The value of a step is
       `beta - G * elasticity` with `G = max(mean gain, --sweep-min-gain)`: the
@@ -1382,7 +1393,7 @@ and run at the speed of one), organised into generations.
       estimable. **Uniform until `--sweep-warmup` (150) children have been seen**, and
       then identical to the old draw from the same rng.
     - **Expect it to be slow and weak.** A gain is the difference of two ratings each
-      with sd ~10 Elo, a x1.2 step is worth a couple, so firming up twelve axes takes
+      with sd ~10 Elo, a x1.2 step is worth a couple, so firming up twenty-two axes takes
       hundreds of children (~6 generations of 25 workers just to warm up). The model
       is linear in the step and fitted over the last `--sweep-window` (1500) children:
       it says which way is uphill *where the fleet has been lately*, not where the
@@ -3512,6 +3523,9 @@ do the numbers.
     **The ranking moves while the fleet trains** (`#1` was another model a day earlier and
     mixing two in one file gave nonsense): the calibration pins the labels in its file and
     `--restart` discards it. Recalibrate when the population has moved far.
+  - **Share, spread, temperature spread and jitter are axes of the sweep** (`HP_AXES`, values in
+    `[starting-point]`): each lineage inherits and perturbs its own, so the optimizer can say whether
+    styled opponents pay. The scales stay fleet-wide (`[styles]`). A share of 0 stays 0.
   - **To do.** (1) Switch on (`style_share` ~0.2-0.3, off in the shipped file) on one
     machine with `--style-share` on its command line (a flag beats the shared file) and
     compare with the rest. (2) Judge it by:

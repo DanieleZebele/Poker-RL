@@ -18,12 +18,12 @@ much it moves the *log cost*, and `G` is the gain a typical child makes (floored
 objective upside down: with `G <= 0` more cost would look like a benefit).
 
 **How `beta` is estimated.** A Bayesian ridge regression of the gain on the
-realised log-steps of the twelve axes, with an intercept and the parent's rating as
+realised log-steps of the axes (`loop.HP_AXES`), with an intercept and the parent's rating as
 nuisance terms. The parent's rating is there because the parents are drawn from the
 top of the ranking, whose ratings are biased upward (a winner's curse), so a high
 parent regresses back and a plain average gain would be negative for reasons that
 have nothing to do with the settings. The prior shrinks every `beta` toward 0
-(`PRIOR_SD`), which is what keeps twelve noisy coefficients from chasing noise.
+(`PRIOR_SD`), which is what keeps twenty-two noisy coefficients from chasing noise.
 Noise is large against the effect -- a gain is the difference of two ratings, each
 with a standard deviation near 10 Elo, and one step of x1.2 is worth a couple of
 Elo -- so the estimate firms up over hundreds of children, not a handful.
@@ -48,7 +48,7 @@ most recent children, so it measures the *average* slope where the fleet has bee
 lately. As a lineage nears a good value the slope there flattens and the average
 follows it down; it does not know where the optimum is, only which way is uphill.
 
-Pure Python, no torch and no numpy: the matrices are 14x14.
+Pure Python, no torch and no numpy: the matrices are 24x24.
 """
 
 from __future__ import annotations
@@ -195,13 +195,21 @@ def fit_estimate(
     *,
     min_gain: float = DEFAULT_MIN_GAIN,
 ) -> SweepEstimate | None:
-    """The estimate from `observations`, or None when there is too little to fit."""
+    """The estimate from `observations`, or None when there is too little to fit.
+
+    **An axis a child recorded on neither side is a step of 0**, not a reason to drop
+    the child: an axis joins the sweep after children were already observed, and
+    those ran it at the fleet's value on both sides, so they still say what the
+    other axes did. Its level, for the cost, is the mean of the children that have
+    it (a centred 0). An axis on one side only has an unknown step, and that child
+    is left out.
+    """
     axes = tuple(axes)
     usable = [
         o
         for o in observations
         if o.cpu_seconds > 0
-        and all(a in o.settings and a in o.parent_settings for a in axes)
+        and all((a in o.settings) == (a in o.parent_settings) for a in axes)
     ]
     count = len(usable)
     if count < MIN_FIT or not axes:
@@ -215,7 +223,12 @@ def fit_estimate(
     sd_parent = math.sqrt(sum((r - mean_parent) ** 2 for r in parent_ratings) / count) or 1.0
 
     design = [
-        [log_step(a, o.parent_settings[a], o.settings[a], complement_axes) for a in axes]
+        [
+            log_step(a, o.parent_settings[a], o.settings[a], complement_axes)
+            if a in o.settings
+            else 0.0
+            for a in axes
+        ]
         + [1.0, (o.parent_rating - mean_parent) / sd_parent]
         for o in usable
     ]
@@ -246,10 +259,17 @@ def fit_estimate(
     log_costs = [math.log(c) for c in costs]
     mean_log_cost = sum(log_costs) / count
     levels = [
-        [log_level(a, o.settings[a], complement_axes) for a in axes] for o in usable
+        [log_level(a, o.settings[a], complement_axes) if a in o.settings else None for a in axes]
+        for o in usable
     ]
-    level_means = [sum(row[i] for row in levels) / count for i in range(width)]
-    centred = [[row[i] - level_means[i] for i in range(width)] for row in levels]
+    level_means = []
+    for i in range(width):
+        known = [row[i] for row in levels if row[i] is not None]
+        level_means.append(sum(known) / len(known) if known else 0.0)
+    centred = [
+        [0.0 if row[i] is None else row[i] - level_means[i] for i in range(width)]
+        for row in levels
+    ]
     ridge = _gram(centred)
     for i in range(width):
         ridge[i][i] += COST_RIDGE

@@ -32,7 +32,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from pokerlab.config import (
@@ -118,7 +118,12 @@ from pokerlab.rl.rollout import DEFAULT_CONCURRENT_TABLES, DEFAULT_TABLE_HANDS
 # uses cannot drift apart. No cycle -- train.py does not import loop.py -- and torch is already
 # here through `rl/benchmark.py`.
 from pokerlab.rl.siblings import sibling_parsers
-from pokerlab.rl.styles import add_style_arguments, style_arguments, style_config_from_args
+from pokerlab.rl.styles import (
+    StyleConfig,
+    add_style_arguments,
+    style_arguments,
+    style_config_from_args,
+)
 from pokerlab.rl.sweep_log import read_observations
 from pokerlab.rl.sweep_optimizer import (
     DEFAULT_EXPLORE,
@@ -131,14 +136,18 @@ from pokerlab.rl.sweep_optimizer import (
 )
 from pokerlab.rl.table_mix import add_table_arguments, table_arguments, table_mix_from_args
 from pokerlab.rl.train import (
+    DEFAULT_ENTROPY_ANNEAL_FINAL,
+    DEFAULT_ENTROPY_ANNEAL_START,
     DEFAULT_EVAL_SESSIONS,
     DEFAULT_FILL_DEADLINE_MINUTES,
     DEFAULT_FILL_SESSIONS,
+    DEFAULT_LR_ANNEAL_FINAL,
     RUN_METADATA_VERSION,
     TrainConfig,
     add_network_arguments,
     check_network_arguments,
     network_shape,
+    recorded_axes,
     same_network_filter,
 )
 from pokerlab.rl.training_pool import (
@@ -409,6 +418,21 @@ def sweep_stale_work(
 # it would confound a strength axis with a cost axis. `pool_top_share` and
 # `pool_top_n` are how strong a field the worker draws: the share decides *how
 # much* of it is elite and `n` *how* elite that part is.
+#
+# **The annealing curves and the opponents' styles are axes too.** The entropy
+# bonus's start, end and length, the learning rate's end and length (its start is
+# `lr`), and how the styled opponents are drawn (`style_share`, `style_spread`,
+# `style_temperature_spread`, `style_jitter`). `style_scales` is not: it is the
+# calibration of each style axis's unit (`studies/agents/style_calibration.py`),
+# measured, not a setting, and `style_spread` already widens every axis at once.
+# `critic_stack_power` is one too: the exponent that equalises the critic's loss
+# across stakes depends on how the target's spread grows with the stake, which moves
+# with `gae_lambda` (itself swept) and the all-in runouts, so each lineage carries
+# its own (0 is "no weighting" and stays 0).
+# An axis at 0 stays at 0 under any multiplier, and for these that is the switch:
+# 0 annealing iterations is "no annealing" (`_HP_ZERO_IS_OFF_AXES`), a 0 share is
+# "no styled seats", 0 jitter or temperature spread is none of that noise. Turning
+# one back on is the file's decision, not a random step's.
 HP_AXES = (
     "lr",
     "hands",
@@ -422,13 +446,38 @@ HP_AXES = (
     "critic_max_grad_norm",
     "pool_top_share",
     "pool_top_n",
+    "lr_anneal_final",
+    "lr_anneal_iterations",
+    "entropy_anneal_start",
+    "entropy_anneal_final",
+    "entropy_anneal_iterations",
+    "style_share",
+    "style_spread",
+    "style_temperature_spread",
+    "style_jitter",
+    "critic_stack_power",
 )
 
 # The axes whose values are counts, so a value is cast back to `int`. Everything
 # else is a float. This exists so `HP_AXES` is the only place an axis has to
 # be added: both arms build a `Hyperparameters` from the dict generically, and
 # the type is the one thing the axis list itself cannot say (0.0 and 0 look alike).
-_HP_INT_AXES = frozenset({"hands", "ppo_epochs", "pool_top_n", "minibatch_size"})
+_HP_INT_AXES = frozenset(
+    {
+        "hands",
+        "ppo_epochs",
+        "pool_top_n",
+        "minibatch_size",
+        "lr_anneal_iterations",
+        "entropy_anneal_iterations",
+    }
+)
+
+# Count axes where 0 is a switch, not a small value: 0 annealing iterations is no
+# annealing at all. `_moved_count` lifts any other count off 0 (`ppo_epochs` 0 is a
+# run that never trains); these stay at 0, as a float axis at 0 does, so a lineage
+# the file started without annealing is not given a one-iteration curve by a step.
+_HP_ZERO_IS_OFF_AXES = frozenset({"lr_anneal_iterations", "entropy_anneal_iterations"})
 
 # What a worker multiplies its starting value by (its parent's, or the fleet's
 # own when it has none), one independent draw per axis. This is the *default*:
@@ -436,7 +485,7 @@ _HP_INT_AXES = frozenset({"hands", "ppo_epochs", "pool_top_n", "minibatch_size"}
 # x{0.8, 1.0, 1.25} with 1.2 -- see the note above for why an unbounded
 # multiplier suits this search. Keeping 1.0 in the set is what lets an axis stay
 # put: with only the two moving multipliers every axis of every worker would move
-# every generation, and with twelve axes no lineage would ever hold a setting
+# every generation, and with twenty-two axes no lineage would ever hold a setting
 # still.
 #
 # **These numbers are not symmetric in log space, and the drift is measurable.**
@@ -455,7 +504,7 @@ HP_MULTIPLIERS: tuple[float, ...] = (0.8, 1.0, 1.2)
 # `rng.random()`, and `pool_top_share` decides how many of `--pool-models` seats
 # come from the top band). There is deliberately no lower cap, here or anywhere:
 # multiplying a positive value by 0.8 can never reach 0.
-_HP_PROBABILITY_AXES = frozenset({"opponent_probability", "pool_top_share"})
+_HP_PROBABILITY_AXES = frozenset({"opponent_probability", "pool_top_share", "style_share"})
 
 # Axes perturbed through their complement, `1 - value`. For the GAE lambda the
 # quantity that matters is `1 - lambda`: the effective horizon is
@@ -505,6 +554,21 @@ class Hyperparameters:
     value_coef: float = PPOConfig.value_coefficient
     policy_max_grad_norm: float = PPOConfig.policy_max_grad_norm
     critic_max_grad_norm: float = PPOConfig.critic_max_grad_norm
+    # The annealing curves: where the learning rate ends (it starts at `lr`) and
+    # over how many iterations, and the entropy bonus's start, end and length.
+    lr_anneal_final: float = DEFAULT_LR_ANNEAL_FINAL
+    lr_anneal_iterations: int = 0
+    entropy_anneal_start: float = DEFAULT_ENTROPY_ANNEAL_START
+    entropy_anneal_final: float = DEFAULT_ENTROPY_ANNEAL_FINAL
+    entropy_anneal_iterations: int = 0
+    # How the styled opponents are drawn (`rl/styles.py`); the per-axis scales stay
+    # the fleet's.
+    style_share: float = StyleConfig.share
+    style_spread: float = StyleConfig.spread
+    style_temperature_spread: float = StyleConfig.temperature_spread
+    style_jitter: float = StyleConfig.jitter
+    # The power of the stake the critic's loss is weighed by (`ppo.critic_weights`).
+    critic_stack_power: float = PPOConfig.critic_stack_power
     arm: str = HP_ARM_SAMPLED
 
 
@@ -522,7 +586,7 @@ def _typed(values: dict[str, float]) -> dict[str, float | int]:
     }
 
 
-def _moved_count(before: float, after: float, multiplier: float) -> int:
+def _moved_count(before: float, after: float, multiplier: float, axis: str = "") -> int:
     """A count axis's perturbed value: **a move has to actually move.**
 
     Plain rounding does not, and the failure is a one-way ratchet rather than an
@@ -544,8 +608,13 @@ def _moved_count(before: float, after: float, multiplier: float) -> int:
     setting, it is the absence of training. 1 is a legitimate value (one PPO
     pass) and it is *reflecting*, not absorbing -- from 1 the up draw gives 2.
     Note this does let a lineage reach 1.
+
+    The exception is an axis of `_HP_ZERO_IS_OFF_AXES` at 0, which stays there:
+    0 annealing iterations is "off", and 1 would be a curve nobody asked for.
     """
     moved = round(after)
+    if axis in _HP_ZERO_IS_OFF_AXES and round(before) == 0:
+        return 0
     if multiplier != 1.0 and moved == round(before):
         moved = round(before) + (1 if multiplier > 1.0 else -1)
     return max(1, moved)
@@ -570,6 +639,16 @@ def starting_hyperparameters(args: argparse.Namespace) -> Hyperparameters:
         value_coef=args.value_coef,
         policy_max_grad_norm=args.policy_max_grad_norm,
         critic_max_grad_norm=args.critic_max_grad_norm,
+        lr_anneal_final=args.lr_anneal_final,
+        lr_anneal_iterations=args.lr_anneal_iterations,
+        entropy_anneal_start=args.entropy_anneal_start,
+        entropy_anneal_final=args.entropy_anneal_final,
+        entropy_anneal_iterations=args.entropy_anneal_iterations,
+        style_share=args.style_share,
+        style_spread=args.style_spread,
+        style_temperature_spread=args.style_temperature_spread,
+        style_jitter=args.style_jitter,
+        critic_stack_power=args.critic_stack_power,
         arm=HP_ARM_SAMPLED,
     )
 
@@ -614,7 +693,7 @@ def _perturbed(
         if axis in _HP_INT_AXES:
             # Direction-aware, because plain rounding leaves a count stuck at 2
             # in both directions -- see `_moved_count`.
-            value = _moved_count(float(before), value, multiplier)
+            value = _moved_count(float(before), value, multiplier, axis)
         moved[axis] = value
     return Hyperparameters(**_typed(moved), arm=arm)
 
@@ -628,18 +707,20 @@ def perturb_hyperparameters(
     """The parent's settings, each axis multiplied by one of `multipliers`.
 
     Returns `None` when the parent carries nothing usable -- no metadata, a
-    schema this build does not know, or a missing axis -- so the caller can start
+    schema this build does not know, or an axis neither among its recorded axes
+    nor in the `settings` it recorded -- so the caller can start
     from the fleet's own settings rather than invent a lineage that does not
     exist.
     """
     if not parent or parent.get("schema") != RUN_METADATA_VERSION:
         return None
-    for axis in HP_AXES:
-        inherited = parent.get(axis)
-        if not isinstance(inherited, (int, float)) or isinstance(inherited, bool):
-            return None
+    # An axis added after the parent was published is read from the `settings`
+    # it recorded: what the fleet ran it with, which is what it trained with.
+    values = recorded_axes(parent)
+    if any(axis not in values for axis in HP_AXES):
+        return None
     return _perturbed(
-        parent, rng, arm=HP_ARM_INHERITED, multipliers=multipliers, policy=policy
+        values, rng, arm=HP_ARM_INHERITED, multipliers=multipliers, policy=policy
     )
 
 
@@ -827,18 +908,28 @@ def launch_worker(
         "--table-hands", str(args.table_hands),
         "--concurrent-tables", str(args.concurrent_tables),
         "--allin-runouts", str(args.allin_runouts),
-        *style_arguments(style_config_from_args(args)),
-        "--critic-stack-power", str(args.critic_stack_power),
+        # Swept: the styled opponents' draw, with the fleet's own per-axis scales.
+        *style_arguments(
+            replace(
+                style_config_from_args(args),
+                share=hp.style_share,
+                spread=hp.style_spread,
+                temperature_spread=hp.style_temperature_spread,
+                jitter=hp.style_jitter,
+            )
+        ),
+        "--critic-stack-power", str(hp.critic_stack_power),  # swept
         "--collect-workers", str(args.collect_workers),
         "--session-workers", str(args.session_workers),
         "--pool-refresh-every", str(args.pool_refresh_every),
         "--update-device", args.update_device,
         "--lr", str(hp.lr),
-        "--lr-anneal-iterations", str(args.lr_anneal_iterations),
-        "--lr-anneal-final", str(args.lr_anneal_final),
-        "--entropy-anneal-iterations", str(args.entropy_anneal_iterations),
-        "--entropy-anneal-start", str(args.entropy_anneal_start),
-        "--entropy-anneal-final", str(args.entropy_anneal_final),
+        # Swept: the annealing curves.
+        "--lr-anneal-iterations", str(hp.lr_anneal_iterations),
+        "--lr-anneal-final", str(hp.lr_anneal_final),
+        "--entropy-anneal-iterations", str(hp.entropy_anneal_iterations),
+        "--entropy-anneal-start", str(hp.entropy_anneal_start),
+        "--entropy-anneal-final", str(hp.entropy_anneal_final),
         # Swept: these two decide how strong a field the worker draws. Only
         # `--pool-models`, the field's *size*, is still the fleet's own value.
         "--pool-top-share", str(hp.pool_top_share),
@@ -1543,7 +1634,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--critic-stack-power", type=float, default=PPOConfig.critic_stack_power,
         help="the critic's loss weighs a decision by its stake in big blinds to this "
-        "power, negated (0: off); forwarded to every worker",
+        "power, negated (0: off). Swept: where a worker with no parent starts, every "
+        "worker then perturbs it (0 stays 0)",
     )
     parser.add_argument(
         "--update-device", default="same",
@@ -1569,25 +1661,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--entropy-anneal-iterations", type=int, default=0,
-        help="iterations over which every worker's entropy bonus falls from "
+        help="iterations over which a worker's entropy bonus falls from "
         "--entropy-anneal-start to --entropy-anneal-final, from the start of its own run "
-        "(0: no annealing, the bonus is --entropy-anneal-final throughout); forwarded to every worker",
+        "(0: no annealing, the bonus is --entropy-anneal-final throughout). Swept like the "
+        "other two: where a worker with no parent starts, every worker then perturbs it "
+        "(0 stays 0)",
     )
-    parser.add_argument("--entropy-anneal-start", type=float, default=0.1,
-                        help="the bonus at a run's first iteration, when annealing")
-    parser.add_argument("--entropy-anneal-final", type=float, default=0.0001,
-                        help="the bonus once the annealing is over")
+    parser.add_argument("--entropy-anneal-start", type=float, default=DEFAULT_ENTROPY_ANNEAL_START,
+                        help="the bonus at a run's first iteration, when annealing (swept)")
+    parser.add_argument("--entropy-anneal-final", type=float, default=DEFAULT_ENTROPY_ANNEAL_FINAL,
+                        help="the bonus once the annealing is over (swept)")
     parser.add_argument("--lr", type=float, default=3e-4,
                         help="starting learning rate of the workers with no parent "
                         "to inherit settings from; every worker then perturbs it")
     parser.add_argument(
         "--lr-anneal-iterations", type=int, default=0,
-        help="iterations over which every worker's learning rate falls from its own lr (swept, "
-        "inherited) to --lr-anneal-final (absolute), from the start of its own run (0: constant); "
-        "forwarded to every worker",
+        help="iterations over which a worker's learning rate falls from its own lr "
+        "to --lr-anneal-final (absolute), from the start of its own run (0: constant). Swept: "
+        "where a worker with no parent starts, every worker then perturbs it (0 stays 0)",
     )
-    parser.add_argument("--lr-anneal-final", type=float, default=1e-5,
-                        help="the rate once the annealing is over, an absolute value")
+    parser.add_argument("--lr-anneal-final", type=float, default=DEFAULT_LR_ANNEAL_FINAL,
+                        help="the rate once the annealing is over, an absolute value (swept)")
     parser.add_argument("--eval-every", type=int, default=100)
     parser.add_argument(
         "--eval-sessions", type=int, default=DEFAULT_EVAL_SESSIONS,
