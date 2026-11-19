@@ -123,20 +123,20 @@ def play_probes(num_players: int, seed: int, hands: int = 30) -> list[tuple[Obse
 # ---- shape and versions --------------------------------------------------------
 
 
-def test_new_models_are_built_at_version_three_and_both_are_served():
+def test_new_models_are_built_at_version_three_and_every_version_is_served():
     assert FEATURE_VERSION == 3
-    assert SUPPORTED_VERSIONS == (3, 4)
+    assert SUPPORTED_VERSIONS == (3, 4, 5)
     assert observation_dim(3) == OBS_DIM_V3 == 660
     assert observation_dim(4) == OBS_DIM
     with pytest.raises(ValueError, match="not one this build serves"):
-        observation_dim(5)
+        observation_dim(6)
     with pytest.raises(ValueError, match="not one this build serves"):
         encode_observation(
             build_observation(three_handed_raise_and_call(), 2),
             big_blind=BIG_BLIND,
             starting_stack=STARTING_STACK,
             legal_mask=[True] * MASK_DIM,
-            version=5,
+            version=6,
         )
 
 

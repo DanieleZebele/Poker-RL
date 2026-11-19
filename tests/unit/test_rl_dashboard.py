@@ -342,7 +342,7 @@ def test_the_page_marks_a_window_that_is_still_filling():
     assert "w.train_hands.toLocaleString('en') + ' hands'" in PAGE
     # The gradient clip: drawn from the worker history, after the iteration charts.
     assert "specs.push(...gradSpecs(hist));" in PAGE
-    assert "hist.grad_policy_clipped" in PAGE and "hist.grad_critic_threshold" in PAGE
+    assert "hist.grad_policy_clipped" in PAGE and "grad_critic_threshold" not in PAGE
     assert "w.train_hands < 100000" in PAGE
 
 

@@ -377,6 +377,62 @@ def request_benchmark_arena(global_dir: str | Path, *, added: list[str], machine
     return path
 
 
+# **One arena at a time, the newest.** The claim above stops two machines running
+# the *same* request, not a second request (another anchor added) starting an arena
+# while the first is still playing -- which happened: two arenas, on two machines,
+# each holding every anchor's rating in memory and writing it every checkpoint, so
+# the files flipped between the two and whichever finished last won, possibly one
+# that did not know the newest anchor. Every arena that will write takes the turn
+# (`take_arena_turn`) as it starts; an arena checks before every write that the turn
+# is still its own (`holds_arena_turn`), and if not it stops without writing and
+# exits with `ARENA_SUPERSEDED_EXIT`. The newest wins because it knows every anchor
+# and starts from the ratings the older one already wrote.
+ARENA_TURN_FILENAME = "benchmark_arena_current.json"
+ARENA_SUPERSEDED_EXIT = 3
+
+
+def read_arena_turn(global_dir: str | Path) -> dict | None:
+    """The arena holding the turn, or None (no file, or one that cannot be read)."""
+    try:
+        turn = json.loads((Path(global_dir) / ARENA_TURN_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return turn if isinstance(turn, dict) else None
+
+
+def take_arena_turn(global_dir: str | Path, *, machine: str) -> tuple[str, dict | None]:
+    """Make this run the one arena allowed to write; any other one stops at its next
+    checkpoint. Returns this run's id and the turn it took over (None if nobody held it).
+    Written through a dotted temporary and renamed, like every shared write here."""
+    directory = Path(global_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    previous = read_arena_turn(directory)
+    turn = {"id": uuid.uuid4().hex, "machine": machine, "pid": os.getpid(), "started": time.time()}
+    temporary = directory / f".{ARENA_TURN_FILENAME}.{turn['id']}.partial"
+    temporary.write_text(json.dumps(turn, indent=2), encoding="utf-8")
+    temporary.replace(directory / ARENA_TURN_FILENAME)
+    return turn["id"], previous
+
+
+def holds_arena_turn(global_dir: str | Path, turn_id: str) -> bool:
+    """Whether the turn is still this run's. A file another run has rewritten -- or
+    removed, which only an arena that held it after this one does -- means no.
+    A file that exists and cannot be parsed (a transient NFS error) is not taken
+    as a reason to stop a run of days: only another id is."""
+    path = Path(global_dir) / ARENA_TURN_FILENAME
+    if not path.exists():
+        return False
+    turn = read_arena_turn(global_dir)
+    return turn is None or turn.get("id") == turn_id
+
+
+def release_arena_turn(global_dir: str | Path, turn_id: str) -> None:
+    """Give the turn back at the end of a run, if it is still this run's."""
+    current = read_arena_turn(global_dir)
+    if current is not None and current.get("id") == turn_id:
+        (Path(global_dir) / ARENA_TURN_FILENAME).unlink(missing_ok=True)
+
+
 def claim_benchmark_arena(global_dir: str | Path, *, machine: str) -> tuple[Path, dict] | None:
     """Take the pending request, if there is one, so exactly one machine runs it.
 

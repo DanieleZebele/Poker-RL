@@ -56,7 +56,7 @@ def _next_to_act(hand_state: HandState, order: list[int], after: int) -> int | N
     return None
 
 
-def _view_for(hand_state: HandState, seat: int | None, hand_stats) -> tuple | None:
+def _view_for(hand_state: HandState, seat: int | None, hand_stats, hand_memory=None) -> tuple | None:
     """What `seat` will be shown when it is asked -- `(Observation, legal actions)` -- built
     ahead of the question, for a spectator that wants to look at the decision while the game is
     held (a GUI showing a bot's action probabilities). None when nobody is due."""
@@ -64,7 +64,10 @@ def _view_for(hand_state: HandState, seat: int | None, hand_stats) -> tuple | No
         return None
     from pokerlab.players.base import build_observation  # local import: avoid a module cycle
 
-    return (build_observation(hand_state, seat, hand_stats), compute_legal_actions(hand_state, seat))
+    return (
+        build_observation(hand_state, seat, hand_stats, hand_memory),
+        compute_legal_actions(hand_state, seat),
+    )
 
 
 def _first_to_act(hand_state: HandState, first_actor_seat: int) -> int | None:
@@ -99,11 +102,15 @@ class Table:
         on_action_applied: Callable[[dict[str, Any]], None] | None = None,
         stats_tracker: StatsTracker | None = None,
         blind_schedule: BlindSchedule | None = None,
+        memory_tracker: Any = None,
     ) -> None:
         """`on_hand_started`, if given, is called once per hand right after
         the antes and blinds are posted (before any betting), with a dict of
         {hand_id, button_seat, sb_seat, bb_seat, small_blind, big_blind, ante,
-        hole_cards}. This is an optional spectator hook only -- e.g. a GUI
+        hole_cards, runout}, `runout` being the five community cards the hand
+        will have if it reaches the river (the deck is shuffled once per hand
+        and no card is burnt, so they are already decided; a training critic
+        reads them). This is an optional spectator hook only -- e.g. a GUI
         showing blind postings and a "spy on opponents' cards" debug toggle
         -- nothing in the engine or in Player depends on it.
 
@@ -143,6 +150,11 @@ class Table:
         seen. Optional by design: with none, or for a player it has not seen, the
         statistics are simply absent.
 
+        `memory_tracker`, if given (`rl/belief_inputs.py::MemoryTracker`, duck-typed so the
+        engine imports nothing from `rl/`), is handed every finished hand (`record(hand,
+        player_ids)`) and puts a view of what it remembers (`view(player_ids)`) into the
+        `Observation`s of the next hand, for the belief networks of the models at the table.
+
         `blind_schedule`, if given, raises the blinds every N hands (`BlindSchedule`):
         `config` holds the blinds the session starts with, `current_blinds()` the ones
         the next hand will be played at, and every hand records its own.
@@ -159,6 +171,8 @@ class Table:
         self._on_street_dealt = on_street_dealt
         self._on_action_applied = on_action_applied
         self.stats_tracker = stats_tracker
+        self.memory_tracker = memory_tracker
+        self._hand_memory: Any = None
         self.blind_schedule = blind_schedule
         self._hand_stats: dict[int, tuple[float, ...]] = {}
         self.stacks: list[int] = [config.starting_stack] * config.num_players
@@ -220,6 +234,9 @@ class Table:
         self._hand_stats = (
             self.stats_tracker.vectors(player_ids) if self.stats_tracker is not None else {}
         )
+        self._hand_memory = (
+            self.memory_tracker.view(player_ids) if self.memory_tracker is not None else None
+        )
 
         order = seats_clockwise_from(hand_state, button_seat)
         if len(eligible) == 2:
@@ -242,8 +259,9 @@ class Table:
                     "big_blind": big_blind,
                     "ante": self.config.ante,
                     "hole_cards": dict(hole_cards),
+                    "runout": tuple(deck.peek(5)),
                     "first_actor": (first := _first_to_act(hand_state, preflop_first_actor)),
-                    "first_actor_view": _view_for(hand_state, first, self._hand_stats),
+                    "first_actor_view": _view_for(hand_state, first, self._hand_stats, self._hand_memory),
                 }
             )
 
@@ -271,7 +289,7 @@ class Table:
                         "community_cards": list(hand_state.community_cards),
                         "betting_closed": betting_closed,
                         "first_actor": (first := _first_to_act(hand_state, postflop_first_actor)),
-                        "first_actor_view": _view_for(hand_state, first, self._hand_stats),
+                        "first_actor_view": _view_for(hand_state, first, self._hand_stats, self._hand_memory),
                     }
                 )
             self._run_betting_round(hand_state, postflop_first_actor)
@@ -309,6 +327,8 @@ class Table:
                 board_cards=len(hand_history.community_cards),
                 player_ids=player_ids,
             )
+        if self.memory_tracker is not None:
+            self.memory_tracker.record(hand_history, player_ids)
 
         return HandResult(
             hand_id=hand_id,
@@ -345,7 +365,7 @@ class Table:
                     hand_state.to_act.discard(seat)
                     continue
                 legal = compute_legal_actions(hand_state, seat)
-                observation = build_observation(hand_state, seat, self._hand_stats)
+                observation = build_observation(hand_state, seat, self._hand_stats, self._hand_memory)
                 action = self.players[seat].act(observation, legal)
                 apply_action(hand_state, seat, action)
                 finished = len(hand_state.hand_active_seats()) <= 1 or _nobody_left_to_bet_against(hand_state)
@@ -358,11 +378,11 @@ class Table:
                             "name": ps.name,
                             "action": action,
                             "record": hand_state.action_log[-1],
-                            "observation": build_observation(hand_state, seat, self._hand_stats),
+                            "observation": build_observation(hand_state, seat, self._hand_stats, self._hand_memory),
                             # Who will be asked next (None: this betting round is over), so a
                             # spectator can show it while it is still holding this action.
                             "next_seat": (upcoming := None if finished else _next_to_act(hand_state, order, position)),
-                            "next_view": _view_for(hand_state, upcoming, self._hand_stats),
+                            "next_view": _view_for(hand_state, upcoming, self._hand_stats, self._hand_memory),
                         }
                     )
                 progressed = True

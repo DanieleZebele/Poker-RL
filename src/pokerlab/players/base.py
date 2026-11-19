@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import Any
 
 from pokerlab.cards.card import Card
 from pokerlab.engine.actions import Action, LegalAction
@@ -49,12 +50,18 @@ class Observation:
     # (`RLAgentPlayer`) reads it from here, because the blind it was built with is only the
     # session's first.
     big_blind: int = 0
+    # Optional: the table's memory of its players (`rl/belief_inputs.py::MemoryView`), which a
+    # model's belief network reads (feature version 5). The one field that is not a primitive:
+    # what a player has done is the table's hands, and each belief network reads them with a
+    # memory network of its own. None -- no tracker -- reads as players never seen.
+    seat_memory: Any = None
 
 
 def build_observation(
     hand_state: HandState,
     seat: int,
     seat_stats: Mapping[int, tuple[float, ...]] | None = None,
+    seat_memory: Any = None,
 ) -> Observation:
     ps = hand_state.seat_state(seat)
     assert ps.hole_cards is not None, "observation requested for a seat with no hole cards dealt"
@@ -84,6 +91,7 @@ def build_observation(
         action_history=tuple(hand_state.action_log),
         seat_stats=dict(seat_stats) if seat_stats else {},
         big_blind=hand_state.big_blind,
+        seat_memory=seat_memory,
     )
 
 

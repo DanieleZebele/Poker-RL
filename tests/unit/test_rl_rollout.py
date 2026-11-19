@@ -45,7 +45,7 @@ def make_trajectory(values: list[float], reward: float) -> HandTrajectory:
             action_index=0,
             log_prob=0.0,
             value=value,
-            stake_bb=50.0,
+           
         )
         for value in values
     ]
@@ -573,3 +573,17 @@ def test_one_worker_is_the_serial_collector():
     serial = make_copying_collector().collect(20, workers=1)
     again = make_copying_collector().collect(20)
     assert [t.reward for t in serial] == [t.reward for t in again]
+
+
+@pytest.mark.parametrize("runout", [False, True])
+def test_the_critic_sees_the_whole_board_only_with_the_runout_switched_on(runout):
+    """`critic_runout` (off by default): the critic's view of every decision is the hand's five
+    community cards, the visible ones first; off, it is the board as it stands."""
+    collector = make_collector(critic_runout=runout)
+    trajectories = collector.collect(30)
+    boards = [len(d.critic_view.board) for t in trajectories for d in t.decisions]
+    assert boards
+    if runout:
+        assert set(boards) == {5}
+    else:
+        assert 0 in boards and set(boards) <= {0, 3, 4, 5}

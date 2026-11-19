@@ -67,7 +67,7 @@ def test_a_head_is_its_hidden_blocks_then_the_output_layer(head_layers):
 
 def test_the_default_network_has_plain_heads():
     model = tiny_model()
-    assert model.shape == {"hidden": 512, "num_layers": 3, "head_hidden": 256, "head_layers": 0}
+    assert model.shape == {"hidden": 512, "num_layers": 3, "head_hidden": 256, "head_layers": 0, "residual": 0}
     assert sum(p.numel() for p in model.parameters()) == parameters(512, 3, 256, 0)
 
 
@@ -113,7 +113,7 @@ def test_a_checkpoint_records_the_whole_shape_and_rebuilds_the_same_network(tmp_
     model = build(head_layers=3)
     save_checkpoint(tmp_path / "m.pt", model)
     rebuilt, checkpoint = build_model_from_checkpoint(tmp_path / "m.pt")
-    assert checkpoint_shape(checkpoint) == model.shape and set(model.shape) == set(SHAPE_KEYS)
+    assert checkpoint_shape(checkpoint) == model.shape and set(model.shape) == {*SHAPE_KEYS, "residual"}
     assert rebuilt.shape == model.shape
     features = torch.randn(3, OBS_DIM)
     mask = torch.ones(3, ACTION_DIM, dtype=torch.bool)

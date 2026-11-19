@@ -169,10 +169,147 @@ def test_a_style_setting_that_cannot_be_used_is_refused_before_anything_starts(t
     equity.write_bytes(b"x")
     parser = argparse.ArgumentParser()
     add_style_arguments(parser)
-    shape = {"hidden": 8, "num_layers": 1, "head_hidden": 8, "head_layers": 0, "equity_model": str(equity)}
+    shape = {"hidden": 8, "num_layers": 1, "head_hidden": 8, "head_layers": 0, "critic_bins": 0, "equity_model": str(equity),
+             "feature_version": 3, "belief_model": "", "belief_oracle": 0.0, "belief_oracle_iterations": 0, "belief_oracle_mode": "mix", "belief_oracle_near": [64], "belief_oracle_mode": "mix", "belief_oracle_near": [64]}
     good = argparse.Namespace(**shape, **vars(parser.parse_args([])))
     check_network_arguments(good)
     for flags in (["--style-scales", "1", "2"], ["--style-share", "2"]):
         bad = argparse.Namespace(**shape, **vars(parser.parse_args(flags)))
         with pytest.raises(ValueError):
             check_network_arguments(bad)
+
+
+# ---- the axes of detail ----------------------------------------------------------------
+
+
+def _observations(size: int = 6, hands: int = 30, seed: int = 0) -> list[Observation]:
+    """Every observation of a few hands of random players."""
+    from support import make_random_legal_bot
+
+    from pokerlab.engine.config import GameConfig
+    from pokerlab.engine.table import Table
+    from pokerlab.players.base import Player
+
+    seen: list[Observation] = []
+
+    class Keep(Player):
+        def __init__(self, seat):
+            super().__init__(f"p{seat}", f"p{seat}")
+            self.bot = make_random_legal_bot(f"p{seat}", rng=random.Random(seed * 10 + seat))
+
+        def act(self, observation, legal):
+            seen.append(observation)
+            return self.bot.act(observation, legal)
+
+    table = Table(GameConfig(size, 2000, 10, 20), [Keep(s) for s in range(size)], rng=random.Random(seed))
+    for _ in range(hands):
+        table.stacks = [2000] * size
+        table.play_hand()
+    return seen
+
+
+def detailed(**axes: float) -> Style:
+    return Style(tuple(axes.get(name, 0.0) for name in AXES))
+
+
+def test_five_scales_are_the_first_five_axes_and_leave_the_detail_off():
+    from pokerlab.rl.styles import DETAIL_AXES, LEGACY_AXES, StyleConfig, full_scales
+
+    assert AXES[: len(LEGACY_AXES)] == LEGACY_AXES and len(AXES) == len(LEGACY_AXES) + len(DETAIL_AXES)
+    assert full_scales([5, 8, 8, 4, 8]) == (5, 8, 8, 4, 8) + (0.0,) * len(DETAIL_AXES)
+    assert StyleConfig(scales=(5.0, 8.0, 8.0, 4.0, 8.0)).scales[len(LEGACY_AXES):] == (0.0,) * len(DETAIL_AXES)
+    every_axis = Style((1.0,) * len(AXES))
+    for observation in _observations(hands=10):
+        old = Style((1.0,) * len(LEGACY_AXES) + (0.0,) * len(DETAIL_AXES)).push(observation, (5, 8, 8, 4, 8))
+        assert every_axis.push(observation, (5, 8, 8, 4, 8)) == old  # the detail is off
+
+
+def test_the_button_acts_last_the_first_seat_after_the_blinds_first():
+    from pokerlab.rl.styles import position_of
+
+    for observation in _observations(size=6, hands=10):
+        where = position_of(observation)
+        assert -1.0 <= where <= 1.0
+        if observation.my_seat == observation.button_seat:
+            assert where == 1.0
+    heads_up = _observations(size=2, hands=5)
+    assert {position_of(o) for o in heads_up} <= {0.0, 1.0}
+
+
+def test_the_preflop_raises_are_counted_and_mine_is_known():
+    from pokerlab.engine.actions import ActionType
+    from pokerlab.rl.styles import preflop_raises
+
+    for observation in _observations(hands=20):
+        raises, mine = preflop_raises(observation)
+        preflop = [r for r in observation.action_history if r.street is Street.PREFLOP]
+        bets = [r for r in preflop if r.action_type in (ActionType.BET, ActionType.RAISE)]
+        assert raises >= len(bets)
+        if any(r.seat == observation.my_seat for r in bets):
+            assert mine
+
+
+@pytest.mark.parametrize(
+    ("hole", "board", "expected"),
+    [
+        ("Ah Kd", "2c 7s 9h", "debole"),
+        ("Ah Kd", "Ac 7s 9h", "media"),
+        ("9d 9c", "9h 7s 2c", "forte"),
+        ("Ah 7d", "Ac 7s 2h", "forte"),
+        ("Ah Kd", "7c 7s 2h", "debole"),  # the pair is the board's
+        ("Ah 2d", "7c 7s 2h", "media"),  # two pair, one of them the board's
+        ("Ah Kh", "Qh Jh 2h", "forte"),
+    ],
+)
+def test_the_strength_of_a_hand_is_what_my_cards_add_to_the_board(hole, board, expected):
+    from pokerlab.rl.styles import strength_of
+
+    cards = lambda text: tuple(Card.parse(c) for c in text.split())
+    assert strength_of(cards(hole), cards(board)) == expected
+
+
+def test_each_axis_of_detail_pushes_only_where_it_belongs():
+    from pokerlab.rl.styles import (
+        DETAIL_AXES,
+        SHORT_FROM_BB,
+        position_of,
+        preflop_raises,
+        strength_of,
+    )
+
+    for observation in _observations(size=6, hands=40, seed=3):
+        situation = situation_of(observation)
+        for axis in DETAIL_AXES:
+            push = detailed(**{axis: 1.0}).push(observation)
+            moved = any(push)
+            if axis.startswith("aggressivita_"):
+                assert moved == (observation.street.value == axis.split("_")[1])
+            elif axis in ("bluff", "slowplay"):
+                if moved:
+                    strength = strength_of(tuple(observation.hole_cards), tuple(observation.community_cards))
+                    assert situation != "preflop" and strength == ("debole" if axis == "bluff" else "forte")
+            elif axis in ("tre_bet", "fold_al_tre_bet") and moved:
+                raises, mine = preflop_raises(observation)
+                assert situation == "preflop"
+                assert (raises == 1 and not mine) if axis == "tre_bet" else (raises >= 2 and mine)
+            elif axis == "check_raise" and moved:
+                assert situation == "facing"
+            elif axis == "posizione" and position_of(observation) == 0.0:
+                assert not moved
+            elif axis == "shove_corto":
+                left_bb = (observation.my_stack + observation.my_current_bet) / observation.big_blind
+                assert moved == (left_bb < SHORT_FROM_BB)  # what is left of the stack, mid-hand
+
+
+def test_a_short_stack_shoves_more_the_shorter_it_is():
+    from dataclasses import replace
+
+    from pokerlab.rl.action_space import ALL_IN_BIN as SHOVE
+    from pokerlab.rl.styles import SHORT_FROM_BB, SHORT_FULL_BB
+
+    base = replace(_observations(hands=1)[0], big_blind=20)
+    pushes = [
+        detailed(shove_corto=1.0).push(replace(base, my_stack=int(bb * 20), my_current_bet=0))[SHOVE]
+        for bb in (SHORT_FROM_BB + 5, SHORT_FROM_BB - 5, SHORT_FULL_BB, 2)
+    ]
+    assert pushes[0] == 0.0 < pushes[1] < pushes[2] == pushes[3] == 1.0

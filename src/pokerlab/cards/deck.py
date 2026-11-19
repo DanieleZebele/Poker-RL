@@ -24,5 +24,11 @@ class Deck:
         dealt, self._cards = self._cards[:n], self._cards[n:]
         return dealt
 
+    def peek(self, n: int) -> list[Card]:
+        """The next `n` cards, left in the deck: what `deal(n)` would hand out now."""
+        if not 0 <= n <= len(self._cards):
+            raise ValueError(f"cannot look at {n} cards of {len(self._cards)}")
+        return list(self._cards[:n])
+
     def __len__(self) -> int:
         return len(self._cards)

@@ -21,7 +21,7 @@ import math
 import random
 import time
 import tkinter as tk
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from tkinter import font as tkfont
 from tkinter import messagebox, ttk
@@ -54,6 +54,7 @@ from pokerlab.gui.spot_table import (
     chair_for_client_seat,
     chair_slot,
 )
+from pokerlab.rl.action_space import RAISE_BINS
 from pokerlab.vision.regions import DEALER_TABLE_SIZES, DEFAULT_TABLE_SIZE
 
 # One wheel notch over a bet or raise amount moves it by this many big blinds.
@@ -1733,7 +1734,12 @@ class SpotFrame(ttk.Frame):
         key = (item.label, spot.hole_cards, tuple(spot.board), tuple(spot.script), spot.my_seat)
         if self._draw_key != key or self._draw is None:
             options = [b for b in item.bins if b.legal and b.probability > 0] or [item.best]
-            self._draw = self._rng.choices(options, weights=[b.probability for b in options])[0]
+            drawn = self._rng.choices(options, weights=[b.probability for b in options])[0]
+            if item.weighted_raise is not None and drawn.index in RAISE_BINS:
+                # The models size a drawn raise by every raise bin's probability
+                # (`raise_sizing = "weighted"`): what they would raise to at a table.
+                drawn = replace(drawn, action=item.weighted_raise)
+            self._draw = drawn
             self._draw_key = key
         return self._draw
 

@@ -8,15 +8,15 @@ a uniform-random baseline in tests, and a replayed checkpoint.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 from pokerlab.cards.card import Card
 from pokerlab.engine.actions import Action, LegalAction
 from pokerlab.engine.state import PlayerStatus
 from pokerlab.players.base import Observation, Player
-from pokerlab.rl.action_space import action_index_to_action, legal_action_mask
-from pokerlab.rl.features import FEATURE_VERSION, card_index, chips_at_stake, encode_observation
+from pokerlab.rl.action_space import RAISE_BINS, action_index_to_action, legal_action_mask
+from pokerlab.rl.features import FEATURE_VERSION, card_index, encode_observation
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,8 @@ class PolicyDecision:
     action_index: int
     log_prob: float = 0.0
     value: float = 0.0
+    # Every bin's probability, when the policy sizes its raises by them (`raise_sizing`).
+    probabilities: list[float] | None = None
 
 
 @dataclass(frozen=True)
@@ -43,8 +45,14 @@ class DealView:
     board: tuple[int, ...]
 
 
-def deal_view(observation: Observation, hole_cards: dict[int, tuple[Card, Card]]) -> DealView:
-    """The `DealView` of a decision, given every seat's hole cards."""
+def deal_view(
+    observation: Observation,
+    hole_cards: dict[int, tuple[Card, Card]],
+    runout: Sequence[Card] | None = None,
+) -> DealView:
+    """The `DealView` of a decision, given every seat's hole cards. With `runout`, the five
+    community cards the hand will have, the view's board is all five of them (the critic in
+    hindsight, see `SelfPlayCollector`); the cards already out must be its first."""
     seats = list(observation.seats)
     mine = next(i for i, seat in enumerate(seats) if seat.seat == observation.my_seat)
     rotated = seats[mine:] + seats[:mine]
@@ -54,7 +62,13 @@ def deal_view(observation: Observation, hole_cards: dict[int, tuple[Card, Card]]
         else (card_index(hole_cards[seat.seat][0]), card_index(hole_cards[seat.seat][1]))
         for seat in rotated
     )
-    return DealView(holes, tuple(card_index(card) for card in observation.community_cards))
+    visible = tuple(card_index(card) for card in observation.community_cards)
+    if runout is None:
+        return DealView(holes, visible)
+    board = tuple(card_index(card) for card in runout)
+    if len(board) != 5 or board[: len(visible)] != visible:
+        raise ValueError(f"the runout {board} does not continue the board {visible}")
+    return DealView(holes, board)
 
 
 @dataclass
@@ -69,10 +83,6 @@ class DecisionRecord:
     action_index: int
     log_prob: float
     value: float
-    # What this hand can still move for this seat, in big blinds (`chips_at_stake`): what
-    # the critic's loss weighs the decision by (`rl/ppo.py`), since the spread of the
-    # value target grows with it.
-    stake_bb: float
     # The *training* reward, in whatever unit the critic predicts (see
     # SelfPlayCollector's reward_scale) -- not necessarily big blinds. Zero on
     # every decision but the last of a hand: the reward is terminal.
@@ -111,8 +121,10 @@ class RLAgentPlayer(Player):
         starting_stack: int,
         on_decision: Callable[[DecisionRecord], None] | None = None,
         deal_holes: Callable[[], dict[int, tuple[Card, Card]]] | None = None,
+        deal_runout: Callable[[], Sequence[Card]] | None = None,
         style: Callable[[Observation], tuple[list[float], float]] | None = None,
         feature_version: int | None = None,
+        oracle: Callable[[], tuple[float, str, tuple[int, ...]]] | None = None,
     ) -> None:
         super().__init__(player_id, name)
         self._policy_fn = policy_fn
@@ -130,9 +142,22 @@ class RLAgentPlayer(Player):
         # Where to read every seat's hole cards from, when the critic is given more than
         # the policy sees: a training collector supplies it, a playing seat never does.
         self._deal_holes = deal_holes
+        # And the board the hand will have, when the critic is given that too.
+        self._deal_runout = deal_runout
         # An opponent's style (`rl/styles.py`): from the state, a push on the logits and a
         # temperature, handed to the policy. A learner never has one.
         self._style = style
+        # Feature version 5 reads a belief about every opponent, which the policy computes
+        # (`make_policy_fn` attaches `beliefs`, `rl/belief.py`). A policy without it (a test's
+        # plain callable) gives none: those slots read zero.
+        self._beliefs = getattr(policy_fn, "beliefs", None) if self._feature_version == 5 else None
+        # Training only (oracle guiding): how much of the opponents' true cards to give the beliefs
+        # and how (`belief_inputs.ORACLE_MODES`), read at every decision; the cards come from
+        # `deal_holes`.
+        self._oracle = oracle
+        # How a drawn raise is sized (`action_space.RAISE_SIZINGS`): the policy's own setting
+        # (`make_policy_fn(raise_sizing=)`), else the bin's level.
+        self._raise_sizing = getattr(policy_fn, "raise_sizing", "bin")
 
     def _normalisers(self, observation: Observation) -> tuple[int, float]:
         """The big blind and the starting stack the features are divided by in this hand.
@@ -160,8 +185,17 @@ class RLAgentPlayer(Player):
             starting_stack=starting_stack,
             legal_mask=mask,
             version=self._feature_version,
+            beliefs=self._beliefs_for(observation, big_blind) if self._beliefs is not None else None,
         )
         return features, mask
+
+    def _beliefs_for(self, observation: Observation, big_blind: int) -> dict[int, list[float]]:
+        share, mode, near = self._oracle() if self._oracle is not None else (0.0, "mix", ())
+        oracle = None
+        if share > 0 and self._deal_holes is not None:
+            holes = self._deal_holes()
+            oracle = (share, {seat: (card_index(a), card_index(b)) for seat, (a, b) in holes.items()}, mode, near)
+        return self._beliefs(observation, big_blind, oracle)
 
     def action_probabilities(
         self, observation: Observation, legal_actions: list[LegalAction]
@@ -200,12 +234,21 @@ class RLAgentPlayer(Player):
                     action_index=decision.action_index,
                     log_prob=decision.log_prob,
                     value=decision.value,
-                    stake_bb=chips_at_stake(observation) / self._normalisers(observation)[0],
                     critic_view=(
-                        deal_view(observation, self._deal_holes())
+                        deal_view(
+                            observation,
+                            self._deal_holes(),
+                            self._deal_runout() if self._deal_runout is not None else None,
+                        )
                         if self._deal_holes is not None
                         else None
                     ),
                 )
             )
-        return action_index_to_action(decision.action_index, observation, legal_actions)
+        weights = None
+        if self._raise_sizing == "weighted" and decision.action_index in RAISE_BINS:
+            probabilities = decision.probabilities
+            if probabilities is None:
+                probabilities = self.action_probabilities(observation, legal_actions)
+            weights = (probabilities, mask)
+        return action_index_to_action(decision.action_index, observation, legal_actions, weights=weights)

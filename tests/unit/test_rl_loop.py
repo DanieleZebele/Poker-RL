@@ -471,11 +471,11 @@ def launch_args(tmp_path, **overrides):
         "workers": 4, "seed_base": 1000, "iterations": 5, "hands": 8,
         "table_weights": [0.0, 1.0, 0, 0, 0, 0, 0, 0], "stack_min_bb": 50.0, "stack_max_bb": 50.0,
         "sb": 1, "bb": 2, "lr": 3e-4, "device": "cpu",
-        "hidden": 512, "num_layers": 3, "head_hidden": 256, "head_layers": 1, "equity_model": "e.pt",
+        "hidden": 512, "num_layers": 3, "head_hidden": 256, "head_layers": 1, "critic_bins": 0, "equity_model": "e.pt", "feature_version": 3, "belief_model": "", "belief_oracle": 0.0, "belief_oracle_iterations": 0, "belief_oracle_mode": "mix", "belief_oracle_near": [64], "raise_sizing": "bin",
         "models_dir": tmp_path / "models",
-        "machine": "host-a", "pool_models": 20, "table_hands": 200, "concurrent_tables": 8, "allin_runouts": 20, "style_share": 0.0, "style_spread": 0.5, "style_temperature_spread": 0.2, "style_jitter": 0.1, "style_scales": [1.0] * 5, "critic_stack_power": 1.4, "collect_workers": 1, "session_workers": 1, "pool_refresh_every": 0, "update_device": "same", "snapshot_every": 0, "snapshot_benchmark_sessions": 10, "lr_anneal_iterations": 0, "lr_anneal_final": 1e-5, "entropy_anneal_iterations": 0, "entropy_anneal_start": 0.1, "entropy_anneal_final": 0.0001, "pool_top_share": 0.5, "pool_top_n": 100,
+        "machine": "host-a", "pool_models": 20, "table_hands": 200, "concurrent_tables": 8, "allin_runouts": 20, "critic_runout": False, "style_share": 0.0, "style_spread": 0.5, "style_temperature_spread": 0.2, "style_jitter": 0.1, "style_scales": [1.0] * 5, "collect_workers": 1, "session_workers": 1, "pool_refresh_every": 0, "update_device": "same", "snapshot_every": 0, "snapshot_benchmark_sessions": 10, "lr_anneal_iterations": 0, "lr_anneal_final": 1e-5, "entropy_anneal_iterations": 0, "entropy_anneal_start": 0.1, "entropy_anneal_final": 0.0001, "pool_top_share": 0.5, "pool_top_n": 100,
         "ppo_epochs": 4, "clip_epsilon": 0.2, "eval_every": 10,
-        "minibatch_size": 1024, "gae_lambda": 0.95, "value_coef": 0.5, "policy_max_grad_norm": 0.5, "critic_max_grad_norm": 1.0,
+        "minibatch_size": 1024, "gae_lambda": 0.95, "value_coef": 0.5, "policy_max_grad_norm": 0.5,
         "k_schedule": "0:16, 100:2", "draw_tiers": "10, 100, 1000, all",
         "eval_sessions": 2,
         "benchmark_dir": tmp_path / "benchmark",
@@ -634,7 +634,6 @@ def test_a_parent_that_vanished_leaves_the_worker_fresh(tmp_path, monkeypatch):
 # A parent with the annealing curves and the styled opponents switched on.
 SWITCHED_ON = {
     "lr_anneal_iterations": 500, "entropy_anneal_iterations": 500, "style_share": 0.3,
-    "critic_stack_power": 1.4,
 }
 
 
@@ -652,7 +651,7 @@ def a_parent(**overrides):
         "minibatch_size": 1024,
         "gae_lambda": 0.95,
         "value_coef": 0.5,
-        "policy_max_grad_norm": 0.5, "critic_max_grad_norm": 1.0,
+        "policy_max_grad_norm": 0.5,
         "lr_anneal_final": 1e-5,
         "lr_anneal_iterations": 0,
         "entropy_anneal_start": 0.1,
@@ -662,7 +661,8 @@ def a_parent(**overrides):
         "style_spread": 0.5,
         "style_temperature_spread": 0.2,
         "style_jitter": 0.1,
-        "critic_stack_power": 0.0,
+        "belief_oracle": 0.0,
+        "belief_oracle_iterations": 0,
     }
     values.update(overrides)
     return values
@@ -781,20 +781,22 @@ def test_a_switched_off_annealing_or_style_stays_off():
     no styled seats: a step must not switch either on. Above 0 they move as usual."""
     off = a_parent(
         lr_anneal_iterations=0, entropy_anneal_iterations=0, style_share=0.0, style_jitter=0.0,
-        critic_stack_power=0.0,
     )
     children = [perturb_hyperparameters(off, random.Random(seed)) for seed in range(60)]
     assert all(
-        (c.lr_anneal_iterations, c.entropy_anneal_iterations, c.style_share, c.style_jitter,
-         c.critic_stack_power)
-        == (0, 0, 0.0, 0.0, 0.0)
+        (c.lr_anneal_iterations, c.entropy_anneal_iterations, c.style_share, c.style_jitter)
+        == (0, 0, 0.0, 0.0)
         for c in children
     )
+    assert all((c.belief_oracle, c.belief_oracle_iterations) == (0.0, 0) for c in children)
+    oracle = [perturb_hyperparameters(a_parent(belief_oracle=0.9, belief_oracle_iterations=500), random.Random(seed))
+              for seed in range(60)]
+    assert {c.belief_oracle_iterations for c in oracle} == {400, 500, 600}
+    assert max(c.belief_oracle for c in oracle) == 1.0  # a share, capped at 1
     on = [perturb_hyperparameters(a_parent(**SWITCHED_ON), random.Random(seed)) for seed in range(60)]
     assert {c.lr_anneal_iterations for c in on} == {400, 500, 600}
     assert {c.entropy_anneal_iterations for c in on} == {400, 500, 600}
     assert len({c.style_share for c in on}) == 3
-    assert {round(c.critic_stack_power, 6) for c in on} == {1.12, 1.4, 1.68}
 
 
 def test_the_style_share_is_capped_at_one():
@@ -820,7 +822,6 @@ def test_a_worker_trains_with_its_own_annealing_and_style(tmp_path, monkeypatch)
         lr_anneal_final=2e-5, lr_anneal_iterations=700, entropy_anneal_start=0.05,
         entropy_anneal_final=3e-4, entropy_anneal_iterations=90, style_share=0.25,
         style_spread=0.6, style_temperature_spread=0.15, style_jitter=0.07,
-        critic_stack_power=1.12,
     )
     command, _ = capture_launch(tmp_path, monkeypatch, hp=hp)
 
@@ -836,7 +837,6 @@ def test_a_worker_trains_with_its_own_annealing_and_style(tmp_path, monkeypatch)
     assert value("--style-spread") == "0.6"
     assert value("--style-temperature-spread") == "0.15"
     assert value("--style-jitter") == "0.07"
-    assert value("--critic-stack-power") == "1.12"
     # The calibrated scales are the fleet's, not the worker's.
     scales = command.index("--style-scales")
     assert command[scales + 1 : scales + 6] == ["1.0"] * 5
@@ -983,14 +983,14 @@ def test_the_settings_are_read_back_out_of_a_real_checkpoint(tmp_path):
     from pokerlab.rl.train import run_metadata
 
     args = SimpleNamespace(
-        hp_arm=HP_ARM_SAMPLED, parent_label="", hidden=512, num_layers=3, head_hidden=256, head_layers=1, equity_model="e.pt", machine="host-a", seed=7, resume=True, iterations=100,
+        hp_arm=HP_ARM_SAMPLED, parent_label="", hidden=512, num_layers=3, head_hidden=256, head_layers=1, critic_bins=0, equity_model="e.pt", feature_version=3, belief_model="", belief_oracle=0.0, belief_oracle_iterations=0, belief_oracle_mode="mix", belief_oracle_near=[64], raise_sizing="bin", machine="host-a", seed=7, resume=True, iterations=100,
         hands=640, table_weights=[25.0, 20.0, 15.0, 10.0, 10.0, 10.0, 5.0, 5.0], stack_min_bb=1.0, stack_max_bb=100.0, sb=50, bb=100, lr=3.8e-4, ppo_epochs=5,
         clip_epsilon=0.25, opponent_probability=0.62,
         pool_models=20, table_hands=200, concurrent_tables=8, pool_top_share=0.5, pool_top_n=100,
-        minibatch_size=1024, gae_lambda=0.95, value_coef=0.5, policy_max_grad_norm=0.5, critic_max_grad_norm=1.0,
+        minibatch_size=1024, gae_lambda=0.95, value_coef=0.5, policy_max_grad_norm=0.5,
         lr_anneal_final=1e-5, lr_anneal_iterations=500, entropy_anneal_start=0.1, entropy_anneal_final=1e-4,
         entropy_anneal_iterations=500, style_share=0.3, style_spread=0.5, style_temperature_spread=0.2,
-        style_jitter=0.1, critic_stack_power=1.4,
+        style_jitter=0.1,
     )
     path = tmp_path / "agent.pt"
     save_checkpoint(path, tiny_model(), iteration=100, metadata=run_metadata(args))
@@ -1420,17 +1420,18 @@ def test_parse_worker_history_reads_the_gradient_lines():
 gradienti: policy media 0.8000 sd 0.2000 tagliati 75.0% soglia 0.5 | critico media 0.1000 sd 0.0500 tagliati 0.0% soglia 1 [40 passi]
 iter    2  reward   -0.15 bb  policy +0.0078  value    0.044  entropy 0.440  kl 0.0069  clip 0.063
 iter    3  reward   -0.15 bb  policy +0.0078  value    0.044  entropy 0.440  kl 0.0069  clip 0.063
-gradienti: policy media 0.3000 sd 0.1000 tagliati 10.0% soglia 0.65 | critico media 0.2000 sd 0.0400 tagliati 5.0% soglia 0.25 [40 passi]
+gradienti: policy media 0.3000 sd 0.1000 tagliati 10.0% soglia 0.65 | critico media 0.2000 sd 0.0400 [40 passi]
 gradienti: policy media 0.3000 sd 0.1000 tagliati 10.0% soglia 0.65 | critico media 0.2000 sd 0.04"""
     history = parse_worker_history("w01", text)
     # Anchored to the iteration printed just before; an iteration without a line has no
-    # point, and a cut line is not read at all.
+    # point, and a cut line is not read at all. The first line is in the format from before the
+    # critic's clip was removed, and is read all the same.
     assert history.grad_policy_mean == [[1, 0.8], [3, 0.3]]
     assert history.grad_policy_sd == [[1, 0.2], [3, 0.1]]
     assert history.grad_policy_clipped == [[1, 0.75], [3, 0.1]]
     assert history.grad_critic_mean == [[1, 0.1], [3, 0.2]]
-    assert history.grad_critic_clipped == [[1, 0.0], [3, 0.05]]
-    assert (history.grad_policy_threshold, history.grad_critic_threshold) == (0.65, 0.25)
+    assert history.grad_critic_sd == [[1, 0.05], [3, 0.04]]
+    assert history.grad_policy_threshold == 0.65
     assert parse_worker_history("w01", text.splitlines()[0]).grad_policy_threshold is None
 
 
@@ -2246,7 +2247,7 @@ def test_the_file_sets_the_shape_of_the_network(tmp_path):
     )
     args, _ = loop_module.load_args(["--config", str(path)])
     assert network_shape(args) == {
-        "hidden": 128, "num_layers": 2, "head_hidden": 64, "head_layers": 3,
+        "hidden": 128, "num_layers": 2, "head_hidden": 64, "head_layers": 3, "residual": 0,
     }
 
 
@@ -2384,3 +2385,16 @@ def test_a_worker_has_no_parent_when_no_file_has_its_network(tmp_path):
         ranking, models, 3, rng=random.Random(0), accept_path=lambda _path: False
     )
     assert plan == [None] * 3
+
+
+def test_an_arena_superseded_by_a_newer_one_is_not_a_failure(tmp_path, monkeypatch, capsys):
+    """A newer arena, which knows every anchor and more, settles them now: the claim
+    is retired like a success, not kept as a failed run for a human."""
+    from pokerlab.rl.global_store import ARENA_SUPERSEDED_EXIT
+
+    global_dir = tmp_path / "global"
+    request_benchmark_arena(global_dir, added=["m1"], machine="host-b")
+    ran, _command = run_arena(tmp_path, monkeypatch, global_dir, exit_code=ARENA_SUPERSEDED_EXIT)
+    assert ran is True
+    assert not list(global_dir.glob(f"{ARENA_REQUEST_FILENAME}*"))
+    assert "piu' recente" in capsys.readouterr().out

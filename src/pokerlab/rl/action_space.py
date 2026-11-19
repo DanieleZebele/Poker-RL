@@ -107,10 +107,71 @@ def legal_action_mask(
     return mask
 
 
+RAISE_BINS = tuple(range(RAISE_MIN_BIN, ALL_IN_BIN))  # min-raise and the pot fractions, not the shove
+# How a raise's size is chosen once a raise bin is drawn (`action_index_to_action`): the bin's own
+# level, or the mean of every legal raise bin's level weighted by its probability.
+RAISE_SIZINGS = ("bin", "weighted")
+
+# How the models of this process size a raise when they play: set once by a CLI from
+# `--raise-sizing` (`set_raise_sizing`), read by `policy.make_policy_fn` when it is not told. A
+# process setting rather than a parameter of every function that builds a player, because it has to
+# reach every player of every rated session, pool and shard alike; forked copies inherit it, and
+# the shards of a pass are handed the flag. The learner a collector trains never uses it: PPO
+# trains on the bins it drew. Here, in a module with no torch, so the torch-free CLIs can set it.
+_RAISE_SIZING = "bin"
+
+
+def set_raise_sizing(mode: str) -> None:
+    global _RAISE_SIZING
+    if mode not in RAISE_SIZINGS:
+        raise ValueError(f"raise sizing {mode!r} is not one of {RAISE_SIZINGS}")
+    _RAISE_SIZING = mode
+
+
+def raise_sizing() -> str:
+    return _RAISE_SIZING
+
+
+def add_raise_sizing_argument(parser) -> None:
+    """`--raise-sizing`, for every CLI that plays the models (and `poker-loop`, which forwards it)."""
+    parser.add_argument(
+        "--raise-sizing", choices=RAISE_SIZINGS, default="bin",
+        help="how the models size a raise when they play (rated sessions, the pool's opponents, the "
+        "GUI): bin, the drawn bin's level, or weighted, the mean of every open raise bin's level "
+        "weighted by its probability; the all-in stays a bin. The learner trains on bins either way",
+    )
+
+
+def weighted_raise_to(
+    probabilities: list[float], observation: Observation, legal_actions: list[LegalAction], mask: list[bool]
+) -> int:
+    """The raise-to level of a weighted raise: the mean of the levels of the open raise bins (the
+    min-raise and the pot fractions, never the all-in), each weighted by its probability, rounded
+    to a chip. Being a mean of legal levels it is legal itself."""
+    aggressive = _aggressive_legal(legal_actions)
+    if aggressive is None:
+        raise ValueError("a weighted raise needs a BET or RAISE to be legal")
+    levels = dict(_raise_levels(observation, aggressive))
+    open_bins = [index for index in RAISE_BINS if mask[index]]
+    total = sum(probabilities[index] for index in open_bins)
+    if total <= 0:
+        raise ValueError("a weighted raise needs some probability on an open raise bin")
+    mean = sum(probabilities[index] * levels[index] for index in open_bins) / total
+    return min(max(round(mean), aggressive.min_amount), aggressive.max_amount)
+
+
 def action_index_to_action(
-    index: int, observation: Observation, legal_actions: list[LegalAction]
+    index: int,
+    observation: Observation,
+    legal_actions: list[LegalAction],
+    *,
+    weights: tuple[list[float], list[bool]] | None = None,
 ) -> Action:
-    """Turn a sampled bin index into the engine's `Action`."""
+    """Turn a sampled bin index into the engine's `Action`.
+
+    With `weights` (the policy's probabilities and the mask it drew from), a raise bin raises to
+    `weighted_raise_to` instead of its own level: the policy decided to raise with the summed
+    probability of the raise bins, and sizes the raise with all of them."""
     if index == FOLD_BIN:
         return Action(ActionType.FOLD)
     if index == CHECK_CALL_BIN:
@@ -123,6 +184,9 @@ def action_index_to_action(
     aggressive = _aggressive_legal(legal_actions)
     if aggressive is None:
         raise ValueError(f"action bin {index} is a raise, but no BET/RAISE is legal here")
+    if weights is not None:
+        probabilities, mask = weights
+        return Action(aggressive.action_type, weighted_raise_to(probabilities, observation, legal_actions, mask))
     return Action(aggressive.action_type, dict(_raise_levels(observation, aggressive))[index])
 
 

@@ -266,7 +266,7 @@ def test_a_batch_cannot_hold_a_decision_without_the_critics_input():
     def decision(extra):
         return DecisionRecord(
             player_id="p", seat=0, features=[0.0] * OBS_DIM, legal_mask=[True] * ACTION_DIM,
-            action_index=0, log_prob=0.0, value=0.0, stake_bb=50.0, critic_extra=extra,
+            action_index=0, log_prob=0.0, value=0.0, critic_extra=extra,
         )
 
     trajectory = HandTrajectory(

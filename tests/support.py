@@ -91,12 +91,24 @@ def tiny_model(**shape):
     return PokerActorCritic(**shape, equity=TINY_EQUITY)
 
 
+# Feature version 5 holds a range in the encoder's space, so its encoder is 32 wide.
+TINY_EQUITY_V5 = {"hidden": 8, "latent": 32, "blocks": 1}
+TINY_BELIEF = {"hidden": 16, "gru": 8, "rank": 4, "state": 8, "embed": 8, "fingerprint": "tiny"}
+
+
+def tiny_belief_model(**shape):
+    """A `PokerActorCritic` of feature version 5 with a small, randomly initialised belief network."""
+    from pokerlab.rl.policy import PokerActorCritic
+
+    return PokerActorCritic(**shape, equity=TINY_EQUITY_V5, feature_version=5, belief=TINY_BELIEF)
+
+
 def tiny_critic(model):
     """The critic callables of `model`: an equity network whose encoder is the model's own."""
     from pokerlab.rl.equity_net import EquityNet
     from pokerlab.rl.policy import make_critic_fns
 
-    net = EquityNet(**TINY_EQUITY, arch="sets")
+    net = EquityNet(**model.equity, arch="sets")
     net.phi.load_state_dict(model.equity_encoder.phi.state_dict())
     return make_critic_fns(model, net.requires_grad_(False).eval())
 

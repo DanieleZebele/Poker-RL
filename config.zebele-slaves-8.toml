@@ -4,6 +4,8 @@
 # Per-machine identity keys (machine, workers, paths) are refused here as in config.toml.
 
 
+pool_models = 50
+
 # [fleet]
 worker_ceiling = 5
 collect_workers = 30     # forked copies of each worker that play its hands

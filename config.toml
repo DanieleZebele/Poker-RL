@@ -22,23 +22,63 @@ iterations = 1000
 table_hands = 100       # hands a training table keeps the same players: the opponent statistics fill in over them
 concurrent_tables = 8   # tables played in turn, so a batch is not the same few opponents
 allin_runouts = 20      # a hand all-in before the river trains on its expected result over this many boards (0: the real chips)
+belief_oracle_mode = "mix"     # feature version 5, oracle guiding: how the true cards are given -- mix ((1-s)*range + s*true hand), swap
+                               # (the true hand for some opponents), near (with probability s the range kept to the belief_oracle_near combos
+                               # nearest the true hand); E8: mix and near ~+5 bb/100 at iteration 40 from scratch, swap nothing.
+                               # The share s and how long it lasts are sweep axes: belief_oracle, belief_oracle_iterations in [starting-point]
 
 [styles]
-style_scales = [5.0, 8.0, 8.0, 4.0, 8.0]   # the unit of each style axis, from the calibration study: fleet-wide, not swept (share, spread, temperature and jitter are in [starting-point])
+# The unit of each style axis (rl/styles.py), from the calibration studies (studies/agents/style_calibration.py:
+# the strength at which an axis's costlier extreme costs what being the #50 instead of the #1 does). Fleet-wide,
+# not swept (share, spread, temperature and jitter are in [starting-point]). With only the first five listed, the
+# other ten are off.
+# The ten axes of detail are at 60% of their own calibration: each was calibrated alone, and fifteen add up -- a
+# random style at style_spread 0.75 cost -44 bb/100 at 100%, -14 at 60% (about the #50), -1.5 at 40%, +0.5 with the
+# first five alone (paired hands, 40,000 a setting).
+style_scales = [
+    5.0,   # larghezza: tight <-> loose preflop
+    8.0,   # aggressivita_preflop: call <-> raise preflop
+    8.0,   # aggressivita_postflop: check/call <-> bet/raise, every street after the flop
+    4.0,   # tenacia: gives up <-> calls, facing a bet
+    8.0,   # dimensione: small <-> big bets
+    12.0,  # posizione: looser and more aggressive the later it acts
+    14.0,  # aggressivita_flop: the flop alone (c-bet)
+    19.0,  # aggressivita_turn: the turn alone (second barrel)
+    12.0,  # aggressivita_river: the river alone
+    17.0,  # bluff: bets and raises with nothing
+    19.0,  # slowplay: checks and calls a strong hand (negative: fast-plays)
+    17.0,  # tre_bet: re-raises a single raise preflop
+    14.0,  # fold_al_tre_bet: folds its own raise to a re-raise
+    10.0,  # check_raise: raises a bet after checking the street
+    19.0,  # shove_corto: shoves instead of raising small with a short stack (25 bb down)
+]
 
 [network]
 hidden = 512        # width of each trunk's layers (policy and critic have one each, same shape, separate weights)
 num_layers = 3       # layers in each trunk
 head_hidden = 256    # width of the hidden layers of each head (policy and value)
 head_layers = 1      # hidden layers in each head before its output layer (0 = the output layer alone)
+critic_bins = 101    # 0: the critic is one value (squared error); N >= 2: a classifier over N
+                     # bins (HL-Gauss, uniform in symlog, cross-entropy; 101 is what was measured offline,
+                     # on since 2026-11-16). Not a reset: a parent with the other critic passes on everything but the
+                     # critic's output layer.
 equity_model = "equity_evaluator/distill-lat32_h256_h1.pt"   # required: an equity network (studies/equity_net). The policy
                      # reads its per-player encoder in place of the card planes and the critic, a separate network,
                      # reads every player's equity in place of them. A different file is a fleet reset: models built
                      # on different encoders do not exchange weights.
+feature_version = 5  # the encoding new networks read: 3, or 5 (a belief about every opponent's cards in place of the
+                     # opponent statistics; needs belief_model). A change is a reset for the lineages: a parent of
+                     # another version is not one, so the workers start from scratch until the store holds models of it.
+belief_model = "belief_evaluator/belief-memory-v3.pt"   # the belief network (studies/belief) copied into every network of
+                     # version 5; trained on equity_model. Read only at version 5.
+
+raise_sizing = "bin"  # how the models size a raise when they play (rated sessions, the pool's opponents, the GUI):
+                     # bin, the drawn bin's level; weighted, every open raise bin's level weighted by its probability
+                     # (the all-in stays a bin). The learner trains on bins either way.
 
 [opponent-pool]
 pool_models = 20
-pool_refresh_every = 10   # every this many iterations a run draws its whole opponent pool again from the store as it is now, with pool_top_share and pool_top_n (0: the pool drawn at the start stays all run)
+pool_refresh_every = 2   # every this many iterations a run draws its whole opponent pool again from the store as it is now, with pool_top_share and pool_top_n (0: the pool drawn at the start stays all run)
 
 [inheritance]
 parent_tiers = "5, 10, 100, all"   # Where a worker's parent comes from.
@@ -47,13 +87,12 @@ parent_tiers = "5, 10, 100, all"   # Where a worker's parent comes from.
 lr = 0.0001
 hands = 20000                # per iteration 
 opponent_probability = 0.8
-ppo_epochs = 5
+ppo_epochs = 2
 clip_epsilon = 0.2
 minibatch_size = 10000
 gae_lambda = 0.7
 value_coef = 1.0
 policy_max_grad_norm = 0.7  # the policy's gradient clip
-critic_max_grad_norm = 0.5   # the critic's gradient clip: its own, the two networks share no weight
 pool_top_share = 0.8
 pool_top_n = 100
 # the annealing curves, counted from the start of each worker's own run (0 iterations: no annealing; 0 stays 0 under the sweep)
@@ -67,7 +106,8 @@ style_share = 0.5             # share of the opponent seats (pool models) that p
 style_spread = 0.75           # sd of each style axis (normal around 0, cut at +-1): most styles are mild, few extreme
 style_temperature_spread = 0.2  # sd of the log of a style's temperature (cut to a factor of 2 either way)
 style_jitter = 0.1            # sd of the noise on the shape of a style's push
-critic_stack_power = 1.1      # the critic's loss weighs a decision by (chips at stake in bb)^-power; inverse variance is 2x the exponent of sd ~ stake^a (a = 0.70 when set, 0.55 on 2026-11-05) (0: off, stays 0)
+belief_oracle = 0.5           # feature version 5: the share of the opponents' true cards given to the learner's beliefs at the start of a run (0 = off)
+belief_oracle_iterations = 500  # the iterations over which belief_oracle falls linearly to 0 (0: held all run)
 
 [sweep]
 inherit_hyperparameters = true    # true: a worker perturbs its parent's settings (the sweep). false: every worker uses exactly [starting-point], no perturbation, no optimizer
@@ -91,8 +131,8 @@ benchmark_rotate_every = 50  # sessions played against one slice before drawing 
 
 [population-elo]
 global_elo = true
-global_sample = 20
-global_benchmark_sample = 5
+global_sample = 10
+global_benchmark_sample = 20
 draw_tiers = "10, 100, all"   # Who the passes seat: equal share per tier.
 global_sessions = 100
 
@@ -102,9 +142,12 @@ fill_deadline_minutes = 1000
 fill_sessions = 10
 
 [pruning]
-global_trigger_size = 500
-global_eliminate_fraction = 0.1
+global_trigger_size = 5000
+global_eliminate_fraction = 0.01
 global_protect_percentile = 0.0
+prune_protect_top = 100    # the pruning keeps the 100 best-rated models whatever they play; below them it removes the
+                           # models that play most like another (rl/diversity.py, studies/agents/diversity_study.py)
+diversity_probes = "diversity/probes-v2.pkl"   # the decisions a model's play is read on; a new file means new signatures
 
 [anchors]
 benchmark_games_percentile = 90.0
@@ -112,7 +155,7 @@ benchmark_margin = 30.0
 
 [benchmark-arena]
 arena_min_sessions = 10000      # never declare convergence before this many rated sessions
-arena_max_sessions = 100000     # safety cap, not a failure
+arena_max_sessions = 1000000     # safety cap, not a failure
 arena_tolerance = 1.0           # rating points of net drift over the window
 arena_window = 10000             # sessions the drift is measured across
 arena_checkpoint_sessions = 200  # sessions between two writes of the ratings (and convergence tests)

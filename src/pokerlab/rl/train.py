@@ -26,7 +26,9 @@ from pokerlab.config import (
     resolved_settings,
 )
 from pokerlab.players.rl_agent import RLAgentPlayer
+from pokerlab.rl.action_space import add_raise_sizing_argument, set_raise_sizing
 from pokerlab.rl.allin_reward import DEFAULT_ALLIN_RUNOUTS
+from pokerlab.rl.belief_inputs import NEAR_COMBOS, ORACLE_MODES
 from pokerlab.rl.benchmark import (
     DEFAULT_ANCHOR_ROTATE_EVERY,
     DEFAULT_BENCHMARK_DIR,
@@ -34,15 +36,15 @@ from pokerlab.rl.benchmark import (
     DEFAULT_RESIDENT_ANCHORS,
 )
 from pokerlab.rl.device import resolve_device, resolve_update_device
-from pokerlab.rl.features import FEATURE_VERSION
-from pokerlab.rl.forking import run_in_copies, torch_seeded
-from pokerlab.rl.memory import release_free_memory
+from pokerlab.rl.diversity import DEFAULT_PROBES, DEFAULT_PROTECT_TOP
 from pokerlab.rl.equity_net import (
     encoder_config,
     equity_net_from_checkpoint,
     load_encoder_weights,
     load_equity_checkpoint,
 )
+from pokerlab.rl.features import BUILT_VERSIONS, FEATURE_VERSION
+from pokerlab.rl.forking import run_in_copies, torch_seeded
 from pokerlab.rl.global_arena import (
     BENCHMARK_GAMES_PERCENTILE,
     BENCHMARK_MARGIN,
@@ -62,7 +64,8 @@ from pokerlab.rl.global_store import (
     write_sidecar,
     write_snapshot,
 )
-from pokerlab.rl.grad_log import ClipReading, GradientReading, format_gradient_line
+from pokerlab.rl.grad_log import ClipReading, GradientReading, NormReading, format_gradient_line
+from pokerlab.rl.memory import release_free_memory
 from pokerlab.rl.phases import (
     DONE,
     ELO_FILL,
@@ -99,15 +102,17 @@ from pokerlab.rl.pool_registry import (
 )
 from pokerlab.rl.ppo import (
     PPOConfig,
-    entropy_coefficient_at,
-    learning_rate_at,
     build_batch,
     build_model_from_checkpoint,
     check_compatible,
     checkpoint_shape,
+    critic_of,
+    entropy_coefficient_at,
+    learning_rate_at,
     load_checkpoint,
     ppo_update,
     save_checkpoint,
+    shrink_and_perturb,
 )
 from pokerlab.rl.rollout import (
     DEFAULT_CONCURRENT_TABLES,
@@ -289,6 +294,15 @@ class TrainConfig:
     # Boards a hand closed before the river is averaged over for its training reward
     # (`rl/allin_reward.py`); 0 trains on the chips that moved.
     allin_runouts: int = DEFAULT_ALLIN_RUNOUTS
+    # The critic in hindsight: its equities on the hand's whole board (`SelfPlayCollector`).
+    critic_runout: bool = False
+    # Oracle guiding (feature version 5): the share of the opponents' true cards mixed into the
+    # learner's beliefs, falling linearly to 0 over `belief_oracle_iterations` (0: held).
+    belief_oracle: float = 0.0
+    belief_oracle_iterations: int = 0
+    belief_oracle_mode: str = "mix"  # `belief_inputs.ORACLE_MODES`
+    # `near`: the combos the range is kept to, one value or one per street (preflop, flop, turn, river)
+    belief_oracle_near: tuple[int, ...] = (NEAR_COMBOS,)
     # Forked copies of the process that play an iteration's hands (`SelfPlayCollector.collect`);
     # 1 plays them here, as before. CPU only: a CUDA context does not survive a fork.
     collect_workers: int = 1
@@ -394,7 +408,9 @@ class SelfPlayTrainer:
         # no rebuilding between iterations.
         self._collector = SelfPlayCollector(
             mix,
-            make_policy_fn(self._play_model, device=device),
+            # PPO trains on the bins it drew: the learner sizes its raises by them, whatever the
+            # process's raise sizing (which its opponents and every rated session follow).
+            make_policy_fn(self._play_model, device=device, raise_sizing="bin"),
             rng=self._rng,
             opponent_pool=self._pool,
             opponent_probability=self._train.opponent_probability,
@@ -404,6 +420,7 @@ class SelfPlayTrainer:
             allin_runouts=self._train.allin_runouts,
             styles=self._train.styles,
             critic=critic,
+            critic_runout=self._train.critic_runout,
             child_setup=_prepare_collector_copy,
         )
 
@@ -675,6 +692,9 @@ class SelfPlayTrainer:
 
     def train_iteration(self) -> dict[str, float]:
         self._iteration += 1
+        self._collector.oracle_share = belief_oracle_at(self._train, self._iteration)
+        self._collector.oracle_mode = self._train.belief_oracle_mode
+        self._collector.oracle_near = self._train.belief_oracle_near
         trajectories = self._collector.collect(
             self._train.hands_per_iteration,
             gamma=self._train.gamma,
@@ -739,7 +759,6 @@ REPORTED_AXES = (
     "gae_lambda",
     "value_coef",
     "policy_max_grad_norm",
-    "critic_max_grad_norm",
     "opponent_probability",
     # How strong a field this run drew. Reported like the rest, and worth
     # reading next to the `pool rating: media ...` line printed just below,
@@ -757,7 +776,9 @@ REPORTED_AXES = (
     "style_spread",
     "style_temperature_spread",
     "style_jitter",
-    "critic_stack_power",
+    # Oracle guiding (feature version 5): how much of the true cards and over how many iterations.
+    "belief_oracle",
+    "belief_oracle_iterations",
 )
 
 # Where the annealing curves start when neither a flag nor `config.toml` says,
@@ -816,11 +837,136 @@ def add_network_arguments(parser: argparse.ArgumentParser) -> None:
         "the output layer alone",
     )
     parser.add_argument(
+        "--residual", type=int, choices=(0, 1), default=0,
+        help="1: each trunk is a Linear, num_layers residual blocks and a LayerNorm (SimBa); "
+        "a study setting, the fleet's models are 0",
+    )
+    parser.add_argument(
+        "--dual-clip", type=float, default=0.0,
+        help="dual-clip PPO: with a negative advantage the surrogate is bounded below at this "
+        "times the advantage (> 1; 0 = off). A study setting",
+    )
+    parser.add_argument(
+        "--shrink-perturb", type=float, default=0.0,
+        help="soft shrink and perturb: after every step each Linear moves this share of the way "
+        "to a fresh initialisation (0 = off). A study setting",
+    )
+    parser.add_argument(
+        "--inherit-shrink", type=float, default=0.0,
+        help="shrink and perturb once, when resuming: the weights become this times themselves "
+        "plus the rest a fresh initialisation (0 = off). A study setting",
+    )
+    parser.add_argument(
+        "--critic-bins", type=int, default=DEFAULT_CRITIC_BINS,
+        help="0: the critic is one value trained on the squared error; N >= 2: a classifier "
+        "over N bins (HL-Gauss, uniform in symlog of the value), trained on the cross-entropy. "
+        "Only the critic's output layer depends on it: a parent "
+        "with another critic passes on everything else",
+    )
+    parser.add_argument(
         "--equity-model", type=str, default="",
         help="checkpoint of an equity network (studies/equity_net), required: the policy reads "
         "its per-player encoder in place of the card planes and the critic, a network of its "
         "own, reads the equity of every player in place of them",
     )
+    parser.add_argument(
+        "--feature-version", type=int, choices=BUILT_VERSIONS, default=FEATURE_VERSION,
+        help="the encoding new networks read (rl/features.py): 3, or 5, which gives the policy a "
+        "belief about every opponent's cards in place of the opponent statistics and needs "
+        "--belief-model. A parent of another version is not one: the worker starts from scratch",
+    )
+    parser.add_argument(
+        "--belief-model", type=str, default="",
+        help="file of a belief network (studies/belief, rl/belief.py), copied into every network "
+        "of feature version 5 built here; trained on the same --equity-model",
+    )
+
+
+def add_oracle_arguments(parser: argparse.ArgumentParser) -> None:
+    """Oracle guiding (feature version 5), for `poker-train` and `poker-loop`, which forwards it."""
+    parser.add_argument(
+        "--belief-oracle", type=float, default=TrainConfig.belief_oracle,
+        help="feature version 5, training only: the share of the opponents' true cards mixed into "
+        "the learner's beliefs ((1 - s) * range + s * true hand), so the policy learns early what "
+        "the vectors are for; 0 (off) gives it only what it may know",
+    )
+    parser.add_argument(
+        "--belief-oracle-iterations", type=int, default=TrainConfig.belief_oracle_iterations,
+        help="iterations over which --belief-oracle falls linearly to 0; 0 holds it",
+    )
+    parser.add_argument(
+        "--belief-oracle-mode", choices=ORACLE_MODES, default=TrainConfig.belief_oracle_mode,
+        help="how the true cards are given: mix (every vector (1 - s) * range + s * true hand), swap "
+        "(with probability s an opponent is read as its true hand for the whole hand), near (with "
+        "probability s its range is kept to the combos nearest its true hand)",
+    )
+    parser.add_argument(
+        "--belief-oracle-near", type=int, nargs="+", default=list(TrainConfig.belief_oracle_near),
+        help="with --belief-oracle-mode near: how many combos, the nearest the true hand, the range is kept "
+        "to; one value, or four (preflop, flop, turn, river)",
+    )
+
+
+def belief_oracle_at(config: TrainConfig, iteration: int) -> float:
+    """The share of the true cards in the learner's beliefs at `iteration` (from 1): the start,
+    falling linearly to 0 at iteration `belief_oracle_iterations + 1`, or held with 0 iterations."""
+    if config.belief_oracle <= 0 or config.belief_oracle_iterations <= 0:
+        return max(config.belief_oracle, 0.0)
+    left = 1.0 - (iteration - 1) / config.belief_oracle_iterations
+    return config.belief_oracle * max(left, 0.0)
+
+
+def network_belief(args: argparse.Namespace) -> dict | None:
+    """The belief file a new network is built with: None below version 5."""
+    if args.feature_version != 5:
+        return None
+    from pokerlab.rl.belief import load_belief_file
+
+    return load_belief_file(args.belief_model)
+
+
+def build_network(args: argparse.Namespace, mix: TableMix) -> PokerActorCritic:
+    """A new network as the flags ask: its shape, its equity encoder and, at version 5, its
+    belief network, weights loaded and frozen."""
+    from pokerlab.rl.belief import belief_spec
+
+    equity_saved = load_equity_checkpoint(args.equity_model)
+    saved_belief = network_belief(args)
+    model = PokerActorCritic(
+        **network_shape(args),
+        equity=encoder_config(equity_saved),
+        critic=critic_support(mix, args.critic_bins),
+        feature_version=args.feature_version,
+        belief=None if saved_belief is None else belief_spec(saved_belief),
+    )
+    load_encoder_weights(model.equity_encoder, equity_saved)
+    if saved_belief is not None:
+        model.belief_net.load_state_dict(saved_belief["state"])
+    return model
+
+
+# The scalar critic, as every model before the classifier was trained with.
+DEFAULT_CRITIC_BINS = 0
+# How far past the largest possible result the support reaches, in deepest stacks.
+CRITIC_MARGIN = 0.05
+
+
+def critic_support(mix: TableMix, bins: int) -> dict[str, float] | None:
+    """The classifier critic for `bins` bins on `mix` (None for 0: the scalar critic).
+
+    The value is the training reward, big blinds times `big_blind / starting_stack` (the
+    trainer's default reward scale), so one big blind is `unit` and the deepest stack 1: a seat
+    can lose at most its own stack and win at most every other seat's, which on the largest
+    table is `max_players - 1` deepest stacks."""
+    if bins == 0:
+        return None
+    unit = mix.big_blind / mix.starting_stack
+    return {
+        "bins": bins,
+        "low": -(1 + CRITIC_MARGIN),
+        "high": mix.max_players - 1 + CRITIC_MARGIN,
+        "unit": unit,
+    }
 
 
 def network_shape(args: argparse.Namespace) -> dict[str, int]:
@@ -830,6 +976,7 @@ def network_shape(args: argparse.Namespace) -> dict[str, int]:
         "num_layers": args.num_layers,
         "head_hidden": args.head_hidden,
         "head_layers": args.head_layers,
+        "residual": getattr(args, "residual", 0),
     }
 
 
@@ -838,6 +985,7 @@ def parent_shape_mismatch(
     shape: dict[str, int],
     equity: dict[str, int],
     feature_version: int = FEATURE_VERSION,
+    belief: dict | None = None,
 ) -> dict | None:
     """The shape of the checkpoint at `path` if it is not `shape` (with `equity`, the shape of
     the equity encoder it is built with, and `feature_version`, the encoding it reads), else None.
@@ -850,32 +998,42 @@ def parent_shape_mismatch(
     parent = torch.load(path, map_location="cpu", weights_only=True)
     check_compatible(parent, str(path))
     found = checkpoint_shape(parent)
+    shape = {"residual": 0, **shape}  # a shape given without it is a plain network
     if parent["feature_version"] != feature_version:
         return {**found, "feature_version": parent["feature_version"]}
     if found != shape:
         return found
     # The same shape, but built with another equity encoder: the weights cannot be exchanged.
     found_equity = parent["equity"]
-    return None if found_equity == equity else {**found, "equity": found_equity}
+    if found_equity != equity:
+        return {**found, "equity": found_equity}
+    # Version 5 built on another belief network: its policy read other vectors.
+    return None if parent.get("belief") == belief else {**found, "belief": parent.get("belief")}
 
 
 _NETWORK_OF: dict[str, tuple | None] = {}
 
 
 def same_network_filter(
-    shape: dict[str, int], equity: dict[str, int], feature_version: int = FEATURE_VERSION
+    shape: dict[str, int],
+    equity: dict[str, int],
+    feature_version: int = FEATURE_VERSION,
+    belief_fingerprint: str | None = None,
 ) -> Callable[[str | Path], bool]:
     """A test for "this checkpoint can be resumed into a network of `shape` and `equity`":
-    the same trunk and head sizes, the same equity encoder, and the same feature version.
+    the same trunk and head sizes, the same equity encoder, the same feature version and, at
+    version 5, the same belief network (`belief_fingerprint`, None below it).
 
     A published checkpoint never changes, so what is read from one is remembered for the
     life of the process (the supervisor asks about every model of the store each
     generation, and a read is ~7 ms). A file that cannot be read or is not this build's
     is simply not a parent."""
+    shape = {"residual": 0, **shape}  # a shape given without it is a plain network
     wanted = (
         *(shape[key] for key in sorted(shape)),
         tuple(sorted(equity.items())),
         feature_version,
+        belief_fingerprint,
     )
 
     def accepts(path: str | Path) -> bool:
@@ -889,6 +1047,7 @@ def same_network_filter(
                     *(found[name] for name in sorted(found)),
                     tuple(sorted(checkpoint["equity"].items())),
                     checkpoint["feature_version"],
+                    (checkpoint.get("belief") or {}).get("fingerprint"),
                 )
             except Exception:  # noqa: BLE001 - torch raises whatever the mount felt like
                 _NETWORK_OF[key] = None
@@ -902,10 +1061,27 @@ def check_network_arguments(args: argparse.Namespace) -> None:
     for name, minimum in (("hidden", 1), ("num_layers", 1), ("head_hidden", 1), ("head_layers", 0)):
         if getattr(args, name) < minimum:
             raise ValueError(f"{name} must be at least {minimum}, got {getattr(args, name)}")
+    if args.critic_bins < 0 or args.critic_bins == 1:
+        raise ValueError(f"critic_bins must be 0 (a scalar critic) or at least 2, got {args.critic_bins}")
     if not args.equity_model:
         raise ValueError("--equity-model is required: set equity_model in config.toml or pass the flag")
     if not Path(args.equity_model).is_file():
         raise ValueError(f"--equity-model {args.equity_model}: no such file")
+    if args.feature_version == 5:
+        if not args.belief_model or not Path(args.belief_model).is_file():
+            raise ValueError(f"feature version 5 needs --belief-model, a file: got {args.belief_model!r}")
+        from pokerlab.rl.belief import file_fingerprint, load_belief_file
+
+        trained_on = load_belief_file(args.belief_model).get("equity_model", "")
+        if not Path(trained_on).is_file() or file_fingerprint(trained_on) != file_fingerprint(args.equity_model):
+            raise ValueError(
+                f"--belief-model {args.belief_model} was trained on the equity network {trained_on!r}, "
+                f"not on --equity-model {args.equity_model}: it scores the combos in another space"
+            )
+    if not 0.0 <= args.belief_oracle <= 1.0 or args.belief_oracle_iterations < 0:
+        raise ValueError("--belief-oracle is a share in [0, 1] and --belief-oracle-iterations at least 0")
+    if len(args.belief_oracle_near) not in (1, 4) or min(args.belief_oracle_near) < 1:
+        raise ValueError("--belief-oracle-near is one count, or four (preflop, flop, turn, river), each at least 1")
     style_config_from_args(args)  # raises, naming the flag, on a style setting that cannot be used
 
 
@@ -937,6 +1113,7 @@ def run_metadata(args: argparse.Namespace) -> dict:
         "resumed": bool(args.resume),
         "parent_label": args.parent_label,
         **network_shape(args),
+        "critic_bins": args.critic_bins,
         "iterations": args.iterations,
         "hands": args.hands,
         "table_weights": list(args.table_weights),
@@ -951,7 +1128,6 @@ def run_metadata(args: argparse.Namespace) -> dict:
         "gae_lambda": args.gae_lambda,
         "value_coef": args.value_coef,
         "policy_max_grad_norm": args.policy_max_grad_norm,
-        "critic_max_grad_norm": args.critic_max_grad_norm,
         "opponent_probability": args.opponent_probability,
         "pool_models": args.pool_models,
         "table_hands": args.table_hands,
@@ -967,7 +1143,8 @@ def run_metadata(args: argparse.Namespace) -> dict:
         "style_spread": args.style_spread,
         "style_temperature_spread": args.style_temperature_spread,
         "style_jitter": args.style_jitter,
-        "critic_stack_power": args.critic_stack_power,
+        "belief_oracle": args.belief_oracle,
+        "belief_oracle_iterations": args.belief_oracle_iterations,
         # Everything else the run resolved to (evaluation, population pass,
         # fill-in...): with a config file, a run's settings are no longer
         # recoverable from its command line.
@@ -1401,11 +1578,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="gradient clipping norm of the policy's weights",
     )
     parser.add_argument(
-        "--critic-max-grad-norm", type=float, default=PPOConfig.critic_max_grad_norm,
-        help="gradient clipping norm of the critic's weights: a clip of its own, since the two "
-        "networks share no weight and their gradients live on different scales",
-    )
-    parser.add_argument(
         "--update-device", default="same",
         help="where the PPO update and the critic run: same (as --device), auto (the GPU if "
         "there is one, else as --device), cpu or cuda. The hands are played on --device; with "
@@ -1533,13 +1705,20 @@ def build_parser() -> argparse.ArgumentParser:
         "drops the runout's luck from the value target); 0 trains on the chips that "
         "moved. Training only: every reported and rated result is the real chips",
     )
+    add_oracle_arguments(parser)
+    add_raise_sizing_argument(parser)
     parser.add_argument(
-        "--critic-stack-power", type=float, default=PPOConfig.critic_stack_power,
-        help="weigh each decision in the critic's loss by its chips at stake in big "
-        "blinds to this power, negated (0: every decision alike). The target's spread "
-        "grows with the stake, so without it the critic learns the deep hands and "
-        "ignores the short ones; a weight on the state alone leaves the policy's "
-        "objective unchanged. An axis of poker-loop's sweep",
+        "--critic-runout", dest="critic_runout", action="store_true", default=False,
+        help="the critic reads every player's equity on the board the hand will have once all "
+        "five cards are out (the deck is already shuffled), not on the cards out so far: the "
+        "baseline then takes the luck of the cards to come out of the advantages. Training only, "
+        "never seen by the policy. Off by default: in place of the equities on the board as it "
+        "stands it explained less of the return (they are what the all-in runouts' expected "
+        "result follows)",
+    )
+    parser.add_argument(
+        "--no-critic-runout", dest="critic_runout", action="store_false",
+        help="the critic reads the equities on the board as it stands (the default)",
     )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
@@ -1652,6 +1831,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--global-protect-percentile", type=float, default=DEFAULT_PROTECT_PERCENTILE
     )
     parser.add_argument(
+        "--prune-protect-top", type=int, default=DEFAULT_PROTECT_TOP,
+        help="the pruning keeps this many best-rated models of the store whatever they play; below "
+        "them it removes the models whose play is nearest to another's (rl/diversity.py)",
+    )
+    parser.add_argument(
+        "--diversity-probes", type=str, default=DEFAULT_PROBES,
+        help="the fixed decisions a model's play is read on to tell how alike two models are "
+        "(studies/agents/diversity_study.py probes); without the file nothing is pruned",
+    )
+    parser.add_argument(
         "--benchmark-games-percentile", type=float, default=BENCHMARK_GAMES_PERCENTILE,
         help="a model becomes a frozen anchor only if its games are above this "
         "percentile of the population's (a rating built on few games is not evidence)",
@@ -1715,6 +1904,7 @@ def main() -> None:
         parser.exit(2, f"{parser.prog}: config: {error}\n")
     args.device = resolve_device(args.device)
     args.update_device = resolve_update_device(args.update_device, args.device)
+    set_raise_sizing(args.raise_sizing)
     if args.print_config:
         print(format_config(
             vars(args),
@@ -1761,11 +1951,11 @@ def main() -> None:
     check_network_arguments(args)
     shape = network_shape(args)
     # The policy gets the equity network's per-player encoder (frozen, kept in the model's
-    # own weights) and the critic the full network's output (training only).
+    # own weights) and the critic the full network's output (training only); at version 5 the
+    # policy also gets the belief network (frozen, in the model's weights too).
     equity_saved = load_equity_checkpoint(args.equity_model)
     equity_config = encoder_config(equity_saved)
-    model = PokerActorCritic(**shape, equity=equity_config)
-    load_encoder_weights(model.equity_encoder, equity_saved)
+    model = build_network(args, mix)
     critic = make_critic_fns(
         model, equity_net_from_checkpoint(equity_saved), device=args.update_device
     )
@@ -1775,11 +1965,13 @@ def main() -> None:
         # `config.toml` changes this is an ordinary event, not an error: the worker
         # trains the new shape from scratch (and, having taken no step from that
         # parent, records no sweep observation).
-        parent_shape = parent_shape_mismatch(args.checkpoint, shape, equity_config)
+        parent_shape = parent_shape_mismatch(
+            args.checkpoint, shape, equity_config, args.feature_version, model.belief
+        )
         if parent_shape is not None:
             print(
                 f"parent has a different network ({parent_shape}), this run builds "
-                f"{ {**shape, 'equity': equity_config} }: "
+                f"{ {**shape, 'equity': equity_config, 'feature_version': args.feature_version} }: "
                 "starting from scratch instead of resuming",
                 flush=True,
             )
@@ -1792,6 +1984,11 @@ def main() -> None:
             table_hands=args.table_hands,
             concurrent_tables=args.concurrent_tables,
             allin_runouts=args.allin_runouts,
+            critic_runout=args.critic_runout,
+            belief_oracle=args.belief_oracle,
+            belief_oracle_iterations=args.belief_oracle_iterations,
+            belief_oracle_mode=args.belief_oracle_mode,
+            belief_oracle_near=tuple(args.belief_oracle_near),
             collect_workers=args.collect_workers,
             session_workers=args.session_workers,
             styles=style_config_from_args(args),
@@ -1807,8 +2004,8 @@ def main() -> None:
             minibatch_size=args.minibatch_size,
             value_coefficient=args.value_coef,
             policy_max_grad_norm=args.policy_max_grad_norm,
-            critic_max_grad_norm=args.critic_max_grad_norm,
-            critic_stack_power=args.critic_stack_power,
+            dual_clip=args.dual_clip,
+            shrink_perturb=args.shrink_perturb,
         ),
         device=args.device,
         update_device=args.update_device,
@@ -1832,8 +2029,21 @@ def main() -> None:
         resumed = load_checkpoint(args.checkpoint, trainer.model, device=args.update_device)
         # the file is the source of truth for the frozen encoder
         load_encoder_weights(trainer.model.equity_encoder, equity_saved)
+        if args.inherit_shrink:
+            # shrink and perturb at the start (Ash & Adams 2020): the inherited weights moved
+            # 1 - `inherit_shrink` of the way towards a fresh initialisation
+            shrink_and_perturb(trainer.model, 1 - args.inherit_shrink)
+            print(f"pesi ereditati ristretti a {args.inherit_shrink} + inizializzazione nuova", flush=True)
         trainer.sync_play_model()
         parent_settings = recorded_axes(resumed.get("metadata"))
+        if resumed.get("critic_head_reset"):
+            print(
+                f"parent's critic {critic_of(resumed) or 'scalar'} (output started "
+                f"{resumed.get('critic_output_init') or 'the old way'}), this run's "
+                f"{trainer.model.critic or 'scalar'}: the critic's output layer starts afresh, "
+                "everything else is inherited",
+                flush=True,
+            )
         print(
             f"resumed from {args.checkpoint} "
             f"(rating ereditato {trainer.learner_rating:.0f})"
@@ -1928,10 +2138,7 @@ def main() -> None:
                         stats["grad_norm_policy"], stats["grad_norm_policy_sd"],
                         stats["grad_clipped_policy"], args.policy_max_grad_norm,
                     ),
-                    critic=ClipReading(
-                        stats["grad_norm_critic"], stats["grad_norm_critic_sd"],
-                        stats["grad_clipped_critic"], args.critic_max_grad_norm,
-                    ),
+                    critic=NormReading(stats["grad_norm_critic"], stats["grad_norm_critic_sd"]),
                     steps=int(stats["grad_steps"]),
                 )
             )
@@ -2168,6 +2375,8 @@ def main() -> None:
                 trigger_size=args.global_trigger_size,
                 eliminate_fraction=args.global_eliminate_fraction,
                 protect_percentile=args.global_protect_percentile,
+                protect_top=args.prune_protect_top,
+                diversity_probes=args.diversity_probes,
                 k_schedule=k_schedule,
                 on_skip=lambda path, why: print(f"  global pass, saltato {path}: {why}"),
                 on_phase=announce,

@@ -25,6 +25,7 @@ from pokerlab.engine.table import Table
 from pokerlab.players.base import Observation, Player
 from pokerlab.players.rl_agent import DealView, DecisionRecord, PolicyFn, RLAgentPlayer
 from pokerlab.rl.allin_reward import DEFAULT_ALLIN_RUNOUTS, expected_deltas
+from pokerlab.rl.belief_inputs import NEAR_COMBOS, MemoryTracker
 from pokerlab.rl.style_log import SIZE_GROUPS, STYLE_WINDOW, size_group
 from pokerlab.rl.styles import StyleConfig
 from pokerlab.rl.table_mix import TableMix
@@ -210,6 +211,8 @@ class TableBank:
         # Every seat's hole cards in the hand being played, from the table's own
         # spectator hook: what a critic that sees more than the players do reads.
         self.hole_cards: dict[int, tuple[Card, Card]] = {}
+        # And the five community cards the hand will have (the engine's `runout`).
+        self.runout: tuple[Card, ...] = ()
 
     def _entry(self, num_players: int, slot: int = 0) -> tuple[Table, list[SeatProxy]]:
         entry = self._tables.get((slot, num_players))
@@ -221,6 +224,7 @@ class TableBank:
                     list(proxies),
                     rng=self._rng,
                     on_hand_started=self._hand_started,
+                    memory_tracker=MemoryTracker(),
                 ),
                 proxies,
             )
@@ -229,6 +233,7 @@ class TableBank:
 
     def _hand_started(self, info: dict) -> None:
         self.hole_cards = info["hole_cards"]
+        self.runout = info["runout"]
 
     def reseed(self, seed: int) -> None:
         """Restart both random streams (the deals and the stacks) from `seed`: what a forked
@@ -245,8 +250,12 @@ class TableBank:
 
     def reset_stats(self, num_players: int, slot: int = 0) -> None:
         """Start the statistics of this table afresh: a new set of players is about to
-        sit, and what was learned about the last ones describes nobody here."""
-        self._entry(num_players, slot)[0].stats_tracker = StatsTracker()
+        sit, and what was learned about the last ones describes nobody here. The same for
+        its memory (`rl/belief_inputs.py`), which the belief networks of version 5 read:
+        computed only when such a model asks, so a table without one pays for a list."""
+        table = self._entry(num_players, slot)[0]
+        table.stats_tracker = StatsTracker()
+        table.memory_tracker = MemoryTracker()
 
     def play_hand(self, num_players: int, slot: int = 0) -> tuple[list[int], list[int]]:
         """One hand from freshly drawn stacks: `(stacks before, stacks after)`."""
@@ -330,6 +339,7 @@ class SelfPlayCollector:
         allin_runouts: int = DEFAULT_ALLIN_RUNOUTS,
         styles: StyleConfig | None = None,
         critic: CriticFns,
+        critic_runout: bool = False,
         child_setup: Callable[[int], None] | None = None,
     ) -> None:
         if table_hands < 1 or concurrent_tables < 1:
@@ -360,6 +370,12 @@ class SelfPlayCollector:
             f"{low}-{high}": StatsTracker(window=STYLE_WINDOW) for low, high in SIZE_GROUPS
         }
 
+        # Oracle guiding (feature version 5): the share of the opponents' true cards in the
+        # learner's beliefs and how they are given (`belief_inputs.ORACLE_MODES`), set by the
+        # trainer before every iteration.
+        self.oracle_share = 0.0
+        self.oracle_mode = "mix"
+        self.oracle_near: tuple[int, ...] = (NEAR_COMBOS,)
         self._bank = TableBank(mix, self._rng)
         # Its own rng, so the boards it imagines never touch the deals.
         self._runout_rng = random.Random(self._rng.random())
@@ -374,6 +390,8 @@ class SelfPlayCollector:
                 starting_stack=mix.starting_stack,
                 on_decision=self._record,
                 deal_holes=lambda: self._bank.hole_cards,
+                oracle=lambda: (self.oracle_share, self.oracle_mode, self.oracle_near),
+                deal_runout=(lambda: self._bank.runout) if critic_runout else None,
             )
             for seat in range(mix.max_players)
         ]

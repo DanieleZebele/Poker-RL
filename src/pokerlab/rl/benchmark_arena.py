@@ -42,6 +42,12 @@ batch is a checkpoint, not a unit anything is counted in.
 
 Every rating is written to a timestamped JSON backup before anything is touched,
 so a run can be undone with `--restore`.
+
+**Only the newest arena writes.** A run takes the turn as it starts
+(`global_store.take_arena_turn`) and checks before every write that it still
+holds it; an older run that finds it taken stops without writing and exits with
+`ARENA_SUPERSEDED_EXIT`. Two arenas on two machines would otherwise overwrite
+each other's ratings at every checkpoint.
 """
 
 from __future__ import annotations
@@ -57,6 +63,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from pokerlab.config import add_config_arguments, resolve_cli
+from pokerlab.rl.action_space import add_raise_sizing_argument, set_raise_sizing
 from pokerlab.rl.device import resolve_device
 from pokerlab.rl.global_arena import (
     DEFAULT_GLOBAL_DIR,
@@ -66,10 +73,14 @@ from pokerlab.rl.global_arena import (
     play_sharded,
 )
 from pokerlab.rl.global_store import (
+    ARENA_SUPERSEDED_EXIT,
     DEFAULT_LOCK_SECONDS,
     acquire_locks,
+    holds_arena_turn,
     read_member,
+    release_arena_turn,
     release_locks,
+    take_arena_turn,
     write_member,
     write_snapshot,
 )
@@ -105,6 +116,10 @@ DEFAULT_MAX_SESSIONS = 100_000   # safety cap, not a failure
 # loads every anchor, so a very small one pays that startup over and over.
 DEFAULT_CHECKPOINT_SESSIONS = 200
 BACKUP_DIRNAME = "benchmark_arena_backups"
+# How long a run that took the turn from another arena waits before reading the
+# ratings: the other one checks the turn before each write, but may be in the middle
+# of one (a few files, seconds), and its last ratings are where this run starts from.
+SUPERSEDE_GRACE_SECONDS = 30.0
 
 
 @dataclass
@@ -367,6 +382,7 @@ def build_parser() -> argparse.ArgumentParser:
         "when both are above 1. cpu only",
     )
     add_table_arguments(parser)
+    add_raise_sizing_argument(parser)
     parser.add_argument(
         "--device", default="auto", help="cpu, cuda or auto (the default): the GPU if there is one"
     )
@@ -396,18 +412,58 @@ def main(argv: list[str] | None = None) -> int:
     args = resolve_cli(build_parser(), argv, siblings=_sibling_parsers, lenient=True)
     if args is None:
         return 0
+    set_raise_sizing(args.raise_sizing)
 
     if args.arena_checkpoint_sessions < 1:
         print(f"--arena-checkpoint-sessions deve essere almeno 1, non {args.arena_checkpoint_sessions}")
         return 2
 
     if args.restore is not None:
-        count = restore(
-            args.global_dir, args.restore, machine=args.machine, lock_ttl=args.global_lock_seconds
-        )
+        # A restore takes the turn too: an arena still running would overwrite it
+        # at its next checkpoint.
+        turn_id, previous = take_arena_turn(args.global_dir, machine=args.machine)
+        try:
+            _wait_for_previous(previous)
+            count = restore(
+                args.global_dir, args.restore, machine=args.machine, lock_ttl=args.global_lock_seconds
+            )
+        finally:
+            release_arena_turn(args.global_dir, turn_id)
         print(f"ripristinati {count} rating da {args.restore}")
         return 0
 
+    if args.dry_run:
+        return _arena(args, None)
+    turn_id, previous = take_arena_turn(args.global_dir, machine=args.machine)
+    try:
+        _wait_for_previous(previous)
+        return _arena(args, turn_id)
+    finally:
+        release_arena_turn(args.global_dir, turn_id)
+
+
+def _wait_for_previous(previous: dict | None) -> None:
+    """Say which arena this run takes over from, and give it time to finish a write."""
+    if previous is None:
+        return
+    started = time.strftime("%Y-%m-%d %H:%M", time.localtime(previous.get("started", 0)))
+    print(f"un'arena precedente ({previous.get('machine', '?')}, partita {started}) "
+          f"si fermera' al suo prossimo checkpoint senza scrivere; "
+          f"attendo {SUPERSEDE_GRACE_SECONDS:.0f} s prima di leggere i rating", flush=True)
+    time.sleep(SUPERSEDE_GRACE_SECONDS)
+
+
+def _superseded(args: argparse.Namespace, turn_id: str | None) -> bool:
+    """True, with a line in the log, when a newer arena has taken the turn."""
+    if turn_id is None or holds_arena_turn(args.global_dir, turn_id):
+        return False
+    print("\nSOSTITUITA: un'arena piu' recente ha preso il turno; mi fermo senza scrivere "
+          "(i rating gia' scritti restano, li riprende lei)", flush=True)
+    return True
+
+
+def _arena(args: argparse.Namespace, turn_id: str | None) -> int:
+    """The run itself; `turn_id` None is a dry run, which writes nothing and takes no turn."""
     k_schedule = parse_k_schedule(args.k_schedule)
     anchors_list = collect_anchors(args.root, args.global_dir)
     mix = table_mix_from_args(args)
@@ -532,6 +588,8 @@ def main(argv: list[str] | None = None) -> int:
         # so each checkpoint leaving them in a consistent state is also the safer
         # thing: every checkpoint is a complete result, not a partial one. The
         # backup taken at startup still undoes the whole run.
+        if _superseded(args, turn_id):
+            return ARENA_SUPERSEDED_EXIT
         if not args.dry_run:
             written = write_ratings(
                 args.global_dir,
@@ -583,6 +641,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     # The ratings are already on disk -- every checkpoint wrote them. This last pass
     # is belt and braces for the final batch plus the snapshot refresh.
+    if _superseded(args, turn_id):
+        return ARENA_SUPERSEDED_EXIT
     written = write_ratings(
         args.global_dir,
         anchors_list,

@@ -14,6 +14,10 @@ import pytest
 STUDY_DIRS = (
     Path(__file__).resolve().parents[1] / "studies" / "agents",
     Path(__file__).resolve().parents[1] / "studies" / "player_embedding",
+    Path(__file__).resolve().parents[1] / "studies" / "critic_loss",
+    Path(__file__).resolve().parents[1] / "studies" / "pi_distill",
+    Path(__file__).resolve().parents[1] / "studies" / "belief",
+    Path(__file__).resolve().parents[1] / "studies" / "human_clone",
 )
 for _folder in STUDY_DIRS:
     if str(_folder) not in sys.path:

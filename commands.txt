@@ -53,7 +53,8 @@ OMP_NUM_THREADS=1 .venv/bin/python -m pokerlab.rl.benchmark_arena --arena-max-se
 
 # ── AGGIORNARE L'ELO DI TUTTI I MODELLI (passata di fine training, a mano) ──────────────────────────
 
-cd /mnt/shared_volume/POKER/Poker-RL
+cd /mnt/shared_volume/POKER/Poker-RL-v2
+OMP_NUM_THREADS=1 .venv/bin/poker-elo --elo-sessions 100000 --session-workers 20
 OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1 .venv/bin/poker-elo \
     --elo-sessions 50000 --workers 1 --session-workers 43 --k-schedule "0:0.5" \
     2>&1 | tee checkpoints/logs/elo-$(date +%Y%m%d-%H%M%S).log

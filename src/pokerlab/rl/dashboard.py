@@ -753,10 +753,10 @@ function styleSpecs(hist){
   return styleGroupSpecs(pooled, '');
 }
 
-/* The gradient-norm clips (`rl/grad_log.py`), one per network: the norm before the cut,
-   as a mean and a standard deviation over the iteration's minibatch steps, against that
-   network's threshold, and the share of steps each clip cut. A mean alone cannot say how
-   often a cut fires. */
+/* The gradient norms (`rl/grad_log.py`), one per network, as a mean and a standard deviation
+   over the iteration's minibatch steps: the policy's before its clip, against its threshold,
+   with the share of steps the clip cut (a mean alone cannot say how often a cut fires); the
+   critic's, which is not clipped, as it is. */
 function gradSpecs(hist){
   const cs = getComputedStyle(document.documentElement);
   const C = k => cs.getPropertyValue(k).trim();
@@ -764,7 +764,7 @@ function gradSpecs(hist){
     const o = {d: 3, zero: true};
     if (threshold !== null && threshold !== undefined) o.ref = threshold;
     return {
-      o, title: `${name} gradient norm before the clip`,
+      o, title: threshold === undefined ? `${name} gradient norm` : `${name} gradient norm before the clip`,
       sets: [{name: 'mean', color: C('--accent'), pts: mean || []},
              {name: 'sd over the steps', color: C('--warn'), pts: sd || []}],
       note: o.ref === undefined ? '' : `dashed: ${name} max grad norm = ${threshold}; a step above it is cut to it`,
@@ -772,17 +772,16 @@ function gradSpecs(hist){
     };
   };
   const pct = pts => (pts || []).map(p => [p[0], 100 * p[1]]);
-  const cutP = hist.grad_policy_clipped || [], cutC = hist.grad_critic_clipped || [];
+  const cutP = hist.grad_policy_clipped || [];
   return [
     norm('policy', hist.grad_policy_mean, hist.grad_policy_sd, hist.grad_policy_threshold),
-    norm('critic', hist.grad_critic_mean, hist.grad_critic_sd, hist.grad_critic_threshold),
+    norm('critic', hist.grad_critic_mean, hist.grad_critic_sd, undefined),
     {
-      o: {d: 0, zero: true}, title: 'steps cut by the gradient clips (%)',
-      sets: [{name: 'policy', color: C('--accent'), pts: pct(cutP)},
-             {name: 'critic', color: C('--warn'), pts: pct(cutC)}],
-      note: 'share of minibatch steps above the threshold of their network. With Adam a steady cut barely '
+      o: {d: 0, zero: true}, title: "steps cut by the policy's gradient clip (%)",
+      sets: [{name: 'policy', color: C('--accent'), pts: pct(cutP)}],
+      note: 'share of minibatch steps above the threshold. With Adam a steady cut barely '
         + 'changes the step; what it does is shrink the steps whose norm is unusual',
-      last: cutP.length ? (100 * lastOf(cutP)).toFixed(0) + '% / ' + (100 * lastOf(cutC)).toFixed(0) + '%' : '&ndash;',
+      last: cutP.length ? (100 * lastOf(cutP)).toFixed(0) + '%' : '&ndash;',
     },
   ];
 }
@@ -842,7 +841,7 @@ function renderCharts(host, hist){
 const HP_LABELS = {
   lr: 'lr', hands: 'hands/iter', ppo_epochs: 'PPO epochs',
   clip_epsilon: 'clip', minibatch_size: 'minibatch', gae_lambda: 'GAE lambda',
-  value_coef: 'value coef', policy_max_grad_norm: 'policy max grad norm', critic_max_grad_norm: 'critic max grad norm', opponent_probability: 'opponent prob.',
+  value_coef: 'value coef', policy_max_grad_norm: 'policy max grad norm', opponent_probability: 'opponent prob.',
   /* Together these two are the strength of the field the worker trains against:
      what share of its seats come from the best-rated band, and how deep that
      band is. The `pool` column shows the strength they actually produced. */

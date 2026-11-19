@@ -25,7 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field, fields
 from itertools import pairwise
 from pathlib import Path
@@ -159,8 +159,8 @@ def k_schedule_text(text: str) -> str:
 
 
 # Population-scale pruning of the global registry (see
-# `rl/global_arena.py::run_population_sessions`). The caller turns these into two numbers for `eliminate_lowest_rated`: how
-# many networks to remove (`fraction` of the eligible models, whenever the real
+# `rl/global_arena.py::_eliminate`, which removes by diversity, `rl/diversity.py`). The caller turns these
+# into two numbers: how many networks to remove (`fraction` of the eligible models, whenever the real
 # on-disk population reaches `DEFAULT_POPULATION_TRIGGER`) and the minimum games
 # a network needs to count as reliably rated (the `DEFAULT_PROTECT_PERCENTILE`
 # of games played among the models rated so far).
@@ -438,50 +438,6 @@ class PoolRegistry:
                 member.games += 1
                 member.rating += delta
         return deltas
-
-    def eliminate_lowest_rated(
-        self,
-        *,
-        count: int,
-        games_threshold: float,
-        among: Collection[str] | None = None,
-    ) -> list[PoolMember]:
-        """Remove up to `count` of the lowest-rated members that have played
-        at least `games_threshold` games.
-
-        Deciding *whether* to prune at all, and how reliable a rating must be
-        (`games_threshold`), is the caller's job: `global_arena.
-        run_population_sessions` derives both from the real on-disk population,
-        which this registry cannot see -- see its docstring for why `count` is
-        sized against the *eligible* set here rather than the raw population.
-        Frozen members are never eligible; `among`, when given, restricts
-        eligibility to those labels (the networks that still exist on disk),
-        so a stale entry can never use up a place in the quota.
-
-        Capped, not all-or-nothing: if fewer than `count` members qualify,
-        every one of them goes rather than none. The alternative -- waiting
-        for `count` to be simultaneously available -- can stall forever if
-        `count` is large relative to how much of the population ever gets
-        rated at once (it is; see the docstring on the caller).
-
-        Only edits `self.members` -- deleting the files, and deciding
-        *whether* to call this at all, are the caller's job (`global_arena.py
-        ::run_population_sessions`). This is a genuinely destructive step, done
-        deliberately to reclaim disk space: an eliminated model is gone.
-        """
-        eligible = [
-            m
-            for m in self.ranked()
-            if not m.frozen
-            and m.games >= games_threshold
-            and (among is None or m.label in among)
-        ]
-        if count <= 0 or not eligible:
-            return []
-        doomed = sorted(eligible, key=lambda m: (m.rating, m.label))[:count]
-        for member in doomed:
-            del self.members[member.label]
-        return doomed
 
     # ---- seating --------------------------------------------------------
 

@@ -431,6 +431,9 @@ class ModelAdvice:
     # every player's equity, which exists only in training (`PokerActorCritic.forward`
     # without `critic_extra`). Kept for the shape, no longer shown: it read "+0.00" always.
     value: float
+    # With the process's raise sizing `weighted` (`action_space.set_raise_sizing`), the raise a
+    # drawn raise bin becomes: every open raise bin's level weighted by its probability.
+    weighted_raise: Action | None = None
 
 
 def bb_number(chips: int, big_blind: int) -> str:
@@ -512,7 +515,12 @@ def advise(
     """
     import torch
 
-    from pokerlab.rl.action_space import action_index_to_action, legal_action_mask
+    from pokerlab.rl.action_space import (
+        RAISE_BINS,
+        action_index_to_action,
+        legal_action_mask,
+        raise_sizing,
+    )
     from pokerlab.rl.features import encode_observation
     from pokerlab.rl.table_mix import DEFAULT_STACK_MAX_BB
 
@@ -530,15 +538,23 @@ def advise(
         model.to(device)
         starting_stack = round(getattr(model, "feature_stack_bb", DEFAULT_STACK_MAX_BB) * big_blind)
         version = model.feature_version
-        if (version, starting_stack) not in by_encoding:
-            by_encoding[(version, starting_stack)] = encode_observation(
-                observation,
-                big_blind=big_blind,
-                starting_stack=starting_stack,
-                legal_mask=mask,
-                version=version,
+        reader = model.belief_reader(device) if version == 5 else None
+        if reader is not None:
+            # Version 5 reads a belief about every opponent, its own network's: no sharing.
+            features = encode_observation(
+                observation, big_blind=big_blind, starting_stack=starting_stack, legal_mask=mask,
+                version=version, beliefs=reader(observation, big_blind),
             )
-        features = by_encoding[(version, starting_stack)]
+        else:
+            if (version, starting_stack) not in by_encoding:
+                by_encoding[(version, starting_stack)] = encode_observation(
+                    observation,
+                    big_blind=big_blind,
+                    starting_stack=starting_stack,
+                    legal_mask=mask,
+                    version=version,
+                )
+            features = by_encoding[(version, starting_stack)]
         with torch.no_grad():
             logits, value = model(
                 torch.tensor([features], dtype=torch.float32, device=device),
@@ -557,6 +573,11 @@ def advise(
         ]
         legal_bins = [b for b in bins if b.legal]
         best = max(legal_bins, key=lambda b: b.probability)
+        weighted = None
+        if raise_sizing() == "weighted" and any(mask[index] for index in RAISE_BINS):
+            weighted = action_index_to_action(
+                RAISE_BINS[0], observation, legal_actions, weights=(probabilities, mask)
+            )
         advice.append(
             ModelAdvice(
                 label=label,
@@ -564,6 +585,7 @@ def advise(
                 best=best,
                 bins=sorted(legal_bins, key=lambda b: -b.probability),
                 value=float(value.item()),
+                weighted_raise=weighted,
             )
         )
     return advice

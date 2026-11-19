@@ -58,7 +58,9 @@ import time
 from pathlib import Path
 
 from pokerlab.config import add_config_arguments, resolve_cli
+from pokerlab.rl.action_space import add_raise_sizing_argument, set_raise_sizing
 from pokerlab.rl.device import resolve_device
+from pokerlab.rl.diversity import DEFAULT_PROBES, DEFAULT_PROTECT_TOP
 from pokerlab.rl.global_arena import (
     DEFAULT_BENCHMARK_SAMPLE,
     DEFAULT_GLOBAL_DIR,
@@ -168,6 +170,7 @@ def build_parser() -> argparse.ArgumentParser:
         "riga di comando: un file condiviso non deve poterlo accendere per tutti",
     )
     add_table_arguments(parser)
+    add_raise_sizing_argument(parser)
     parser.add_argument(
         "--device", default="auto", help="cpu, cuda or auto (the default): the GPU if there is one"
     )
@@ -184,6 +187,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--global-protect-percentile", type=float, default=DEFAULT_PROTECT_PERCENTILE,
         help="usato solo con --prune",
+    )
+    parser.add_argument(
+        "--prune-protect-top", type=int, default=DEFAULT_PROTECT_TOP,
+        help="the pruning keeps this many best-rated models of the store whatever they play; below "
+        "them it removes the models whose play is nearest to another's (rl/diversity.py)",
+    )
+    parser.add_argument(
+        "--diversity-probes", type=str, default=DEFAULT_PROBES,
+        help="the fixed decisions a model's play is read on to tell how alike two models are "
+        "(studies/agents/diversity_study.py probes); without the file nothing is pruned",
     )
     parser.add_argument(
         "--k-schedule", type=k_schedule_text, default=format_k_schedule(DEFAULT_K_SCHEDULE),
@@ -204,6 +217,7 @@ def main(argv: list[str] | None = None) -> int:
     args = resolve_cli(build_parser(), argv, siblings=_sibling_parsers, lenient=True)
     if args is None:
         return 0
+    set_raise_sizing(args.raise_sizing)
 
     mix = table_mix_from_args(args)
     population = discover_population(args.root)
@@ -265,6 +279,8 @@ def main(argv: list[str] | None = None) -> int:
             trigger_size=args.global_trigger_size if args.prune else NO_PRUNE_TRIGGER,
             eliminate_fraction=args.global_eliminate_fraction,
             protect_percentile=args.global_protect_percentile,
+            protect_top=args.prune_protect_top,
+            diversity_probes=args.diversity_probes,
             k_schedule=parse_k_schedule(args.k_schedule),
             on_skip=lambda path, why: print(f"    saltato {path}: {why}"),
         )

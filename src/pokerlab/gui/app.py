@@ -1391,8 +1391,23 @@ class PokerGuiApp(tk.Tk):
         thread.start()
 
 
+def _apply_fleet_raise_sizing() -> None:
+    """The bots size their raises as the fleet's models play (`raise_sizing` in `config.toml`,
+    `action_space.set_raise_sizing`); with no readable file, by the bins."""
+    from pokerlab.config import DEFAULT_CONFIG_PATH, ConfigError, read_config
+    from pokerlab.rl.action_space import RAISE_SIZINGS, set_raise_sizing
+
+    try:
+        value = read_config(DEFAULT_CONFIG_PATH).get("raise_sizing", "bin")
+    except ConfigError:
+        return
+    if value in RAISE_SIZINGS:
+        set_raise_sizing(value)
+
+
 def main() -> None:
     _make_windows_dpi_aware()
+    _apply_fleet_raise_sizing()
     app = PokerGuiApp()
     app.mainloop()
 

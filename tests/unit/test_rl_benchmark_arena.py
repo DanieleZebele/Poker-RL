@@ -499,3 +499,81 @@ def test_session_workers_play_each_batch_in_forked_copies(tmp_path, monkeypatch)
     ]) == 0
 
     assert forks == [3, 3]
+
+
+def test_an_arena_stops_without_writing_once_a_newer_one_takes_the_turn(tmp_path, monkeypatch, capsys):
+    """Two arenas on two machines overwrote each other's ratings at every checkpoint.
+    The older one, finding the turn taken, writes nothing more and exits with its own
+    code; the newer one is the only writer."""
+    import pokerlab.rl.benchmark_arena as module
+    from pokerlab.rl.global_store import ARENA_SUPERSEDED_EXIT, read_arena_turn, take_arena_turn
+
+    root, global_dir = anchor_store(tmp_path)
+    before = {label: read_member(global_dir, label).rating for label in ("s1-m0", "s1-m1")}
+    batches: list[int] = []
+
+    def play(candidates, mix, *, sessions, **k):
+        batches.append(sessions)
+        if len(batches) == 2:
+            take_arena_turn(global_dir, machine="newer")  # another machine starts an arena
+        return [{candidates[0].label: 100.0, candidates[1].label: -100.0}] * sessions
+
+    writes: list[int] = []
+    real_write = module.write_ratings
+    monkeypatch.setattr(module, "write_ratings", lambda *a, **k: writes.append(1) or real_write(*a, **k))
+    monkeypatch.setattr(module, "play_global_sessions", play)
+    monkeypatch.setattr(module, "write_snapshot", lambda *a, **k: True)
+
+    assert module.main([
+        "--config", "", *SIX_SEATS, "--root", str(root), "--global-dir", str(global_dir),
+        "--arena-max-sessions", "10", "--arena-min-sessions", "10", "--arena-checkpoint-sessions", "2",
+    ]) == ARENA_SUPERSEDED_EXIT
+
+    assert len(batches) == 2 and len(writes) == 1, "the first checkpoint writes, the second does not"
+    assert "SOSTITUITA" in capsys.readouterr().out
+    assert read_arena_turn(global_dir)["machine"] == "newer", "the newer arena's turn is left alone"
+    assert any(read_member(global_dir, label).rating != before[label] for label in before)
+
+
+def test_an_arena_that_takes_over_waits_for_the_previous_and_gives_the_turn_back(tmp_path, monkeypatch, capsys):
+    import pokerlab.rl.benchmark_arena as module
+    from pokerlab.rl.global_store import read_arena_turn, take_arena_turn
+
+    root, global_dir = anchor_store(tmp_path)
+    take_arena_turn(global_dir, machine="older")
+    waits: list[float] = []
+    monkeypatch.setattr(module.time, "sleep", waits.append)
+
+    drive_checkpoints(monkeypatch, [
+        "--root", str(root), "--global-dir", str(global_dir),
+        "--arena-max-sessions", "4", "--arena-min-sessions", "4",
+    ])
+
+    assert waits == [module.SUPERSEDE_GRACE_SECONDS]
+    assert "older" in capsys.readouterr().out
+    assert read_arena_turn(global_dir) is None, "a run that ends gives its turn back"
+
+
+def test_a_dry_run_takes_no_turn(tmp_path, monkeypatch):
+    from pokerlab.rl.global_store import read_arena_turn, take_arena_turn
+
+    root, global_dir = anchor_store(tmp_path)
+    turn_id, _ = take_arena_turn(global_dir, machine="running")
+    drive_checkpoints(monkeypatch, [
+        "--root", str(root), "--global-dir", str(global_dir),
+        "--arena-max-sessions", "4", "--arena-min-sessions", "4", "--dry-run",
+    ])
+    assert read_arena_turn(global_dir)["id"] == turn_id
+
+
+def test_the_turn_is_lost_to_another_id_or_a_removed_file_but_not_to_an_unreadable_one(tmp_path):
+    from pokerlab.rl.global_store import ARENA_TURN_FILENAME, holds_arena_turn, take_arena_turn
+
+    mine, _ = take_arena_turn(tmp_path, machine="a")
+    assert holds_arena_turn(tmp_path, mine)
+    (tmp_path / ARENA_TURN_FILENAME).write_text("{not json")
+    assert holds_arena_turn(tmp_path, mine)
+    take_arena_turn(tmp_path, machine="b")
+    assert not holds_arena_turn(tmp_path, mine)
+    (tmp_path / ARENA_TURN_FILENAME).unlink()
+    assert not holds_arena_turn(tmp_path, mine)

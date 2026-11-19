@@ -43,7 +43,7 @@ def trajectory(
     decisions = [
         DecisionRecord(
             player_id="p0", seat=0, features=features_at(street), legal_mask=[], action_index=0,
-            log_prob=0.0, value=v, stake_bb=50.0,
+            log_prob=0.0, value=v,
         )
         for v, street in zip(values, streets, strict=True)
     ]

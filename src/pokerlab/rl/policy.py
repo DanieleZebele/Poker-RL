@@ -8,13 +8,19 @@ selecting between per-street networks -- see `rl/features.py` for why.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
+from typing import Any
 
 import torch
 from torch import Tensor, nn
+from torch.nn import functional
 
 from pokerlab.players.rl_agent import DealView, PolicyDecision, PolicyFn
-from pokerlab.rl.action_space import ACTION_DIM
+from pokerlab.rl.action_space import ACTION_DIM, RAISE_SIZINGS
+from pokerlab.rl.action_space import raise_sizing as process_raise_sizing
+from pokerlab.rl.belief import CONFIG_KEYS as BELIEF_KEYS
+from pokerlab.rl.belief import BeliefModel, BeliefReader
 from pokerlab.rl.equity_net import CARDS, EquityEncoder, EquityNet
 from pokerlab.rl.features import CARDS_DIM, FEATURE_VERSION, MAX_SEATS, observation_dim
 from pokerlab.rl.rollout import CriticFns
@@ -47,9 +53,85 @@ BOARD_PLANE = 4
 # has folded.
 EQUITY_SLOTS = MAX_SEATS
 
+# The critic as a classifier (HL-Gauss, "Stop Regressing", Farebrother et al. 2024): its head
+# gives `bins` logits over a fixed support, the value is the softmax's mean over the bins'
+# centres and the loss the cross-entropy against a Gaussian `CRITIC_SIGMA_RATIO` bins wide
+# centred on the target. The bins are uniform in symlog(v) = sign(v) log(1 + |v| / unit), with
+# `unit` one big blind in the value's scale (the reward scale): fine near 0, where a short
+# stack's hands live, coarse in the tails. `low`/`high` are the support's ends in the value's
+# own unit. A model's critic is a dict of those four (`PokerActorCritic.critic`), or None for
+# the scalar head trained on the squared error. Measured offline (`studies/critic_loss`): 101
+# symlog bins explain more of the held-out return than the squared error in every group, worth
+# ~1.6x the data.
+CRITIC_KEYS = ("bins", "low", "high", "unit")
+CRITIC_SIGMA_RATIO = 0.75
+# How the classifier's output layer is started (`reset_critic_output`), recorded in every
+# checkpoint: 2 is the start that learns. A classifier checkpoint without it was saved by a run
+# whose critic began at 1, which barely learns, and `ppo.load_checkpoint` starts that layer afresh.
+CRITIC_OUTPUT_INIT = 2
+
+
+def symlog(value: Tensor, unit: float) -> Tensor:
+    return torch.sign(value) * torch.log1p(value.abs() / unit)
+
+
+def critic_edges(critic: dict[str, Any]) -> Tensor:
+    """The `bins + 1` edges of the bins, in symlog space."""
+    unit = float(critic["unit"])
+    low = math.copysign(math.log1p(abs(critic["low"]) / unit), critic["low"])
+    high = math.copysign(math.log1p(abs(critic["high"]) / unit), critic["high"])
+    return torch.linspace(low, high, int(critic["bins"]) + 1, dtype=torch.float64).float()
+
+
+def critic_centres(critic: dict[str, Any]) -> Tensor:
+    """Each bin's centre as a value (back from symlog): what the predicted distribution is
+    averaged over."""
+    edges = critic_edges(critic).double()
+    middle = (edges[1:] + edges[:-1]) / 2
+    return (torch.sign(middle) * torch.expm1(middle.abs()) * float(critic["unit"])).float()
+
+
+def hl_gauss_targets(targets: Tensor, edges: Tensor) -> Tensor:
+    """The probability of each bin under a Gaussian on `targets` (already in symlog space)
+    `CRITIC_SIGMA_RATIO` bins wide, renormalised to the support (a target outside it is
+    clipped to its end): `(B,)` -> `(B, bins)`."""
+    sigma = CRITIC_SIGMA_RATIO * float(edges[1] - edges[0])
+    clipped = targets.clamp(float(edges[0]), float(edges[-1]))
+    cdf = 0.5 * (1 + torch.erf((edges[None, :] - clipped[:, None]) / (math.sqrt(2) * sigma)))
+    return (cdf[:, 1:] - cdf[:, :-1]) / (cdf[:, -1:] - cdf[:, :1])
+
+
+def normalise_critic(critic: dict[str, Any] | None) -> dict[str, Any] | None:
+    """A critic spec as the model keeps and a checkpoint records it, refusing one that cannot
+    be built."""
+    if critic is None:
+        return None
+    missing = [key for key in CRITIC_KEYS if key not in critic]
+    if missing:
+        raise ValueError(f"a classifier critic needs {CRITIC_KEYS}, missing {missing}")
+    spec = {"bins": int(critic["bins"]), "low": float(critic["low"]),
+            "high": float(critic["high"]), "unit": float(critic["unit"])}
+    if spec["bins"] < 2 or not spec["low"] < 0 < spec["high"] or spec["unit"] <= 0:
+        raise ValueError(f"a classifier critic needs bins >= 2, low < 0 < high and unit > 0, got {spec}")
+    return spec
+
 
 def _block(in_features: int, out_features: int) -> list[nn.Module]:
     return [nn.Linear(in_features, out_features), nn.LayerNorm(out_features), nn.ReLU()]
+
+
+class ResidualBlock(nn.Module):
+    """`x + Linear(ReLU(Linear(LayerNorm(x))))`, `width` wide throughout (SimBa's block, with
+    no widening inside)."""
+
+    def __init__(self, width: int) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(width)
+        self.inner = nn.Linear(width, width)
+        self.outer = nn.Linear(width, width)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x + self.outer(torch.relu(self.inner(self.norm(x))))
 
 
 class PokerActorCritic(nn.Module):
@@ -57,7 +139,8 @@ class PokerActorCritic(nn.Module):
 
     - **Trunk**: `num_layers` blocks of `Linear -> LayerNorm -> ReLU`, `hidden` wide.
     - **Each head**: `head_layers` such blocks, `head_hidden` wide, and then the output
-      `Linear` (11 logits for the policy, 1 value for the critic). With
+      `Linear` (11 logits for the policy; for the critic 1 value, or `critic["bins"]` logits
+      when it is a classifier, see `CRITIC_KEYS`). With
       `head_layers = 0` a head is the output `Linear` alone.
 
     `equity` is the shape of an equity network's per-player encoder (see `rl/equity_net.py`)
@@ -86,6 +169,9 @@ class PokerActorCritic(nn.Module):
         *,
         equity: dict[str, int],
         feature_version: int = FEATURE_VERSION,
+        critic: dict[str, Any] | None = None,
+        belief: dict[str, Any] | None = None,
+        residual: int = 0,
     ) -> None:
         super().__init__()
         # The encoding the model reads (`rl/features.py`): its input has that many numbers, and
@@ -110,16 +196,63 @@ class PokerActorCritic(nn.Module):
         self.num_layers = num_layers
         self.head_hidden = head_hidden
         self.head_layers = head_layers
+        # 1: each trunk is a `Linear` into `hidden`, `num_layers` residual blocks and a final
+        # LayerNorm (SimBa, Lee et al. 2025), instead of `num_layers` plain blocks. A study
+        # setting: the fleet's models are all 0, and a checkpoint without the key is 0.
+        if residual not in (0, 1):
+            raise ValueError(f"residual is 0 or 1, not {residual!r}")
+        self.residual = int(residual)
         self.equity = dict(equity)
         rest = obs_dim - CARDS_DIM
         self.equity_encoder = EquityEncoder(**self.equity)
-        self.trunk = self._trunk(rest + self.equity["latent"], hidden, num_layers)
+        self.trunk = self._trunk(rest + self.equity["latent"], hidden, num_layers, self.residual)
         self.policy_head = self._head(hidden, action_dim)
-        self.value_trunk = self._trunk(rest + EQUITY_SLOTS, hidden, num_layers)
-        self.value_head = self._head(hidden, 1)
+        self.value_trunk = self._trunk(rest + EQUITY_SLOTS, hidden, num_layers, self.residual)
+        self.critic = normalise_critic(critic)
+        self.value_head = self._head(hidden, self.critic["bins"] if self.critic else 1)
+        if self.critic is not None:
+            # Not persistent: rebuilt from `critic`, which the checkpoint records, so the
+            # state of a scalar-critic model and of a classifier differ only in the head.
+            self.register_buffer("critic_edges", critic_edges(self.critic), persistent=False)
+            self.register_buffer("critic_centres", critic_centres(self.critic), persistent=False)
+            self.reset_critic_output()
+        # Feature version 5 reads a belief about every opponent: the belief network (`rl/belief.py`),
+        # frozen, rides in the model's own state like the equity encoder. `belief` is its shape and
+        # the fingerprint of the file it came from; the weights are loaded by whoever builds the
+        # model (`train.py` from the file, `build_model_from_checkpoint` from the checkpoint).
+        if (feature_version == 5) != (belief is not None):
+            raise ValueError("a network of feature version 5 needs a belief network, and only it has one")
+        self.belief = None if belief is None else {**{k: int(belief[k]) for k in BELIEF_KEYS},
+                                                   "fingerprint": str(belief["fingerprint"])}
+        self.belief_net = (
+            None if belief is None
+            else BeliefModel(self.equity["latent"], **{k: self.belief[k] for k in BELIEF_KEYS})
+        )
+
+    def reset_critic_output(self) -> None:
+        """Start the classifier's output layer afresh: the weights as PyTorch initialises a
+        `Linear`, the biases `-|z|` for a bin whose centre is `z` in symlog space -- a broad bump
+        at 0, so the value starts at about +1 big blind (a near-uniform distribution would start
+        it at about +1 deepest stack) and every logit is within reach (the far tail at -6.6).
+
+        Measured (`CRITIC_OUTPUT_INIT` 1 was the other way): weights 0 and biases the log of the
+        narrow HL-Gauss target of 0, floored at 1e-6, put almost every logit at -13.8, and with
+        Adam's steps the critic explained 0.006 of the return after 400 steps against 0.24 from
+        this start; in PPO it explained nothing after 10 iterations. The scalar head starts near
+        0 by itself."""
+        if self.critic is None:
+            return
+        output = self.value_head[-1]
+        output.reset_parameters()
+        centres = (self.critic_edges[1:] + self.critic_edges[:-1]) / 2
+        with torch.no_grad():
+            output.bias.copy_(-centres.abs())
 
     @staticmethod
-    def _trunk(in_features: int, hidden: int, num_layers: int) -> nn.Sequential:
+    def _trunk(in_features: int, hidden: int, num_layers: int, residual: int = 0) -> nn.Sequential:
+        if residual:
+            return nn.Sequential(nn.Linear(in_features, hidden),
+                                 *(ResidualBlock(hidden) for _ in range(num_layers)), nn.LayerNorm(hidden))
         layers: list[nn.Module] = []
         for _ in range(num_layers):
             layers.extend(_block(in_features, hidden))
@@ -134,6 +267,12 @@ class PokerActorCritic(nn.Module):
         layers.append(nn.Linear(in_features, out_features))
         return nn.Sequential(*layers)
 
+    def belief_reader(self, device: str | torch.device = "cpu") -> BeliefReader | None:
+        """What computes this model's beliefs at a decision (None below version 5)."""
+        if self.belief_net is None:
+            return None
+        return BeliefReader(self.belief_net, self.equity_encoder, self.belief["fingerprint"], device)
+
     def policy_parameters(self) -> list[nn.Parameter]:
         """The policy's own trainable weights: its trunk and head (the encoder is frozen)."""
         return [*self.trunk.parameters(), *self.policy_head.parameters()]
@@ -143,14 +282,46 @@ class PokerActorCritic(nn.Module):
         trainable weight of the model, each exactly once."""
         return [*self.value_trunk.parameters(), *self.value_head.parameters()]
 
+    def _critic_output(self, features: Tensor, critic_extra: Tensor) -> Tensor:
+        """The head's output: `(B, 1)` for the scalar critic, `(B, bins)` logits for a classifier."""
+        return self.value_head(
+            self.value_trunk(torch.cat([features[:, CARDS_DIM:], critic_extra], dim=-1))
+        )
+
+    def _value_of(self, output: Tensor) -> Tensor:
+        if self.critic is None:
+            return output.squeeze(-1)
+        return torch.softmax(output, dim=-1) @ self.critic_centres
+
     def critic_value(self, features: Tensor, critic_extra: Tensor) -> Tensor:
         """The state values `(B,)`, without the policy's half of the work."""
-        hidden = self.value_trunk(torch.cat([features[:, CARDS_DIM:], critic_extra], dim=-1))
-        return self.value_head(hidden).squeeze(-1)
+        return self._value_of(self._critic_output(features, critic_extra))
+
+    def critic_terms(
+        self, features: Tensor, critic_extra: Tensor, returns: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        """The values `(B,)` and each decision's critic loss `(B,)` against `returns`: the
+        squared error for the scalar critic, the cross-entropy against the HL-Gauss target
+        for a classifier."""
+        output = self._critic_output(features, critic_extra)
+        values = self._value_of(output)
+        if self.critic is None:
+            return values, (values - returns) ** 2
+        target = hl_gauss_targets(symlog(returns, self.critic["unit"]), self.critic_edges)
+        return values, -(target * torch.log_softmax(output, dim=-1)).sum(dim=-1)
+
+    def policy_logits(self, features: Tensor, legal_mask: Tensor) -> Tensor:
+        """The masked logits `(B, ACTION_DIM)`, without the critic."""
+        latent = self.equity_encoder(
+            features[:, HOLE_PLANE * PLANE : (HOLE_PLANE + 1) * PLANE],
+            features[:, BOARD_PLANE * PLANE : (BOARD_PLANE + 1) * PLANE],
+        )
+        logits = self.policy_head(self.trunk(torch.cat([features[:, CARDS_DIM:], latent], dim=-1)))
+        return logits.masked_fill(~legal_mask, MASK_FILL)
 
     @property
     def shape(self) -> dict[str, int]:
-        return {key: getattr(self, key) for key in SHAPE_KEYS}
+        return {**{key: getattr(self, key) for key in SHAPE_KEYS}, "residual": self.residual}
 
     def forward(
         self, features: Tensor, legal_mask: Tensor, critic_extra: Tensor | None = None
@@ -159,27 +330,100 @@ class PokerActorCritic(nn.Module):
 
         `critic_extra` `(B, EQUITY_SLOTS)` is what the critic reads; without it (a model that
         is only playing) the values are zero."""
-        rest = features[:, CARDS_DIM:]
-        latent = self.equity_encoder(
-            features[:, HOLE_PLANE * PLANE : (HOLE_PLANE + 1) * PLANE],
-            features[:, BOARD_PLANE * PLANE : (BOARD_PLANE + 1) * PLANE],
-        )
-        logits = self.policy_head(self.trunk(torch.cat([rest, latent], dim=-1)))
-        logits = logits.masked_fill(~legal_mask, MASK_FILL)
+        logits = self.policy_logits(features, legal_mask)
         if critic_extra is None:
             return logits, features.new_zeros(features.shape[0])
         return logits, self.critic_value(features, critic_extra)
 
 
+# How many card inputs a policy function remembers the encoder's output for (`make_policy_fn`):
+# the preflop has 169 of them once the suits are in canonical order, the later streets many more.
+ENCODER_CACHE_SIZE = 20_000
+
+
+def canonical_cards(hole: Sequence[int], board: Sequence[int]) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """`equity_net.canonical_suits` for one player, in plain Python: the indices (`suit * 13 +
+    rank`) of the hole cards and of the board once the suits are put in canonical order. The
+    same order, ties included (pinned by a test); a few microseconds instead of a dozen small
+    tensor operations."""
+    key = [0, 0, 0, 0]
+    for card in board:
+        suit, rank = divmod(card, 13)
+        key[suit] += 10**12 + (1 << rank) * 10**5
+    for card in hole:
+        suit, rank = divmod(card, 13)
+        key[suit] += 10**9 + (1 << rank)
+    order = sorted(range(4), key=lambda suit: -key[suit])  # stable: ties keep their order
+    place = [0, 0, 0, 0]
+    for new, old in enumerate(order):
+        place[old] = new
+    return (
+        tuple(sorted(place[c // 13] * 13 + c % 13 for c in hole)),
+        tuple(sorted(place[c // 13] * 13 + c % 13 for c in board)),
+    )
+
+
+def _plane_cards(features: Sequence[float], plane: int) -> list[int]:
+    start = plane * PLANE
+    return [index for index, value in enumerate(features[start : start + PLANE]) if value]
+
+
 def make_policy_fn(
-    model: PokerActorCritic, *, device: str | torch.device = "cpu", greedy: bool = False
+    model: PokerActorCritic,
+    *,
+    device: str | torch.device = "cpu",
+    greedy: bool = False,
+    raise_sizing: str | None = None,
 ) -> PolicyFn:
     """Adapt a network into the callable `RLAgentPlayer` expects.
 
     This is the whole bridge between torch and the engine: everything on the
     engine side stays plain Python lists.
+
+    The probabilities are `model.policy_logits`'s and the draw is `Categorical`'s, step for
+    step (pinned by tests), but a decision is asked for at a fraction of the cost, since at
+    batch 1 the network's arithmetic is a minority of it: the suits are put in canonical
+    order in Python (`canonical_cards`), the card encoder's output is remembered by those
+    cards (the encoder is frozen; `ENCODER_CACHE_SIZE` of them, then started afresh), and
+    the action is drawn from the normalised logits without building a distribution.
+
+    `raise_sizing` (default: the process's, `action_space.set_raise_sizing`) is how a drawn raise is sized when
+    the model plays: `bin`, the bin's own level, or `weighted`, the mean of the open raise bins'
+    levels weighted by their probabilities (`action_space.weighted_raise_to`). Which bin is drawn,
+    and its log-probability, do not depend on it.
     """
     model.to(device)
+    sizing = process_raise_sizing() if raise_sizing is None else raise_sizing
+    if sizing not in RAISE_SIZINGS:
+        raise ValueError(f"raise sizing {sizing!r} is not one of {RAISE_SIZINGS}")
+    encoder = model.equity_encoder
+    latents: dict[tuple[tuple[int, ...], tuple[int, ...]], Tensor] = {}
+
+    def logits_of(features: list[float], mask: list[bool]) -> Tensor:
+        cards = canonical_cards(_plane_cards(features, HOLE_PLANE), _plane_cards(features, BOARD_PLANE))
+        latent = latents.get(cards)
+        if latent is None:
+            if len(latents) >= ENCODER_CACHE_SIZE:
+                latents.clear()
+            planes = [0.0] * (2 * PLANE)
+            for card in cards[0]:
+                planes[card] = 1.0
+            for card in cards[1]:
+                planes[PLANE + card] = 1.0
+            latent = functional.layer_norm(
+                encoder.phi(torch.tensor([planes], dtype=torch.float32, device=device)), (encoder.latent,)
+            )
+            latents[cards] = latent
+        inputs = torch.cat(
+            [torch.tensor([features[CARDS_DIM:]], dtype=torch.float32, device=device), latent], dim=-1
+        )
+        logits = model.policy_head(model.trunk(inputs))
+        return logits.masked_fill(~torch.tensor([mask], dtype=torch.bool, device=device), MASK_FILL)
+
+    def styled(logits: Tensor, bias: list[float] | None, temperature: float) -> Tensor:
+        if bias is None:
+            return logits
+        return (logits + torch.tensor([bias], dtype=logits.dtype, device=device)) / temperature
 
     def policy_fn(
         features: list[float], mask: list[bool], bias: list[float] | None = None, temperature: float = 1.0
@@ -187,18 +431,19 @@ def make_policy_fn(
         """`bias` and `temperature` are an opponent's style (`rl/styles.py`): added to the
         logits, then divided. A masked bin stays masked (its logit is -1e9). The learner
         never passes them, so what PPO is given is its own policy's probabilities."""
-        with torch.no_grad():
-            feature_batch = torch.tensor([features], dtype=torch.float32, device=device)
-            mask_batch = torch.tensor([mask], dtype=torch.bool, device=device)
-            logits, value = model(feature_batch, mask_batch)
-            if bias is not None:
-                logits = (logits + torch.tensor([bias], dtype=logits.dtype, device=device)) / temperature
-            distribution = torch.distributions.Categorical(logits=logits)
-            action = logits.argmax(dim=-1) if greedy else distribution.sample()
+        with torch.inference_mode():
+            logits = styled(logits_of(features, mask), bias, temperature)
+            # What `Categorical(logits=...)` does: normalise, softmax, one draw with replacement.
+            normalised = logits - logits.logsumexp(dim=-1, keepdim=True)
+            if greedy:
+                action = int(logits.argmax(dim=-1))
+            else:
+                action = int(torch.multinomial(torch.softmax(normalised, dim=-1), 1, True))
             return PolicyDecision(
-                action_index=int(action.item()),
-                log_prob=float(distribution.log_prob(action).item()),
-                value=float(value.item()),
+                action_index=action,
+                log_prob=float(normalised[0, action]),
+                value=0.0,
+                probabilities=normalised.exp()[0].tolist() if sizing == "weighted" else None,
             )
 
     def distribution(
@@ -206,18 +451,16 @@ def make_policy_fn(
     ) -> list[float]:
         """The probability of each bin for this decision -- what `policy_fn` samples from,
         without sampling (and without touching the random stream the game depends on)."""
-        with torch.no_grad():
-            logits, _value = model(
-                torch.tensor([features], dtype=torch.float32, device=device),
-                torch.tensor([mask], dtype=torch.bool, device=device),
-            )
-            if bias is not None:
-                logits = (logits + torch.tensor([bias], dtype=logits.dtype, device=device)) / temperature
-            return torch.softmax(logits, dim=-1)[0].tolist()
+        with torch.inference_mode():
+            return torch.softmax(styled(logits_of(features, mask), bias, temperature), dim=-1)[0].tolist()
 
     policy_fn.distribution = distribution  # type: ignore[attr-defined]
     # What `RLAgentPlayer` encodes with when it is not told otherwise: the model's own version.
     policy_fn.feature_version = model.feature_version  # type: ignore[attr-defined]
+    # Version 5: what computes the beliefs `RLAgentPlayer` puts in the features.
+    policy_fn.beliefs = model.belief_reader(device)  # type: ignore[attr-defined]
+    # How `RLAgentPlayer` sizes a drawn raise.
+    policy_fn.raise_sizing = sizing  # type: ignore[attr-defined]
     return policy_fn
 
 
@@ -303,6 +546,7 @@ def make_search_policy_fn(
     policy_fn.distribution = distribution  # type: ignore[attr-defined]
     policy_fn.batch_distribution = batch_distribution  # type: ignore[attr-defined]
     policy_fn.feature_version = model.feature_version  # type: ignore[attr-defined]
+    policy_fn.beliefs = model.belief_reader(device)  # type: ignore[attr-defined]
     return policy_fn
 
 

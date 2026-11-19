@@ -30,6 +30,8 @@ AREAS = (
     ("src/pokerlab/", {"engine", "rl", "gui", "study"}),
     ("studies/agents/", {"study"}),
     ("studies/player_embedding/", {"study"}),
+    ("studies/belief/", {"study"}),
+    ("studies/human_clone/", {"study"}),
     ("run.sh", {"rl"}),
     ("config.toml", {"rl", "config"}),
 )

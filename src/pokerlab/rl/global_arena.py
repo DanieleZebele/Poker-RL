@@ -26,9 +26,10 @@ from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 
+from pokerlab.rl.action_space import add_raise_sizing_argument, raise_sizing, set_raise_sizing
 from pokerlab.rl.device import resolve_device
+from pokerlab.rl.diversity import DEFAULT_PROBES, DEFAULT_PROTECT_TOP
 from pokerlab.rl.forking import run_in_copies, torch_seeded
-from pokerlab.rl.memory import release_free_memory
 from pokerlab.rl.global_store import (
     DEFAULT_LOCK_SECONDS,
     PRUNE_LOCK,
@@ -44,6 +45,7 @@ from pokerlab.rl.global_store import (
     write_member,
     write_snapshot,
 )
+from pokerlab.rl.memory import release_free_memory
 from pokerlab.rl.phases import ELO_MERGE, ELO_PLAY, PRUNING
 from pokerlab.rl.pool_registry import (
     DEFAULT_ELIMINATION_FRACTION,
@@ -583,7 +585,9 @@ def _shard_main() -> None:
     parser.add_argument(
         "--device", default="auto", help="cpu, cuda or auto (the default): the GPU if there is one"
     )
+    add_raise_sizing_argument(parser)
     args = parser.parse_args()
+    set_raise_sizing(args.raise_sizing)
 
     mix = table_mix_from_args(args)
     raw = json.loads(args.candidates.read_text(encoding="utf-8"))
@@ -633,6 +637,57 @@ def spread_pick(
     return chosen
 
 
+def promote_to_benchmark(
+    global_dir: str | Path,
+    root: str | Path,
+    label: str,
+    *,
+    machine: str,
+    copies: dict[str, list[Path]] | None = None,
+    lock_ttl: float = DEFAULT_LOCK_SECONDS,
+    on_skip: Callable[[Path, str], None] | None = None,
+) -> PoolMember | None:
+    """Make one store model an anchor: *move* its checkpoint into `checkpoints/benchmark/` (every
+    other copy deleted), point its member there and freeze it at the rating it holds. None when it
+    was skipped: being rated right now (its lock is taken), unknown to the ledger, already frozen,
+    or no file in the store. The caller holds `__prune__` (or knows nothing else moves models);
+    `add_benchmark_candidates` is the fleet's caller, a model added by hand is the other."""
+    global_dir, root = Path(global_dir), Path(root)
+    copies = discover_all_copies(root) if copies is None else copies
+    target_dir = root / BENCHMARK_DIRNAME
+    if not acquire_locks(global_dir, [label], machine=machine, ttl=lock_ttl):
+        return None
+    try:
+        member = read_member(global_dir, label)
+        sources = sorted(copies.get(label, []))
+        if member is None or member.frozen or not sources:
+            return None
+        primary, *extra_copies = sources
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / primary.name
+        try:
+            if not target.exists():
+                staging = target_dir / f".{primary.name}.partial"
+                shutil.copy2(primary, staging)
+                staging.replace(target)
+            primary.unlink()
+        except OSError as exc:
+            if on_skip is not None:
+                on_skip(primary, str(exc))
+            return None
+        for duplicate in extra_copies:
+            try:
+                duplicate.unlink()
+            except OSError:
+                pass  # best-effort: the primary copy already landed safely
+        member.ref = str(target)
+        member.frozen = True
+        write_member(global_dir, member)
+        return member
+    finally:
+        release_locks(global_dir, [label])
+
+
 def add_benchmark_candidates(
     *,
     global_dir: str | Path = DEFAULT_GLOBAL_DIR,
@@ -680,42 +735,14 @@ def add_benchmark_candidates(
         return []
     added: list[PoolMember] = []
     copies = discover_all_copies(root)
-    target_dir = root / BENCHMARK_DIRNAME
 
     def promote(candidate: PoolMember) -> bool:
         """Move one model into the benchmark and freeze it. False if it was skipped."""
-        if not acquire_locks(global_dir, [candidate.label], machine=machine, ttl=lock_ttl):
-            return False  # being rated right now: the next run will look again
-        try:
-            member = read_member(global_dir, candidate.label)
-            sources = sorted(copies.get(candidate.label, []))
-            if member is None or member.frozen or not sources:
-                return False
-            primary, *extra_copies = sources
-            target_dir.mkdir(parents=True, exist_ok=True)
-            target = target_dir / primary.name
-            try:
-                if not target.exists():
-                    staging = target_dir / f".{primary.name}.partial"
-                    shutil.copy2(primary, staging)
-                    staging.replace(target)
-                primary.unlink()
-            except OSError as exc:
-                if on_skip is not None:
-                    on_skip(primary, str(exc))
-                return False
-            for duplicate in extra_copies:
-                try:
-                    duplicate.unlink()
-                except OSError:
-                    pass  # best-effort: the primary copy already landed safely
-            member.ref = str(target)
-            member.frozen = True
-            write_member(global_dir, member)
+        member = promote_to_benchmark(global_dir, root, candidate.label, copies=copies, machine=machine,
+                                      lock_ttl=lock_ttl, on_skip=on_skip)
+        if member is not None:
             added.append(member)
-            return True
-        finally:
-            release_locks(global_dir, [candidate.label])
+        return member is not None
 
     try:
         registry = load_global_registry(global_dir)
@@ -763,9 +790,8 @@ def delete_checkpoints(
 ) -> int:
     """Permanently delete every copy of each member's checkpoint from disk.
 
-    This is the genuinely destructive half of elimination (see
-    `PoolRegistry.eliminate_lowest_rated`'s docstring): a member passed here
-    is already gone from the registry, and after this call its file is gone
+    This is the genuinely destructive half of elimination (`_eliminate` chooses
+    who goes): a member passed here is about to leave the ledger, and after this call its file is gone
     too, for good -- there is no "retired" holding area.
 
     `paths_by_label` should come from `discover_all_copies()`. A file already
@@ -1065,6 +1091,7 @@ def play_sharded(
                 *table_arguments(mix),
                 "--seed", str(rng.randrange(2**31)),
                 "--device", device,
+                "--raise-sizing", raise_sizing(),
             ]
             log = (work_dir / f"shard{shard:02d}.log").open("w", encoding="utf-8")
             processes.append(
@@ -1180,6 +1207,11 @@ def _apply_session(
         release_locks(global_dir, labels)
 
 
+# Signatures a prune computes for the models that lack one (`rl/diversity.py`), ~1 s each, so a
+# pass stays well inside its lock; the rest are computed by the next ones.
+SIGNATURES_PER_PRUNE = 300
+
+
 def _eliminate(
     *,
     global_dir: Path,
@@ -1189,16 +1221,26 @@ def _eliminate(
     trigger_size: int,
     eliminate_fraction: float,
     protect_percentile: float,
+    protect_top: int,
+    diversity_probes: str | Path,
     on_skip: Callable[[Path, str], None] | None,
     on_phase: Callable[[str], None] | None = None,
-) -> tuple[int, int, int, str]:
-    """The pruning pass: `(eliminated, deleted_files)`.
+) -> tuple[int, int]:
+    """The pruning pass, by diversity: `(eliminated, deleted_files)`.
 
     Runs only when the real on-disk population has reached `trigger_size`, and
     under an exclusive `__prune__` lock so two machines never prune (or number a
     new benchmark series) at once. That lock serialises pruners only -- ordinary
     merges carry on around it, since each doomed model is locked individually
     and re-read fresh before anything is touched.
+
+    **Who goes** (`rl/diversity.py`): the `protect_top` best-rated models of the store are kept
+    whatever they play; the others are *eligible* once their `games` reach the
+    `protect_percentile` of games played; `eliminate_fraction` of the eligible go, one at a
+    time the one whose play is nearest to any other model still standing (protected or not),
+    the lower-rated when the nearest two are both eligible. A model with no signature on the
+    probes yet (computed here, at most `SIGNATURES_PER_PRUNE` a pass) is neither eligible nor a
+    neighbour this time. Without the probes file nothing is pruned.
     """
     none = (0, 0)
     if not acquire_locks(global_dir, [PRUNE_LOCK], machine=machine, ttl=PRUNE_LOCK_SECONDS):
@@ -1209,31 +1251,62 @@ def _eliminate(
         population = discover_population(root)
         if len(population) < trigger_size:
             return none
+        probes = Path(diversity_probes)
+        if not probes.is_file():
+            if on_skip is not None:
+                on_skip(probes, "no probes for the pruning by diversity: nothing pruned")
+            return none
         # Only now is it certain this pass will prune: announced after the lock
         # and the recount, not when the merge merely noticed the trigger, so a
         # worker that lost the race to another pruner never reports "pruning".
         if on_phase is not None:
             on_phase(PRUNING)
-        population_labels = {c.label for c in population}
+        paths = {c.label: c.path for c in population}
         registry = load_global_registry(global_dir)
-        rated_games = [
-            m.games
-            for m in registry.ranked()
-            if not m.frozen and m.games > 0 and m.label in population_labels
-        ]
+        store = [m for m in registry.ranked() if not m.frozen and m.label in paths]
+        rated_games = [m.games for m in store if m.games > 0]
         if not rated_games:
             return none
         games_threshold = interpolated_percentile(rated_games, protect_percentile)
-        eligible_count = sum(
-            1
-            for m in registry.ranked()
-            if not m.frozen and m.games >= games_threshold and m.label in population_labels
+        protected = {m.label for m in store[:protect_top]}
+
+        from pokerlab.rl.diversity import (
+            backfill_signatures,
+            load_signatures,
+            probe_subset,
+            redundant_models,
+            signature_dir,
         )
-        doomed = registry.eliminate_lowest_rated(
-            count=round(eligible_count * eliminate_fraction),
-            games_threshold=games_threshold,
-            among=population_labels,
+        from pokerlab.rl.table_mix import TableMix
+
+        directory = signature_dir(global_dir, probes)
+        mix = TableMix()
+        backfill_signatures(
+            directory, probes, [(m.label, paths[m.label]) for m in store],
+            big_blind=mix.big_blind, starting_stack=mix.starting_stack, limit=SIGNATURES_PER_PRUNE,
+            on_skip=(lambda label, why: on_skip(paths[label], why)) if on_skip is not None else None,
         )
+        subset = None
+        first = next((directory / f"{m.label}.npy" for m in store if (directory / f"{m.label}.npy").is_file()), None)
+        if first is not None:
+            import numpy as np
+
+            probes_count, bins = np.load(first, mmap_mode="r").shape
+            subset = probe_subset(len(store), probes_count, bins)
+        signatures = load_signatures(directory, [m.label for m in store], subset)
+        labels = [m.label for m in store if m.label in signatures]
+        removable = {
+            m.label for m in store
+            if m.label in signatures and m.label not in protected and m.games >= games_threshold
+        }
+        doomed_labels = redundant_models(
+            labels,
+            [signatures[label] for label in labels],
+            removable=removable,
+            count=round(len(removable) * eliminate_fraction),
+            ratings={m.label: m.rating for m in store},
+        )
+        doomed = [registry.members[label] for label in doomed_labels]
 
         held: list[str] = []
         confirmed: list[PoolMember] = []
@@ -1269,6 +1342,8 @@ def apply_pending_population_sessions(
     trigger_size: int = DEFAULT_POPULATION_TRIGGER,
     eliminate_fraction: float = DEFAULT_ELIMINATION_FRACTION,
     protect_percentile: float = DEFAULT_PROTECT_PERCENTILE,
+    protect_top: int = DEFAULT_PROTECT_TOP,
+    diversity_probes: str | Path = DEFAULT_PROBES,
     k_schedule: Sequence[tuple[int, float]] = DEFAULT_K_SCHEDULE,
     on_skip: Callable[[Path, str], None] | None = None,
     on_phase: Callable[[str], None] | None = None,
@@ -1393,7 +1468,9 @@ def apply_pending_population_sessions(
             trigger_size=trigger_size,
             eliminate_fraction=eliminate_fraction,
             protect_percentile=protect_percentile,
-                on_skip=on_skip,
+            protect_top=protect_top,
+            diversity_probes=diversity_probes,
+            on_skip=on_skip,
             on_phase=on_phase,
         )
         if on_phase is not None:
@@ -1432,6 +1509,8 @@ def run_population_sessions(
     trigger_size: int = DEFAULT_POPULATION_TRIGGER,
     eliminate_fraction: float = DEFAULT_ELIMINATION_FRACTION,
     protect_percentile: float = DEFAULT_PROTECT_PERCENTILE,
+    protect_top: int = DEFAULT_PROTECT_TOP,
+    diversity_probes: str | Path = DEFAULT_PROBES,
     k_schedule: Sequence[tuple[int, float]] = DEFAULT_K_SCHEDULE,
     on_skip: Callable[[Path, str], None] | None = None,
     on_phase: Callable[[str], None] | None = None,
@@ -1480,6 +1559,8 @@ def run_population_sessions(
         trigger_size=trigger_size,
         eliminate_fraction=eliminate_fraction,
         protect_percentile=protect_percentile,
+        protect_top=protect_top,
+        diversity_probes=diversity_probes,
         k_schedule=k_schedule,
         on_skip=on_skip,
         on_phase=on_phase,

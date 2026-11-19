@@ -399,6 +399,19 @@ def test_a_well_played_model_above_the_best_anchor_is_added(tmp_path):
     assert not (root / "models" / "model4.pt").exists()
 
 
+def test_a_model_chosen_by_hand_becomes_an_anchor_at_its_rating_whatever_the_rule_says(tmp_path):
+    from pokerlab.rl.global_arena import promote_to_benchmark
+
+    root, global_dir = _store(tmp_path, anchors=[(1900.0, 500)], models=[(1700.0, 5)])
+    member = promote_to_benchmark(global_dir, root, "model0", machine="m")
+    assert member is not None and member.frozen and member.rating == 1700.0
+    assert read_member(global_dir, "model0").ref == str(root / "benchmark" / "model0.pt")
+    assert (root / "benchmark" / "model0.pt").is_file() and not (root / "models" / "model0.pt").exists()
+    # already an anchor, or unknown: nothing happens
+    assert promote_to_benchmark(global_dir, root, "model0", machine="m") is None
+    assert promote_to_benchmark(global_dir, root, "nobody", machine="m") is None
+
+
 def test_a_model_within_the_margin_of_the_best_anchor_is_not_added(tmp_path):
     root, global_dir = _store(
         tmp_path, anchors=[(1500.0, 500)],
@@ -503,6 +516,34 @@ def _make_checkpoint(path, seed=0):
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(seed)
     save_checkpoint(path, tiny_model(hidden=8, num_layers=1))
+
+
+def _probes(path, hands: int = 6):
+    """A small probe file: decisions of a few hands of random players."""
+    from support import make_random_legal_bot
+
+    from pokerlab.engine.config import GameConfig
+    from pokerlab.engine.table import Table
+    from pokerlab.players.base import Player
+    from pokerlab.rl.diversity import save_probes
+
+    kept = []
+
+    class Keep(Player):
+        def __init__(self, seat):
+            super().__init__(f"p{seat}", f"p{seat}")
+            self.bot = make_random_legal_bot(f"p{seat}", rng=random.Random(seat))
+
+        def act(self, observation, legal):
+            kept.append((observation, list(legal)))
+            return self.bot.act(observation, legal)
+
+    table = Table(GameConfig(3, 10_000, 50, 100), [Keep(seat) for seat in range(3)], rng=random.Random(0))
+    for _ in range(hands):
+        table.stacks = [10_000] * 3
+        table.play_hand()
+    save_probes(kept, path)
+    return path
 
 
 def _four_candidates(tmp_path):
@@ -878,6 +919,8 @@ def test_run_population_sessions_prunes_and_deletes_every_doomed_model(tmp_path)
         trigger_size=7,  # 8 tracked models >= 7 fires
         eliminate_fraction=0.5,  # doomed = round(eligible * 0.5)
         protect_percentile=0,
+        protect_top=0,
+        diversity_probes=_probes(tmp_path / "probes.pkl"),
     )
 
     assert report.triggered_elimination
@@ -916,6 +959,8 @@ def test_run_population_sessions_trigger_is_the_real_disk_population_not_the_led
         trigger_size=3,
         eliminate_fraction=0.34,
         protect_percentile=0,
+        protect_top=0,
+        diversity_probes=_probes(tmp_path / "probes.pkl"),
     )
     assert empty_report.triggered_elimination
 
@@ -975,6 +1020,8 @@ def test_run_population_sessions_fires_again_when_the_population_crosses_the_tri
         "trigger_size": 7,
         "eliminate_fraction": 0.5,
         "protect_percentile": 0,
+        "protect_top": 0,
+        "diversity_probes": _probes(tmp_path / "probes.pkl"),
     }
 
     first = run_population_sessions(seed=1, **kwargs)
@@ -1266,3 +1313,45 @@ def test_forked_copies_report_one_progress_step_per_session(tmp_path):
 
     assert [done for done, _total, _detail in seen] == [1, 2, 3, 4, 5, 6]
     assert {total for _done, total, _detail in seen} == {6}
+
+
+def test_the_pruning_keeps_the_top_and_removes_the_near_copy_below_it(tmp_path):
+    """Two models below the top that play alike (one is a copy of the other with a tiny change) and
+    a third that plays differently: the copy goes, the different one stays, and the best-rated is
+    kept whatever it plays."""
+    from pokerlab.rl.global_arena import _eliminate
+
+    root = tmp_path / "checkpoints"
+    global_dir = root / "global"
+    labels = ["best", "twin_a", "twin_b", "odd"]
+    for seed, label in enumerate(labels):
+        _make_checkpoint(root / f"models/{label}.pt", seed={"twin_b": 1}.get(label, seed))
+    twin = torch.load(root / "models/twin_b.pt", weights_only=True)
+    first = next(key for key in twin["model"] if key.startswith("trunk.") and key.endswith("bias"))
+    twin["model"][first] = twin["model"][first] + 1e-4
+    torch.save(twin, root / "models/twin_b.pt")
+    for rating, label in zip((1900, 1500, 1490, 1400), labels, strict=True):
+        write_member(global_dir, PoolMember(label=label, ref=f"models/{label}.pt", rating=rating, games=50))
+    eliminated, deleted = _eliminate(
+        global_dir=global_dir, root=root, machine="host-a", lock_ttl=60, trigger_size=1,
+        eliminate_fraction=0.34, protect_percentile=0, protect_top=1,
+        diversity_probes=_probes(tmp_path / "probes.pkl", hands=10), on_skip=None,
+    )
+    assert (eliminated, deleted) == (1, 1)
+    left = sorted(p.stem for p in (root / "models").glob("*.pt"))
+    assert left == ["best", "odd", "twin_a"]  # the lower-rated of the two alike went
+
+
+def test_without_the_probes_nothing_is_pruned(tmp_path):
+    from pokerlab.rl.global_arena import _eliminate
+
+    root = tmp_path / "checkpoints"
+    for i in range(3):
+        _make_checkpoint(root / f"models/m{i}.pt", seed=i)
+        write_member(root / "global", PoolMember(label=f"m{i}", ref=f"models/m{i}.pt", rating=1500, games=5))
+    skipped = []
+    assert _eliminate(global_dir=root / "global", root=root, machine="h", lock_ttl=60, trigger_size=1,
+                      eliminate_fraction=0.5, protect_percentile=0, protect_top=0,
+                      diversity_probes=tmp_path / "missing.pkl",
+                      on_skip=lambda path, why: skipped.append(why)) == (0, 0)
+    assert len(list((root / "models").glob("*.pt"))) == 3 and "no probes" in skipped[0]

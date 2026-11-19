@@ -43,13 +43,16 @@ from pokerlab.config import (
     format_config,
     parse_with_config,
 )
+from pokerlab.rl.action_space import add_raise_sizing_argument
 from pokerlab.rl.allin_reward import DEFAULT_ALLIN_RUNOUTS
+from pokerlab.rl.belief import file_fingerprint
 from pokerlab.rl.benchmark import (
     DEFAULT_ANCHOR_ROTATE_EVERY,
     DEFAULT_BENCHMARK_DIR,
     DEFAULT_BENCHMARK_SESSIONS,
     DEFAULT_RESIDENT_ANCHORS,
 )
+from pokerlab.rl.diversity import DEFAULT_PROBES, DEFAULT_PROTECT_TOP
 from pokerlab.rl.equity_net import encoder_config, load_equity_checkpoint
 from pokerlab.rl.global_arena import (
     BENCHMARK_GAMES_PERCENTILE,
@@ -63,6 +66,7 @@ from pokerlab.rl.global_arena import (
     draw_tiers_text,
 )
 from pokerlab.rl.global_store import (
+    ARENA_SUPERSEDED_EXIT,
     DEFAULT_LOCK_SECONDS,
     DEFAULT_MODELS_DIR,
     claim_benchmark_arena,
@@ -145,6 +149,7 @@ from pokerlab.rl.train import (
     RUN_METADATA_VERSION,
     TrainConfig,
     add_network_arguments,
+    add_oracle_arguments,
     check_network_arguments,
     network_shape,
     recorded_axes,
@@ -425,10 +430,6 @@ def sweep_stale_work(
 # `style_temperature_spread`, `style_jitter`). `style_scales` is not: it is the
 # calibration of each style axis's unit (`studies/agents/style_calibration.py`),
 # measured, not a setting, and `style_spread` already widens every axis at once.
-# `critic_stack_power` is one too: the exponent that equalises the critic's loss
-# across stakes depends on how the target's spread grows with the stake, which moves
-# with `gae_lambda` (itself swept) and the all-in runouts, so each lineage carries
-# its own (0 is "no weighting" and stays 0).
 # An axis at 0 stays at 0 under any multiplier, and for these that is the switch:
 # 0 annealing iterations is "no annealing" (`_HP_ZERO_IS_OFF_AXES`), a 0 share is
 # "no styled seats", 0 jitter or temperature spread is none of that noise. Turning
@@ -443,7 +444,6 @@ HP_AXES = (
     "gae_lambda",
     "value_coef",
     "policy_max_grad_norm",
-    "critic_max_grad_norm",
     "pool_top_share",
     "pool_top_n",
     "lr_anneal_final",
@@ -455,7 +455,8 @@ HP_AXES = (
     "style_spread",
     "style_temperature_spread",
     "style_jitter",
-    "critic_stack_power",
+    "belief_oracle",
+    "belief_oracle_iterations",
 )
 
 # The axes whose values are counts, so a value is cast back to `int`. Everything
@@ -470,6 +471,7 @@ _HP_INT_AXES = frozenset(
         "minibatch_size",
         "lr_anneal_iterations",
         "entropy_anneal_iterations",
+        "belief_oracle_iterations",
     }
 )
 
@@ -477,7 +479,7 @@ _HP_INT_AXES = frozenset(
 # annealing at all. `_moved_count` lifts any other count off 0 (`ppo_epochs` 0 is a
 # run that never trains); these stay at 0, as a float axis at 0 does, so a lineage
 # the file started without annealing is not given a one-iteration curve by a step.
-_HP_ZERO_IS_OFF_AXES = frozenset({"lr_anneal_iterations", "entropy_anneal_iterations"})
+_HP_ZERO_IS_OFF_AXES = frozenset({"lr_anneal_iterations", "entropy_anneal_iterations", "belief_oracle_iterations"})
 
 # What a worker multiplies its starting value by (its parent's, or the fleet's
 # own when it has none), one independent draw per axis. This is the *default*:
@@ -504,7 +506,7 @@ HP_MULTIPLIERS: tuple[float, ...] = (0.8, 1.0, 1.2)
 # `rng.random()`, and `pool_top_share` decides how many of `--pool-models` seats
 # come from the top band). There is deliberately no lower cap, here or anywhere:
 # multiplying a positive value by 0.8 can never reach 0.
-_HP_PROBABILITY_AXES = frozenset({"opponent_probability", "pool_top_share", "style_share"})
+_HP_PROBABILITY_AXES = frozenset({"opponent_probability", "pool_top_share", "style_share", "belief_oracle"})
 
 # Axes perturbed through their complement, `1 - value`. For the GAE lambda the
 # quantity that matters is `1 - lambda`: the effective horizon is
@@ -553,7 +555,6 @@ class Hyperparameters:
     gae_lambda: float = TrainConfig.lam
     value_coef: float = PPOConfig.value_coefficient
     policy_max_grad_norm: float = PPOConfig.policy_max_grad_norm
-    critic_max_grad_norm: float = PPOConfig.critic_max_grad_norm
     # The annealing curves: where the learning rate ends (it starts at `lr`) and
     # over how many iterations, and the entropy bonus's start, end and length.
     lr_anneal_final: float = DEFAULT_LR_ANNEAL_FINAL
@@ -567,8 +568,10 @@ class Hyperparameters:
     style_spread: float = StyleConfig.spread
     style_temperature_spread: float = StyleConfig.temperature_spread
     style_jitter: float = StyleConfig.jitter
-    # The power of the stake the critic's loss is weighed by (`ppo.critic_weights`).
-    critic_stack_power: float = PPOConfig.critic_stack_power
+    # Oracle guiding (feature version 5): the share of the true cards at the start of a run, and the
+    # iterations over which it falls to 0.
+    belief_oracle: float = TrainConfig.belief_oracle
+    belief_oracle_iterations: int = TrainConfig.belief_oracle_iterations
     arm: str = HP_ARM_SAMPLED
 
 
@@ -638,7 +641,6 @@ def starting_hyperparameters(args: argparse.Namespace) -> Hyperparameters:
         gae_lambda=args.gae_lambda,
         value_coef=args.value_coef,
         policy_max_grad_norm=args.policy_max_grad_norm,
-        critic_max_grad_norm=args.critic_max_grad_norm,
         lr_anneal_final=args.lr_anneal_final,
         lr_anneal_iterations=args.lr_anneal_iterations,
         entropy_anneal_start=args.entropy_anneal_start,
@@ -648,7 +650,8 @@ def starting_hyperparameters(args: argparse.Namespace) -> Hyperparameters:
         style_spread=args.style_spread,
         style_temperature_spread=args.style_temperature_spread,
         style_jitter=args.style_jitter,
-        critic_stack_power=args.critic_stack_power,
+        belief_oracle=args.belief_oracle,
+        belief_oracle_iterations=args.belief_oracle_iterations,
         arm=HP_ARM_SAMPLED,
     )
 
@@ -898,6 +901,15 @@ def launch_worker(
             for token in (f"--{key.replace('_', '-')}", str(value))
         ],
         "--equity-model", args.equity_model,
+        "--critic-bins", str(args.critic_bins),
+        "--feature-version", str(args.feature_version),
+        "--belief-model", args.belief_model,
+        # Swept: the oracle's share and how long it lasts; the way it is given is the fleet's.
+        "--belief-oracle", str(hp.belief_oracle),
+        "--belief-oracle-iterations", str(hp.belief_oracle_iterations),
+        "--belief-oracle-mode", args.belief_oracle_mode,
+        "--belief-oracle-near", *(str(n) for n in args.belief_oracle_near),
+        "--raise-sizing", args.raise_sizing,
         "--seed", str(seed),
         "--device", args.device,
         "--models-dir", str(args.models_dir),
@@ -908,6 +920,7 @@ def launch_worker(
         "--table-hands", str(args.table_hands),
         "--concurrent-tables", str(args.concurrent_tables),
         "--allin-runouts", str(args.allin_runouts),
+        "--critic-runout" if args.critic_runout else "--no-critic-runout",
         # Swept: the styled opponents' draw, with the fleet's own per-axis scales.
         *style_arguments(
             replace(
@@ -918,7 +931,6 @@ def launch_worker(
                 jitter=hp.style_jitter,
             )
         ),
-        "--critic-stack-power", str(hp.critic_stack_power),  # swept
         "--collect-workers", str(args.collect_workers),
         "--session-workers", str(args.session_workers),
         "--pool-refresh-every", str(args.pool_refresh_every),
@@ -941,7 +953,6 @@ def launch_worker(
         "--gae-lambda", str(hp.gae_lambda),
         "--value-coef", str(hp.value_coef),
         "--policy-max-grad-norm", str(hp.policy_max_grad_norm),
-        "--critic-max-grad-norm", str(hp.critic_max_grad_norm),
         # Recorded by the worker into the model it publishes, never acted on:
         # which arm drew these values is what separates the runs an analysis can
         # read a response curve from.
@@ -987,6 +998,8 @@ def launch_worker(
             "--global-trigger-size", str(args.global_trigger_size),
             "--global-eliminate-fraction", str(args.global_eliminate_fraction),
             "--global-protect-percentile", str(args.global_protect_percentile),
+            "--prune-protect-top", str(args.prune_protect_top),
+            "--diversity-probes", args.diversity_probes,
             "--benchmark-games-percentile", str(args.benchmark_games_percentile),
             "--benchmark-margin", str(args.benchmark_margin),
         ]
@@ -1200,10 +1213,14 @@ def run_requested_benchmark_arena(
         code = subprocess.call(
             command, stdout=handle, stderr=subprocess.STDOUT, env=environment
         )
-    finish_benchmark_arena(claim, failed=code != 0)
+    # Superseded is not a failure: a newer arena, which knows every anchor this one
+    # did and more, is settling them now.
+    finish_benchmark_arena(claim, failed=code not in (0, ARENA_SUPERSEDED_EXIT))
     elapsed = (time.time() - started) / 60.0
     if code == 0:
         print(f"  arena conclusa in {elapsed:.0f} min", flush=True)
+    elif code == ARENA_SUPERSEDED_EXIT:
+        print(f"  arena fermata dopo {elapsed:.0f} min: un'arena piu' recente ha preso il turno", flush=True)
     else:
         print(f"  ARENA FALLITA (codice {code}) dopo {elapsed:.0f} min: vedi {log_path}. "
               f"La richiesta non viene ripetuta da sola.", flush=True)
@@ -1387,14 +1404,17 @@ def run_loop(
             tiers=parse_parent_tiers(args.parent_tiers),
             benchmark_dir=Path(args.benchmark_dir),
             accept_path=same_network_filter(
-                network_shape(args), encoder_config(load_equity_checkpoint(args.equity_model))
+                network_shape(args),
+                encoder_config(load_equity_checkpoint(args.equity_model)),
+                args.feature_version,
+                file_fingerprint(args.belief_model) if args.feature_version == 5 else None,
             ),
         )
         if None in plan:
             print(
                 f"  {plan.count(None)} worker senza genitore: nessun modello con la rete "
-                f"{args.hidden}x{args.num_layers} (testa {args.head_hidden}x{args.head_layers}) "
-                f"nello store, partono da zero",
+                f"{args.hidden}x{args.num_layers} (testa {args.head_hidden}x{args.head_layers}, "
+                f"feature v{args.feature_version}) nello store, partono da zero",
                 flush=True,
             )
         # Read once per generation, off the very checkpoints the workers are
@@ -1603,7 +1623,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gae-lambda", type=float, default=TrainConfig.lam)
     parser.add_argument("--value-coef", type=float, default=PPOConfig.value_coefficient)
     parser.add_argument("--policy-max-grad-norm", type=float, default=PPOConfig.policy_max_grad_norm)
-    parser.add_argument("--critic-max-grad-norm", type=float, default=PPOConfig.critic_max_grad_norm)
     parser.add_argument(
         "--opponent-probability", type=float, default=0.5,
         help="chance that a non-learner seat gets an opponent instead of another "
@@ -1631,11 +1650,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="boards a hand closed before the river is averaged over for its training "
         "reward (0: the chips that moved); forwarded to every worker",
     )
+    add_oracle_arguments(parser)
+    add_raise_sizing_argument(parser)
     parser.add_argument(
-        "--critic-stack-power", type=float, default=PPOConfig.critic_stack_power,
-        help="the critic's loss weighs a decision by its stake in big blinds to this "
-        "power, negated (0: off). Swept: where a worker with no parent starts, every "
-        "worker then perturbs it (0 stays 0)",
+        "--critic-runout", dest="critic_runout", action="store_true", default=False,
+        help="the critic reads every player's equity on the board the hand will have once all "
+        "five cards are out (the deck is already shuffled), not on the cards out so far: the "
+        "baseline then takes the luck of the cards to come out of the advantages. Training only, "
+        "never seen by the policy. Off by default: in place of the equities on the board as it "
+        "stands it explained less of the return (they are what the all-in runouts' expected "
+        "result follows); forwarded to every worker",
+    )
+    parser.add_argument(
+        "--no-critic-runout", dest="critic_runout", action="store_false",
+        help="the critic reads the equities on the board as it stands (the default)",
     )
     parser.add_argument(
         "--update-device", default="same",
@@ -1775,6 +1803,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--global-protect-percentile", type=float, default=DEFAULT_PROTECT_PERCENTILE
+    )
+    parser.add_argument(
+        "--prune-protect-top", type=int, default=DEFAULT_PROTECT_TOP,
+        help="the pruning keeps this many best-rated models of the store whatever they play; below "
+        "them it removes the models whose play is nearest to another's (rl/diversity.py)",
+    )
+    parser.add_argument(
+        "--diversity-probes", type=str, default=DEFAULT_PROBES,
+        help="the fixed decisions a model's play is read on to tell how alike two models are "
+        "(studies/agents/diversity_study.py probes); without the file nothing is pruned",
     )
     parser.add_argument(
         "--benchmark-games-percentile", type=float, default=BENCHMARK_GAMES_PERCENTILE,

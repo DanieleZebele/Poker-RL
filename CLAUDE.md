@@ -226,6 +226,75 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
     from 380 to 942 inputs and the critic's from 357 to 919, about +1.1M parameters on the
     shipped shape. **Whether it plays better is not measured**: it needs an ablation at equal
     compute against version 3.
+- **Version 5: a belief about every opponent's cards, in place of the opponent statistics**
+  (`OBS_DIM_V5` 777; built when `feature_version = 5` in `[network]`, shipped at 3). Version 3's
+  layout with each seat's 20 statistics replaced by `BELIEF_FEATURES` = 33 numbers: the mean, in
+  the equity encoder's space, of the range of hole cards the model believes that seat holds, and
+  how wide the range is (its entropy over `log 1326`); zero for me and for a folded seat. Computed
+  at every decision by the **belief network** (`rl/belief.py`, `BeliefReader`; trained apart in
+  `studies/belief`, see its section), from the hand's actions, the seat's position and stack, the
+  board, the cards I see (which nobody else holds) and the table's **memory** of that player.
+  - **Frozen, in the model, from one file**: `[network] belief_model` (`belief_evaluator/
+    belief-memory-v3.pt` since 2026-11-18, the network trained on our models and on real hands, see
+    "Belief on models and on real players"; exported by `studies/belief/belief_export.py`) is copied
+    into every version-5 network built (`train.build_network`, `PokerActorCritic(belief=)`: weights in
+    `belief_net`, shape and the file's fingerprint in `model.belief` and the checkpoint), like the
+    equity encoder: a published model is self-contained. It must have been trained on
+    `equity_model` (`check_network_arguments` compares the files). `check_compatible` refuses a
+    version-5 checkpoint without one, `load_checkpoint` one built on another file, and a parent is one
+    only with the same fingerprint (`same_network_filter`, `parent_shape_mismatch`).
+  - **The memory is the table's** (`rl/belief_inputs.py::MemoryTracker`, `Table(memory_tracker=)`,
+    `Observation.seat_memory`): what a player did is the table's finished hands; each belief network
+    reads them with its own memory network (keyed by fingerprint, so models of one file share it),
+    lazily, when one of its models first asks in the next hand -- a table with no version-5 model
+    pays a list append. A view is the memory as it stood before its hand (`MemoryView`), and asking
+    one after a later hand was read raises. `TableBank` gives every table one and starts it afresh
+    with the statistics (`reset_stats`), so in training it lives as long as a table's players and in
+    a rated session as long as the session. Where there is no tracker (GUI, spot screen, search,
+    `duel_power`) every player reads as never seen. Identity is the `player_id`.
+  - **Oracle guiding, training only, off** (`--belief-oracle`, `--belief-oracle-iterations`, in
+    `[training]`, forwarded by `poker-loop`): the learner's beliefs become `(1 - s) * range + s * true
+    hand` (the true hand's `phi` and a width of 0) with `s` falling linearly to 0 over the iterations
+    (`train.belief_oracle_at`, `SelfPlayCollector.oracle_share`); the true cards come from `deal_holes`.
+    PPO trains on the vectors that acted, since they are in the features. **How** they are given is
+    `--belief-oracle-mode` (`belief_inputs.ORACLE_MODES`, `BeliefReader`): `mix` (the default, every
+    vector mixed as above), `swap` (with probability `s` an opponent is read as its true hand for the
+    whole hand, else as its range; drawn once per opponent and hand) and `near` (with probability `s`
+    its range is kept to the `NEAR_COMBOS` (64) combos nearest its true hand in `phi`, renormalised: a
+    range that knows roughly what it holds), as many combos as `--belief-oracle-near` says: one count, or
+    four, one per street (preflop, flop, turn, river; `belief_inputs.near_combos`). **The share and the
+    length are sweep axes** (`HP_AXES`, starting at 0.5 and 500 iterations in `[starting-point]`, the
+    user's choice of 2026-11-18, mode `mix`): each lineage inherits and perturbs them, and every run,
+    an inheriting one included, starts its own oracle afresh. **E8** (`checkpoints/studies/belief_ppo/e8`, belief v3, from
+    scratch, 3 seeds, s 0.5 falling to 0 at iteration 20, bb/100 against the anchors on the same 300
+    sessions at i10/i20/i30/i40): none -83.8/-16.9/-3.8/-3.2, `mix` -38.6/-5.0/-3.3/+2.6, `near`
+    -62.7/-3.6/+2.5/+1.9, `swap` -85.4/-18.9/-1.0/-4.7. Paired with the same seed's no-oracle run at
+    i40: `mix` +6/+8/+3, `near` +3/+11/+2 (every seed ahead at i20, i30 and i40; `near` the steadiest
+    between seeds, +-0.4 at i40), `swap` -16/+13/-1 (nothing). Giving each opponent's true hand whole,
+    to some opponents only, does not teach what the vectors mean; a vector that is always partly
+    true (`mix`) or always a narrower but plausible range (`near`) does, and its edge outlives the
+    oracle by 20 iterations. Measured only from scratch: in the fleet every inheriting run would
+    restart the oracle on a trained model, which is not measured.
+    **E9** (`e9/`, how much, how long, how narrow; E8's setup but `ppo_epochs` 2 from the file, not 5):
+    mix 0.25/0.5/0.75 over 20 iterations, 0.5 over 40, near 16/64/256 and per street (256-32, 32-256),
+    a control `off` (`--belief-oracle 0`, `run-off.sh`; the arm named `none` passed no flag and took the
+    file's 0.5 over 500, so it is an oracle held all run). **Unreadable as a ranking of the variants**:
+    with 2 epochs a run from scratch sits for a while losing ~3 bb a hand before it starts to learn, and
+    when it starts is luck (iteration 7-12 for every arm of seed 71, 8-32 for seeds 72 and 73 whatever
+    the arm), so at i20 and i40 the result is mostly how long ago that was. On seed 71, where every arm
+    started together, **every oracle arm is ahead of `off` by +8 to +12 bb/100 at i40** (+44 to +62 at
+    i20; `off` started at 12, the oracle arms at 7-9), and the variants are not told apart. Pass
+    `--belief-oracle 0` for a control: the file's starting point is not off.
+  - **What the network is fed is what it was trained on**: the tokens are one function for the study
+    and for play (`belief_inputs.action_tokens`; `studies/belief/belief_records.py` imports it), and
+    the export drops the study's statistics columns, which multiplied zeros: on a real test session the
+    production reader's ranges equal the study network's within 2e-6.
+  - **Cost, measured** (one core, the training mixture, every seat the shipped shape): 7.7 ms a hand
+    at version 3, 15.9 at version 5 (2.1x), ~0.8 ms a decision of which the GRU over the hand's tokens
+    (run only over the tokens that came since the last question, `_summaries`), the context MLP and
+    the 1326-combo softmax; the combos' features are remembered per board (`BOARD_CACHE_SIZE`). In a
+    fleet still mostly version 3 only the learner's seats pay it. **Whether it plays better is not
+    measured.**
 - **`encode_observation` takes `big_blind` and `starting_stack` as keyword
   arguments** because `Observation` deliberately carries no table config. Do
   *not* try to recover the blind from the `POST_BLIND` records: a short blind
@@ -260,6 +329,25 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
   does not exist. Colliding raise levels (common in small pots) are deduplicated
   the same way, lowest bin wins. `FOLD` is masked when `to_call == 0` (folding
   for free is strictly dominated) behind `mask_dominated_folds=True`.
+- **A raise can be sized by every raise bin's probability** (`raise_sizing` in `config.toml`,
+  `--raise-sizing bin|weighted`, the user's choice of 2026-11-17; shipped `bin`). With `weighted`,
+  which bin is drawn is unchanged (so the policy raises with the summed probability of the raise
+  bins), but a drawn min-raise or pot-fraction bin raises to the mean of the open raise bins' levels
+  weighted by their probabilities (`action_space.weighted_raise_to`, a mean of legal levels and so
+  legal); the all-in stays a bin of its own, and so do fold and call. **Only when the models play**:
+  every rated session, the pool's opponents, the shards, the GUI's bots (which read the key from
+  `config.toml`) and the spot screen's drawn action. The learner a collector trains always uses
+  bins (`make_policy_fn(raise_sizing="bin")` in `SelfPlayTrainer`), because PPO credits the drawn
+  bin: with a weighted size the outcome no longer depends on which raise bin was drawn and the sizes
+  could not be learnt. It is a process setting (`action_space.set_raise_sizing`, set by each CLI
+  from the flag, inherited by forked copies, handed to shards), so it reaches every player without a
+  parameter in every function that builds one. `PolicyDecision.probabilities` carries the
+  distribution when it is needed. **Measured** (`studies/agents/sizing_study.py`, the #1 of the
+  ranking in one seat, the same hands twice, 4,000 sessions of 100 hands, `checkpoints/studies/
+  sizing`): weighted - bin = +0.8 +- 1.6 bb/100 against the anchors and -1.0 +- 1.1 against the
+  store's top 50, nothing at any table size; the raises barely change (median size over the pot
+  0.75 -> 0.74 and 0.50 -> 0.58), since the models put almost all of a raise's probability on one
+  bin. Switching it on changes how every rating is earned, by about nothing.
 - **Training collects trajectories through `Player.act()`, not through a Gym
   `step()`** (`rl/rollout.py`). PPO needs `(s, a, logp, V, r, done)` tuples, not
   a `step()`; `Table` drives hands synchronously and `RLAgentPlayer.on_decision`
@@ -313,25 +401,69 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
   collection at 20 runouts (+5% at 10, +31% at 50). The `valore` diagnostics read the
   new target, so their explained variance jumps when it is switched on: do not compare
   readings across the change. Pinned in `tests/unit/test_rl_allin_reward.py`.
-- **The critic's loss weighs each decision by its stake** (`ppo.critic_weights`,
-  `--critic-stack-power`, `critic_stack_power` in `config.toml` `[starting-point]`, 1.4; 0 = off;
-  an axis of the sweep, each lineage its own, 0 stays 0): the squared error is multiplied by `stake_bb ** -power`,
-  rescaled to mean 1 over the batch, where the stake (`features.chips_at_stake`,
-  `DecisionRecord.stake_bb`) is my chips for the hand (stack plus what I put in) against
-  the deepest opponent still in it, floored at `MIN_STAKE_BB` 1. Why: the target's sd
-  grows with the stake (production `valore per stack` lines: ~0.045 / 0.125 / 0.26 for
-  `<10` / `10-30` / `30+` bb, sd ~ stake^0.7, so 1.4 is inverse-variance), and unweighted
-  the `<10` group was ~0.4% of the value loss with an explained variance often negative.
-  **Critic only, never the policy**: a weight that is a function of the state leaves the
-  minimiser at E[G | s] for every state (only capacity moves) and any state-only critic
-  is an unbiased baseline, so the policy's objective is untouched; weighing the policy's
-  loss would change what bb/100 means to it. Two rules for whoever touches it: the weight
-  must be computed from what the critic sees at the decision (hence the stake at the
-  decision, not `HandTrajectory.effective_stack_bb` at the hand's start) and never from
-  the outcome (|reward|, the final pot), or the target is biased. The logged `value` stays
-  the *unweighted* error, so it reads the same with the weight on or off. Pinned by
-  `test_weighing_the_critic_by_the_stake_leaves_the_policy_untouched` and
-  `test_chips_at_stake_is_mine_against_the_deepest_opponent_still_in`.
+- **The critic is a classifier (HL-Gauss), on since 2026-11-16** (`critic_bins` in `config.toml`
+  `[network]`, 101; `--critic-bins`, forwarded by `poker-loop`; 0 = the scalar critic on the squared
+  error). The head gives 101 logits over bins uniform in symlog of the value (`unit` one big blind
+  in the reward's scale, support from -1.05 to `max_players - 1 + 0.05` deepest stacks,
+  `train.critic_support`), the value is the softmax's mean over the bins' centres and the loss the
+  cross-entropy against a Gaussian 0.75 bins wide on the target (`policy.hl_gauss_targets`,
+  `CRITIC_SIGMA_RATIO`). Why: offline it explains more of the held-out return than the squared
+  error in every group, worth ~1.6x the data, and 25-201 bins are equal (see the study section
+  "Critic as a classifier"). **Not a reset**: the policy does not depend on the critic, the parent
+  filter ignores it, and `load_checkpoint` carries over everything but the critic's output layer,
+  which starts at "the value is 0" (`reset_critic_output`; the log says "the critic's output layer
+  starts afresh"), so the first children of scalar-critic parents run a few iterations with a critic
+  that knows nothing. The checkpoint records `critic`. The logged `value` stays the squared error
+  of the softmax's mean, comparable across the change. Pinned in `tests/unit/test_rl_hl_critic.py`.
+  - **How the output layer starts matters, and it was wrong for the first hours** (fixed
+    2026-11-16, `CRITIC_OUTPUT_INIT` 2): `reset_critic_output` used to zero the weights and set the
+    biases to the log of the narrow HL-Gauss target of 0, floored at 1e-6, which put almost every
+    logit at -13.8. With Adam's steps that barely moves: in PPO the explained variance stayed 0.00
+    on every street at iteration 10 (the scalar critic: 0.18 preflop, 0.50-0.57 later), and offline
+    the same network explained 0.006 after 400 steps against 0.24 from PyTorch's own start. Now the
+    weights are PyTorch's and the biases `-|z|` (a bin's centre in symlog): the value starts near
+    +1 big blind and every logit is within reach. The offline study never saw this because it built
+    its own network. **A classifier checkpoint without `critic_output_init` was saved by a run whose
+    critic began the old way**, and `load_checkpoint` starts its output layer afresh as for a parent
+    with another critic (the log line says "output started the old way"); the fleet published none
+    before the fix, but its first generation on the classifier trained with the stuck start.
+  - **In PPO, against the scalar critic** (from scratch, 10,000 hands an iteration, explained
+    variance at iteration 20, mean of the seeds): scalar (6 runs of the distillation study's base
+    arms, with the stake weighting) preflop 0.21, flop 0.48, turn 0.43, river 0.57; classifier with
+    the working start (3 runs) 0.26, 0.48, 0.44, 0.45. Better on the preflop, which is most of the
+    decisions, level on flop and turn, worse on the river. Not yet measured: strength.
+- **The critic in hindsight, off** (`--critic-runout`, `TrainConfig.critic_runout`,
+  `SelfPlayCollector(critic_runout=)`; forwarded by `poker-loop`). The table's `on_hand_started`
+  carries `runout`, the five community cards the hand will have (the deck is shuffled once and
+  burns nothing: `Deck.peek`), `TableBank.runout` keeps it, and with the switch on a learner's
+  `DealView` has all five as its board (`deal_view(..., runout)`, which refuses a runout that does
+  not continue the visible cards), so the critic's equities say who wins a showdown. A baseline may
+  read anything the action does not change, and the cards to come qualify. **Measured worse as it
+  is** (`studies/pi_distill` E4, iteration 10, 3 seeds): explained variance preflop 0.10-0.12
+  against 0.17-0.23 with the equities on the board as it stands (flop 0.27-0.35 against
+  0.38-0.42). Why: a hand closed before the river is trained on its mean over `allin_runouts`
+  boards, not on the board that came, and those hands carry most of the preflop target's variance;
+  the equity now is what that mean follows, and the switch replaces it. **With `allin_runouts` 0
+  it does not help either** (E5): the critic in hindsight then explains far more of the real
+  result (preflop 0.40-0.56 against 0.08-0.15 without it) and the students learn no faster (level
+  with the same setup without the runout at every reading), while dropping the runouts' mean costs
+  30-50 bb/100 up to iteration 20 (production's `allin_runouts` 20 is the one that pays). A critic
+  that explains more is not a policy that learns faster here. **Both equities side by side do not
+  help either** (E6: the critic explains the most of any arm, preflop 0.30-0.34 and flop
+  0.47-0.58, and the students end -7.6 +- 5.0 bb/100 against production at iteration 40, level or
+  worse at every reading), and neither do 100 all-in runouts in place of 20 (-2.2 +- 2.1, and the
+  collection costs ~28% more).
+- **The critic's loss is not weighed and its gradient is not clipped** (both removed on
+  2026-11-16, with the classifier). It used to weigh each decision's squared error by its chips at
+  stake to a swept power (`critic_stack_power`, inverse-variance across stacks, since the target's
+  sd grows ~stake^0.7) and clip its gradient to a swept `critic_max_grad_norm`. The weighting was
+  about a squared error's scale, which the cross-entropy does not have, and offline the classifier
+  unweighted explained the short stacks better than the squared error weighted
+  (`studies/critic_loss`); the clip was tuned on the squared error, and under Adam a steady cut
+  barely changes a step. `--critic-stack-power`, `--critic-max-grad-norm`,
+  `DecisionRecord.stake_bb`, `features.chips_at_stake` and `TrainingBatch.stakes` are gone; a
+  parent's metadata may still carry the two keys and nothing reads them. Only the policy's
+  gradient is clipped (`policy_max_grad_norm`); the critic's norm is measured (`ppo.grad_norm`).
 - **Value diagnostics** (`rl/value_diagnostics.py`, pure Python):
   `poker-train` prints three `valore per tavolo:` / `valore per stack (bb):` /
   `valore per strada:` lines
@@ -353,8 +485,8 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
   - **Read off the first v2 run** (565 worker logs, generations 4-8, the last reading of
     each, medians with quartiles): by table size the target's spread is **1.7x**
     (1.4-2.1x), under the ~2x that would call for a scale per size, so the single
-    `reward_scale` stays; by stack it is **5.7x** (5.1-6.5x), which is what the stake
-    weighting is for. Explained variance by street: preflop 0.09, flop 0.36, turn 0.50,
+    `reward_scale` stays; by stack it is **5.7x** (5.1-6.5x), which the stake weighting of the
+    time was for (removed with the classifier critic). Explained variance by street: preflop 0.09, flop 0.36, turn 0.50,
     river 0.73, so the critic learns where it is given the cards. The weak spot is the
     `<10` bb group (0.03, a quarter of the workers negative): see the TODO.
   - **Why the reward scale is one constant and not per hand.** A from-scratch self-play
@@ -363,8 +495,7 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
     variant (up to ~12 bb/100) was larger than between variants, and a constant 25x apart
     did not move strength. A per-hand scale (`reward / effective stack`) was the only one
     whose critic had non-negative explained variance on every stack group, and it changes
-    what the objective weighs, so it was not adopted; the stake weighting balances the
-    critic's loss across stacks without touching the policy's objective.
+    what the objective weighs, so it was not adopted.
   - **No chart in a worker's panel has more than three lines** (`MAX_LINES` in the
     dashboard page): a larger set is split over several charts, each titled with what it
     holds (the target by table size is three charts, 2-4, 5-7, 8-9), and the legend is a
@@ -693,6 +824,23 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
   epoch (each epoch shuffles again, so it is a different handful each time). A batch smaller than
   one minibatch is used whole. `minibatch_size` counts *decisions*, not hands (~10 a hand at the
   default mixture), so a run's steps are about `epochs x floor(hands x 10 / minibatch_size)`.
+- **A decision at the table is asked for the lean way** (`policy.make_policy_fn`, 2026-11-16).
+  Measured at the shipped shape (512/3/256/1), one core: a decision cost 688 us, of which the
+  network's arithmetic (trunk and head) is ~180 us, memory-bound (3.4 MB of weights read per
+  decision: NumPy is no faster, and C would not be either); the rest was overhead. The policy
+  function now puts the suits in canonical order in plain Python (`canonical_cards`, pinned equal
+  to `equity_net.canonical_suits`), remembers the frozen card encoder's output by those cards
+  (`ENCODER_CACHE_SIZE`; the preflop has 169 of them), builds one tensor, and draws from the
+  normalised logits exactly as `Categorical` does (`multinomial` with replacement), so the
+  probabilities, the actions and the log-probabilities are the same as before, draw for draw
+  (pinned by tests; a seeded iteration prints the same line). ~320 us a decision, and an
+  iteration of 3,000 hands on one core 39.3 -> 29.5 s. It no longer calls `model.forward`: a
+  hook that wants to see a policy play watches its trunk. **Rejected: batching the decisions of
+  concurrent tables** (`BatchGate`-style): it pays only within one network (8 decisions at once:
+  ~110 us each), the forked copies play their tables one after another, and two thirds of the
+  decisions are the pool's opponents, different networks; stacking their weights to evaluate
+  them together cost ~590 us a decision against ~160, since every network's weights are copied.
+  What it would still buy is ~5% of an iteration, not worth threads in every copy.
 - **The critic's equity inputs are written with indexed assignments, not seat by seat**
   (`policy.deal_tensors`, used by `make_critic_fns.equity`): one assignment per tensor from flat
   (row, seat, card) lists. The seat-by-seat loop was ~7 s of pure Python per iteration at 66,000
@@ -700,22 +848,48 @@ Target algorithm is **self-play PPO** (actor-critic). Requires the `rl` extra
   ~5 s after, on 8,000 hands with 24 forks and a CPU critic). What is left of the serial part of an
   iteration is the features' list-to-tensor conversion (twice: the critic's value and
   `build_batch`) and the unpickling of the forks' lists; see the compact-array note above.
-- **Two gradient-norm clips, one per network** (`ppo.py`): `policy_max_grad_norm` (the old
-  `max_grad_norm`) on the policy's trunk and head, `critic_max_grad_norm` on the critic's;
-  both are axes of the sweep, starting from `config.toml` `[starting-point]`. A parent
+- **Study settings from the literature, off in the fleet** (2026-11-19; `poker-train` flags, studied in
+  `checkpoints/studies/policy_size/`, nothing in `config.toml` sets them):
+  - `--residual 1` (`PokerActorCritic(residual=)`, `ResidualBlock`): each trunk is a `Linear` into `hidden`,
+    `num_layers` blocks `x + Linear(ReLU(Linear(LayerNorm(x))))` and a final LayerNorm (SimBa, Lee et al.
+    2025: with these a larger network pays, with a plain MLP it can hurt). Recorded in the checkpoint
+    (`residual`, a fifth key of `PokerActorCritic.shape` and `checkpoint_shape`; a checkpoint without it is
+    0) and part of what makes a parent the same network (`same_network_filter`, `parent_shape_mismatch`,
+    which take a shape without the key as plain).
+  - `--dual-clip C` (`PPOConfig.dual_clip`, `ppo.clipped_objective`): with a negative advantage the
+    surrogate is bounded below at `C * advantage` (Ye et al. 2020; AlphaHoldem's "trinal clip"), C > 1.
+  - `--shrink-perturb B` (`PPOConfig.shrink_perturb`, `ppo.shrink_and_perturb`): after every step each
+    trainable `Linear` of policy and critic moves B of the way to a fresh initialisation of itself (soft
+    shrink and perturb, against the loss of plasticity of a network trained on and on: Juliani & Ash 2024
+    for PPO). `--inherit-shrink L`: once, on `--resume`, the weights become L x themselves + (1 - L) x a
+    fresh initialisation.
+  - `studies/pi_distill/pi_distill.py`'s update honours the first two the same way (it is what the studies
+    run).
+- **P1: a larger policy does not pay, from scratch** (`checkpoints/studies/policy_size/p1/`, 2026-11-19; feature
+  version 5, belief v3, 100 iterations of 10,000 hands, lr 3e-4, 5 epochs, 3 seeds; students rated against the
+  anchors from 1500 on the same 300 sessions). bb/100 at i25/i50/i75/i100, mean of the seeds: `small`
+  256/2/128/1 -10.1/+1.1/+6.2/+8.8, `base` 512/3/256/1 (the fleet's) -13.8/-4.4/+6.4/+7.6, `wide` 1024/3/256/1
+  -2.5/-5.7/+10.2/+10.3, `deep` 512/6/256/1 -21.7/+7.2/+9.0/+10.1, `large` 1024/5/256/3 -132.5/+0.1/+5.8/+2.8.
+  At i100, paired by seed against `base`: small +1.2 +- 3.0, wide +2.6 +- 3.0, deep +2.5 +- 3.7, large -4.8 +- 4.6:
+  nothing above the noise, and `large` learns slower (its training reward over the first 20 iterations is -250
+  to -330 bb/100 against -50 to -100 for the rest, one seed at -395 against the anchors at i25) and costs ~3x
+  the time. One million hands a run, from scratch: whether a larger network pays over a fleet lineage's tens
+  of millions is not measured.
+- **One gradient-norm clip, the policy's** (`ppo.py`): `policy_max_grad_norm` (the old
+  `max_grad_norm`) on the policy's trunk and head, an axis of the sweep starting from
+  `config.toml` `[starting-point]`; the critic's has none since 2026-11-16 (see above). A parent
   published before an axis existed is read from the `settings` its metadata recorded
   (`train.recorded_axes`): what the fleet ran it with, which is what it trained with; only one
   with the axis in neither place makes its child start from the file (`sampled-fallback`). A
   sweep observation written before an axis existed has it on neither side and counts as a step
-  of 0 on it (`fit_estimate`); one with the axis on one side only is left out. The two networks share no weight, and their gradients live on
-  different scales -- the policy's loss is of order 1 on normalised advantages, the
-  critic's a squared error in the reward's unit -- so one clip over both cut each by a
-  factor the other decided. Measured before the split, on a real worker: policy norm
-  ~0.6-0.8, critic ~0.13-0.23, so the old shared clip was in practice the policy's.
-- **The clips are measured, not assumed** (`rl/grad_log.py`): every iteration
-  `poker-train` prints `gradienti: policy media … sd … tagliati …% soglia … | critico …
-  [N passi]` -- per network, the norm before the cut over the iteration's minibatch
-  steps, its sd and the share of steps above its threshold. The dashboard draws them.
+  of 0 on it (`fit_estimate`); one with the axis on one side only is left out. The two networks
+  share no weight, so the policy's clip never touches the critic.
+- **The gradients are measured, not assumed** (`rl/grad_log.py`): every iteration
+  `poker-train` prints `gradienti: policy media … sd … tagliati …% soglia … | critico media
+  … sd … [N passi]` -- per network, the norm over the iteration's minibatch steps (the
+  policy's before its cut) and its sd, and for the policy the share of steps above its
+  threshold. The dashboard draws them. A line from before 2026-11-16 carries `tagliati …
+  soglia …` after the critic's sd too; it is read and those two numbers dropped.
   **Read them against Adam, not SGD**: Adam divides each parameter's step by a running
   RMS of its own gradient, so a cut by a factor that is about the same on every step
   cancels out and does not lower the effective learning rate; what a cut changes is the
@@ -1240,12 +1414,13 @@ and run at the speed of one), organised into generations.
   attributed afterwards to the settings that produced it.
   - **The axes** (`HP_AXES`): `--lr`, `--hands`, `--opponent-probability`,
     `--ppo-epochs`, `--clip-epsilon`, `--minibatch-size`, `--gae-lambda`,
-    `--value-coef`, `--policy-max-grad-norm`, `--critic-max-grad-norm`, the two that decide
+    `--value-coef`, `--policy-max-grad-norm`, the two that decide
     how strong a field the worker draws, `--pool-top-share` and `--pool-top-n`, the annealing
     curves (`--lr-anneal-final`, `--lr-anneal-iterations`, `--entropy-anneal-start`,
     `--entropy-anneal-final`, `--entropy-anneal-iterations`) and how the styled opponents are
-    drawn (`--style-share`, `--style-spread`, `--style-temperature-spread`, `--style-jitter`),
-    and `--critic-stack-power`: 22 axes. **`--style-scales` is held fixed**: it is the calibration of each style axis's unit
+    drawn (`--style-share`, `--style-spread`, `--style-temperature-spread`, `--style-jitter`), and
+    oracle guiding's share and length (`--belief-oracle`, a probability axis capped at 1, and
+    `--belief-oracle-iterations`, a count where 0 stays 0; since 2026-11-18): 22 axes. **`--style-scales` is held fixed**: it is the calibration of each style axis's unit
     (`style_calibration.py`), not a setting, and `--style-spread` already widens them all.
     An axis at 0 stays at 0 (a float times anything; the two annealing counts by
     `_HP_ZERO_IS_OFF_AXES`, where 0 is "off"), so a style share or an annealing switched off in
@@ -1378,7 +1553,7 @@ and run at the speed of one), organised into generations.
       regression carries the parent's rating as a nuisance term for that.
     - **The model**: a Bayesian ridge regression of gain on the *realised* log-steps
       of every axis (`log_step`: the GAE lambda on its complement, a move off exactly
-      0 as a fixed step), prior sd `PRIOR_SD` 15 Elo per unit log-step so twenty-two noisy
+      0 as a fixed step), prior sd `PRIOR_SD` 15 Elo per unit log-step so twenty noisy
       coefficients do not chase noise; plus a ridge regression of log CPU on the log
       *levels*, which gives each axis a **cost elasticity**. The value of a step is
       `beta - G * elasticity` with `G = max(mean gain, --sweep-min-gain)`: the
@@ -1393,7 +1568,7 @@ and run at the speed of one), organised into generations.
       estimable. **Uniform until `--sweep-warmup` (150) children have been seen**, and
       then identical to the old draw from the same rng.
     - **Expect it to be slow and weak.** A gain is the difference of two ratings each
-      with sd ~10 Elo, a x1.2 step is worth a couple, so firming up twenty-two axes takes
+      with sd ~10 Elo, a x1.2 step is worth a couple, so firming up twenty axes takes
       hundreds of children (~6 generations of 25 workers just to warm up). The model
       is linear in the step and fitted over the last `--sweep-window` (1500) children:
       it says which way is uphill *where the fleet has been lately*, not where the
@@ -1544,8 +1719,8 @@ and run at the speed of one), organised into generations.
   - **Cost, accepted: the end-of-run pass prunes under a biased draw.**
     Eligibility for deletion is a percentile of `games`, so the top bands (seated
     every pass or every other pass) become eligible sooner and the tail stays
-    below the percentile and immune; `eliminate_lowest_rated` then removes the
-    lowest rated *among the eligible*.
+    below the percentile and immune; the pruning then removes, *among the eligible*, the
+    models that play most like another (see "Pruning by diversity").
   - A model never before seen is bootstrapped at the default rating when it
     first plays; a benchmark draw is bootstrapped `frozen=True`.
 - **K follows a 20-step staircase approximating the optimal gain, and one
@@ -1746,7 +1921,9 @@ and run at the speed of one), organised into generations.
   repeated on a stale count.
 - **Elimination physically deletes the checkpoint file. This is deliberately
   destructive, not bookkeeping.** `_eliminate` removes `--global-eliminate-
-  fraction` of the *eligible* members: the non-frozen ones whose `games` is at or
+  fraction` of the *eligible* members, chosen by how alike they play, never by rating
+  below the protected top (see "Pruning by diversity" below): the non-frozen ones outside the
+  `--prune-protect-top` (100) best-rated whose `games` is at or
   above the `--global-protect-percentile` (**25th**) of games played among the
   models rated so far — never below it, since a rating built on a handful of
   games is not evidence. The percentile is low on purpose: eligibility is a
@@ -1797,7 +1974,14 @@ and run at the speed of one), organised into generations.
     runs with what `config.toml` sets under `[benchmark-arena]` (`arena_min_sessions`,
     `arena_max_sessions`, `arena_tolerance`, `arena_window`, `arena_checkpoint_sessions`; the supervisor only forwards `--config` when it was given
     one), logged to `arena-gen<N>.log`. A failed
-    run is not retried. **The arena always uses the hyperbolic K staircase**:
+    run is not retried. **Only the newest arena writes**: each run takes a turn as it starts
+    (`global_store.take_arena_turn`, `benchmark_arena_current.json` in the global dir) and checks
+    it before every write; an older one that finds it taken stops without writing and exits with
+    `ARENA_SUPERSEDED_EXIT` (3), which the supervisor retires like a success. The claim stops two
+    machines running one request, not a second request starting an arena while the first plays:
+    that happened, and the two overwrote each other's anchor ratings at every checkpoint. A run
+    that takes over waits `SUPERSEDE_GRACE_SECONDS` (30) before reading the ratings; `--restore`
+    takes the turn too, `--dry-run` does not. **The arena always uses the hyperbolic K staircase**:
     each anchor's K comes from its own `games`, so a session is not zero-sum and
     the anchors' mean is not exactly fixed — veterans at the bottom tier barely
     move, a new anchor moves most.
@@ -1879,6 +2063,50 @@ and run at the speed of one), organised into generations.
   physical deletion, gated behind an Elo signal reliable enough to trust (the
   percentile-of-games protection) and a real disk-population trigger, is what
   bounds it.
+
+## Pruning by diversity (`rl/diversity.py`, `studies/agents/diversity_study.py`)
+
+Since 2026-11-17, the user's choice: **the top 100 by rating is always safe, and below it the
+pruning keeps the models that play most differently** (`_eliminate`). It used to remove the lowest
+rated, which left the store full of near-copies.
+
+- **A model's signature** is its policy on a fixed set of decisions, the *probes*: 10,000 decisions
+  of real hands of the store's models at the training mixture with their statistics on (40%
+  preflop, 20% each later street; `diversity/probes-v2.pkl`, 16 MB, in the repo, `[pruning]
+  diversity_probes`), the square root of each bin's probability per probe. Two models are
+  `d = mean_probe(1 - sum sqrt(p_a p_b))` apart (the mean Hellinger distance, in [0, 1]), which on
+  the signatures is a dot product. A model of version 5 reads a probe with the table's memory empty.
+  Signatures are written once per model under `global/signatures/<probes fingerprint>/` (a new
+  probe file is a new directory: v1, 2,000 probes, was replaced the same day and never used by the
+  fleet) and computed by the prune itself for the models that lack one, at most
+  `SIGNATURES_PER_PRUNE` (300, ~1 s each) a pass; a model without one is neither removable nor a
+  neighbour that pass. Without the probe file nothing is pruned.
+- **Who goes** (`redundant_models`): `eliminate_fraction` of the eligible (outside the protected
+  top, games at or above the percentile, with a signature), one at a time the eligible model nearest
+  to any other still standing, protected or not, the lower-rated when the nearest two are both
+  eligible. No distance matrix is held (each model's nearest neighbour is found in blocks and again
+  only when its neighbour goes), and above `MAX_NUMBERS` (50M) every model is read on one fixed
+  random subset of the probes (`probe_subset`, ~450 probes at 10,000 models), so a worker holds at
+  most ~200 MB of signatures.
+- **The study (2026-11-17, 537 models of which 26 anchors, 10,000 probes, `checkpoints/studies/
+  diversity/report-v2.txt`)**: two models are a median 0.23 apart (preflop 0.14, later streets
+  0.27-0.31), but a model's nearest is a median 0.03 away, and the closest pairs (0.003-0.006) are
+  the **snapshots of one run** (`-i0700`, `-i0800`, ...), which the snapshot feature publishes by
+  the dozen; a child is 0.18 from its parent (a run moves a policy a lot). Two halves of the probes
+  rank the pairs alike (0.997; 0.988 with 2,000). The distance agrees with the nine statistics of
+  `style` (0.66) and hardly with the rating gap (0.12). On the real store the first prune (trigger
+  500, 10%) removes 41 models ranked 122-509, nearly all snapshots, where the rule by rating removed
+  ranks 471-511; at 10-50% removed, the models left are further from each other (nearest neighbour
+  median 0.032-0.054 against 0.031-0.033 by rating), the removed ~10 points better rated on average.
+- **The anchors are far more varied than the store** (median 0.39 apart against 0.23), and their
+  distance follows their rating gap (0.50): three blocks. The top eight (2089-1992, November
+  models) are 0.05-0.24 from each other and 0.03-0.07 from a store model (they play like the
+  store); the middle eleven (1970-1870, models of 2026-10-08) are 0.16-0.58 from each other and
+  0.26-0.46 from anything in the store (styles the store no longer has); the bottom seven
+  (1707-1280, generation 1 of 2026-10-07) are a tight group (0.12-0.24) 0.40-0.47 from the store.
+  No two anchors are near-copies (closest pair 0.05). So the benchmark measures a model against
+  styles the training pool has lost, which is what anchors are for; it also means a model's anchor
+  rating rests half on opponents unlike any it trains against.
 
 ## Ranking resolution at the top
 
@@ -2247,6 +2475,304 @@ and players only), tests in `tests/unit/test_rl_search.py`.
   known, so the belief can be exact -- the favourable case. Risks: the policy learns to exploit the pool
   and not to play, and a deterministic target collapses its entropy. `studies/agents/search_distill.py`
   is the cheap offline test (below); nothing goes into PPO before it says the network can absorb it.
+
+## Critic as a classifier, and Q-values (`studies/critic_loss/`) -- studies (the classifier is in `src/` as `critic_bins`, on since 2026-11-16)
+
+Offline tests of "Stop Regressing" (HL-Gauss: the value as a distribution over bins, trained with
+cross-entropy). `critic_loss.py generate` plays the model's own training tables (its pool, the
+mixture, lambda = 1 so the target is the Monte Carlo return) and keeps every decision with what the
+critic and the policy read; `critic_loss.py train` trains critics of one shape from scratch, one per
+loss, and reports the held-out explained variance by street, stack and table size (`--hidden` ...
+for another shape, `--train-fraction` for a learning curve); `q_values.py` trains Q-networks on the
+policy's inputs and plays agents built on them against the policy on paired hands. Readings on #1 of
+2026-11-05 (rating ~2110), all with 2 seeds, seed noise ~0.004:
+- **Critic**: `hl-symlog` (101 bins uniform in sign(v) log(1 + |v| in bb)) beats `mse-stake` (the
+  production loss then, the squared error weighed by the stake; that arm left the study with the
+  weighting) in every group, +0.008 overall (0.270 -> 0.278) and +0.05 on `<10` bb (0.38 ->
+  0.43) with no stake weighting at all; uniform bins do the same. A network 6x larger (1024x5 + 256x3)
+  changes nothing (within 0.01). The data does: every doubling of the hands adds ~+0.012 (25/50/100%
+  of 812k decisions: 0.246/0.258/0.270 `mse-stake`, 0.252/0.266/0.278 `hl-symlog`) and the curve has
+  not flattened; the production critic (0.298) has simply seen more hands. HL is worth ~1.6x the data.
+  Not measured in PPO, where the target moves (the case the paper says it helps most): switched on in
+  the fleet on 2026-11-16, read its effect off the ratings of the generations that follow.
+- **How many bins** (`train --hl-configs BINS:RATIO ...`, the same data, `hl-symlog`, 2 seeds each,
+  `report-bins.txt`): 25, 51, 101 and 201 bins are equal (0.277-0.281 overall, 0.415-0.445 on `<10` bb,
+  inside the seed noise); 11 is clearly worse (0.248-0.257, `<10` bb 0.26-0.31); 401 a little worse
+  (0.272-0.276), and still so at the 101-bin smoothing (`401:2.98`), so it is the number of outputs and
+  not the Gaussian. The Gaussian's width does not matter between 0.75 and 3 bins; 0.375 is a hair
+  worse. Hence `critic_bins = 101` with the 0.75 of `CRITIC_SIGMA_RATIO`, the middle of a flat range.
+- **Q-values, one step of policy improvement** (2.36M decisions, Q of the action taken on its Monte
+  Carlo return, HL bins per action, from scratch or from the policy's trunk): the greedy agent loses
+  ~450-560 bb/100 against the model and ~400-450 against the anchors -- its argmax differs from the
+  policy's in 96% of decisions and 95% of the time picks an action the policy plays under 5%, where
+  the Q has no examples and overestimates (it claims +2.5-3.6 bb a decision). Kept to the policy's
+  support (`supported`, `improve` with tau 1-3 bb) it is the policy within +-4 bb/100. A DQN would
+  have to fix that by exploring, and in a multiplayer game a deterministic greedy policy is
+  exploitable; not pursued.
+
+## Privileged-information distillation (`studies/pi_distill/`) -- a study, nothing in `src/` uses it
+
+Penaloza et al. 2026 (`priviliged_information_distillation.pdf`): a teacher that sees what the
+player cannot, distilled into the player. Here the privileged information is the nine equities the
+critic reads (`critic_extra`). The study is `poker-train` with the PPO update replaced
+(`distill_update`, production PPO step for step at the default settings, pinned by a test) and every
+writer of the shared store and ledger refused (`SHARED_WRITERS`, `ARENA_WRITERS`, `--no-global-elo`
+forced): a study model stays in its `--scratch-dir`. The teacher is the student plus a zero-started
+projection of the equities into the trunk's first layer (all other weights shared), or with
+`--pi-separate-teacher` a copy of the student's trunk and head plus that projection, clipped apart
+and reaching the student only through the KL. `--pi-actor student` is OPSD (the student plays, the
+teacher learns off-policy, reverse KL), `teacher` is pi-Distill (the teacher plays reading the
+equities, the student learns off-policy, forward KL); `--pi-placebo` gives the teacher another
+decision's equities (same distribution, no information), the control every reading is held against.
+`pi_distill.py ratings <json>...` and `summary <dirs>` read the results. Tests in
+`tests/unit/test_study_pi_distill.py`.
+
+- **E1 (shared teacher, from scratch, 40 iterations of 10,000 hands, 3 seeds, students rated against
+  the anchors at 10/20/30/40 on the same 300 sessions; `checkpoints/studies/pi_distill/e1`)**: at
+  iteration 10 every teacher arm is ahead of plain PPO, **the placebo as much as any** (+35 +- 21
+  bb/100), so the early gain is the extra loss term on the shared weights, not the information. From
+  iteration 20 the real equities hurt: OPSD is 5-12 bb/100 below the placebo at every later reading
+  (i40: OPSD -14.6, placebo -3.0, base -7.7), whatever the KL weight (0, 0.1, 1: the harm comes through
+  the shared weights), and pi-Distill is the worst (-28.7 +- 12.4). The teacher does learn to read the
+  equities (edge +0.06-0.09, KL to the student 0.26-0.53; placebo 0.001 and 0.03): the high-KL regime
+  where the paper finds transfer fails, and in poker a strategy that knows the cards is not one a
+  player without them can copy (strategy fusion).
+- **E2 (separate teacher, otherwise E1; `e2/`)**: the shared weights were the harm. With weak KL
+  (0.1) the student ends level with plain PPO (i40 -1.0 +- 3.4) and level with its placebo at every
+  reading from i20 (-1.3, -2.8, +0.3); with KL 1.0 it loses again (-10.1 +- 3.4). Its i10 lead (+29.6
+  +- 8.5) is matched by two of the three placebo seeds, so it is the pull towards a second, faster-
+  moving network, not the equities. The teacher's KL to the student settles at 0.6-0.8 (placebo
+  0.07-0.12): nothing it learns from the cards reaches a student that cannot see them.
+- **E3 (fine-tune of the #1, rated 2117, with its own recorded settings, 20 iterations of 30,000
+  hands, separate teacher; `e3/`)**: nothing moves. On the same 300 sessions the parent reads +33.2
+  bb/100 and every arm drifts to ~+30 by i20 (base +30.0, weak KL -1.1 +- 0.8, a teacher held close
+  to the student by `--pi-beta-teacher 1` +1.1 +- 0.9, placebo -0.2 +- 0.9). Held close, the KL is
+  0.003 and the teacher's edge +0.005: the low-KL regime where the paper finds transfer works, and
+  here there is nothing in it to transfer. **Reading of the three: the equities do not distil into
+  this policy**; not pursued further.
+- **E4 (the critic in hindsight, `--pi-critic-board`; from scratch, 3 seeds, the HL critic with
+  its working start; `e4/`)**: the critic's equities on the board the hand will have (`real`, the
+  production switch `--critic-runout`) in place of the equities now explained less of the return
+  (iteration 40: preflop 0.09-0.22 against 0.25-0.30) and the students end level (i40 -3.7 against
+  -3.4 bb/100, -0.3 +- 1.0); the control (`random`, the visible cards completed at random) ends
+  worse (-6.6 +- 1.8). The base arm, the HL critic, ends at -3.4 +- 0.8 where the scalar critic's
+  base arms of E1/E2 ended at -7.7 and -3.9: no worse. Why the runout did not help: see "The critic
+  in hindsight, off" in the RL section (the all-in hands are trained on a mean over runouts).
+- **E5 (`e5/`, 3 seeds)**: `base` (production), `now0` (`--allin-runouts 0`), `real0` (that and
+  the critic in hindsight). bb/100 at i10/i20/i30/i40: base -44.7/-7.8/-6.5/-4.9, now0
+  -96.6/-38.0/-16.2/-5.8, real0 -121.8/-33.7/-15.3/-6.0. The runouts' mean is worth a great deal
+  early; the critic in hindsight, though it explains 3-4x more of the real return, recovers none of
+  it. **Reading of E4 and E5: in this setup the critic's explained variance is not what limits how
+  fast the policy learns.**
+- **E6 (`e6/`, 3 seeds)**: `base`, `both` (the critic reads the equities now and on the whole
+  board, 18 numbers: its first layer is widened when the critic is made, `widen_critic`, and a
+  student is saved with a layer of the usual width, `playable_copy`), `runs100` (`--allin-runouts
+  100`). bb/100 at i10/i20/i30/i40: base -60.8/-6.8/-7.5/-1.2, both -55.8/-12.4/-2.7/-8.8, runs100
+  -46.1/-6.5/-6.4/-3.3. Nothing better than production. **Where the variance left is** (the #1
+  against itself, 3,000 hands of the training mixture, each seat's result squared, the all-in hands
+  at their mean over 20 boards): hands ended by a fold before the river are 55.5% of the hands and
+  9.7% of it, the all-in hands 16.9% and 42.3%, the hands that reached the river with betting 27.5%
+  and 48.0%. The one place an all-in-style simulation could still take luck out is the last: replay
+  the river (and the turn) with other cards and the same players, and train the earlier decisions on
+  the mean. Not built: it means a replay of the street's betting per card, with the models.
+- **A separate teacher copies the student at its first use** (`Distiller.ready`): `poker-train`
+  makes the critic, hence the teacher, before it loads the checkpoint it resumes from.
+
+## Belief network (`studies/belief/`) -- the study behind feature version 5 (branch `v4`)
+
+The plan (the user's): the policy reads, for every opponent, a vector describing the range of cards
+it believes that opponent holds, from public information only; and, as a later arm, *oracle
+guiding* (Suphx): in training part of the vectors are the true ones, a share that falls to 0. So the
+vector must exist for the true hand too: it is built **from the range**, as the range's mean and
+spread in the space of the equity encoder `phi` (`belief_model.range_embedding`); on the true hand
+alone it is exactly `phi` of that hand (pinned by a test), and an oracle mix is `(1 - a) * range +
+a * true hand`. Decided with the user: the belief network is trained apart and frozen (like the
+equity network), the policy gets the vector plus the equity, the work goes on branch `v4`.
+
+- **Data** (`belief_generate.py`, `belief_data.py`): 800,000 hands (4,000 sessions of 200, ~6
+  minutes on 44 cores) of store models at training-like tables (70% of the seats from the top 100,
+  the rest from the whole store, 30% styled, HUD on); ~12M samples: at every voluntary action, every
+  other player still in, with its real cards. The raw hands are kept (`hands-*.jsonl.gz`), so a new
+  featurisation does not replay them. Test: every tenth session, and the targets of a tenth of the
+  models (never a target in training).
+- **The network** (`belief_model.BeliefNet`): a GRU over the hand's tokens (the target's own
+  marked), the target's statics (position, stack, HUD) and the board give a context; each of the
+  1326 combos is scored as `<A h, psi(phi(c, board), class(c))>`, the combos the observer sees masked.
+- **First reading** (20,000 steps of 2,048, `runs/`): on the opponents that have acted, the true combo
+  gets 1.48 bits more than "any two cards" (the believed range ~486 combos of ~1,000; river 1.41 bits
+  over every sample, 431 combos); 0 bits on those that have not spoken yet, rightly (59% of the
+  samples, mostly preflop). The same on models never seen (1.57). The actions of the hand are most of
+  it (`no-tokens` 0.88 bits); **the HUD adds little** (`no-hud` 1.44), in line with `hud_study`: the
+  store's models play alike.
+- **Worth to a decision** (`belief_equity.py`): the explained variance of my heads-up equity against
+  the opponent's real hand (the equity network's expectation) goes from 0.26 with my `phi` alone to
+  **0.46** with the range vector, against the opponents that have acted (river 0.21 -> 0.40); the
+  equity computed exactly against the believed range reaches 0.51 (the 64 numbers lose little); the
+  oracle 0.98.
+- **Memory instead of the HUD** (`belief_history.py`, `PlayerMemory`): each past hand of the target
+  (all its tokens, its cards only if it showed them at a showdown, its result) becomes a vector, a GRU
+  runs over them in order; trained by whole sessions. Arms `hud` / `memory` / `both` / `none`,
+  reported by how many hands of the target the table has seen (8,000 steps of 4,096, one seed,
+  `history/`). Bits gained on the targets that have acted: none 1.40, HUD 1.43, both 1.45, **memory
+  1.47**; after 50+ hands of the target seen: 1.40 / 1.44 / 1.46 / 1.48, after 1-9: 1.35 / 1.33 /
+  1.34 / 1.36. The memory is at least as good as the HUD and its edge grows with the hands seen
+  (where `none` stays flat), but everything the past hands give is small (+0.08 bits at most): the
+  store's models differ little from one another. A memory would matter more against opponents that
+  differ (styles, humans); not measured.
+- **In production** (2026-11-17, the user's choice: the memory in place of the HUD): the `memory` arm
+  was exported and read by feature version 5 (see "Version 5"
+  in the RL section). The policy is given the range's mean and width per opponent, not the equity
+  against it: an exact equity is 1326 equity-network calls per opponent and decision, and offline a
+  head on the mean and spread recovered most of it (0.475 against 0.509), which the policy's trunk can
+  learn as well.
+
+- **The second data set and network (2026-11-17, in production as `belief_evaluator/
+  belief-memory-v2.pt` until 2026-11-18, when `belief-memory-v3.pt` replaced it; no version-5 model
+  had been published; the first file was never used by a model and is deleted)**: `data-v2/`,
+  12,000 sessions of 200 hands (2.4M hands, ~39M samples, 3.1 GB), every model of the store and the
+  26 anchors (`--with-anchors`, 30% of the seats from the top 100), half the seats with a style of
+  the fifteen axes at their full calibration (spread 0.75, temperature spread 0.3, jitter 0.2:
+  harsher than the fleet's). The first data set had styles at scale 1, which barely move a model.
+  The `memory` arm, 20,000 steps of 16 sessions and 4,096 samples (~25 min on the GPU,
+  `history-v2/memory`). On `data-v2`'s test sessions, on the opponents that have acted:
+
+  | | every one | styled | not styled | seen 0 hands | seen 50+ | models never seen |
+  |---|---|---|---|---|---|---|
+  | first network | 0.22 bits | **-0.82** | 1.38 | 0.10 | 0.25 | 0.36 |
+  | second network | 1.29 | 1.08 | 1.52 | 1.05 | 1.31 | 1.34 |
+
+  The first network is **worse than "any two cards" on a styled player** (it believes the store's
+  play and is confidently wrong); the second reads styled players at 1.08 bits and plain ones better
+  than the first did (1.52). **The memory now pays**: +0.26 bits from a player never seen to one
+  seen 50+ hands (+0.08 on the first data set, where the players were alike) -- the hypothesis of the
+  history study, that a memory matters against players that differ. The loss was still falling
+  slowly at 20,000 steps (6.754, 6.725, 6.712, 6.710 at 5k/10k/15k/20k).
+
+## Real players: how they play, styles that copy them, a model that imitates them (2026-11-18)
+
+Studies on the real hands of `dataset_real_hands/unified` (HandHQ, online 2009; nothing in `src/`
+uses them).
+
+- **How they differ** (`studies/agents/human_style.py`, `checkpoints/studies/human_style/`): the nine
+  HUD statistics per player. At 3-6 seats and 50+ bb the store's models play more preflop (PFR 20 against
+  13, 3-bet 9 against 4) and fold less after it (WTSD 40 against 29); Pluribus's professionals are
+  between the two.
+- **Profiles** (`studies/agents/human_imitation.py profiles`, `checkpoints/studies/human_imitation/
+  profiles.json`): k-means (k 5) on 31,673 HandHQ players (3-6 seats, 200+ hands, rates shrunk to the
+  median by their chances); a profile is its cluster's median, with its share of the players.
+- **Styles fitted to them** (`fit`, `fit.json`): for each profile the fifteen axes and the temperature
+  of `rl/styles.py` (in units of the full calibration, `FULL_SCALES`) such that the #1 playing it shows
+  the profile's statistics, at **human tables** (3-6 seats, 50-100 bb, every seat a profile drawn by
+  its share). The gradient is a weighted regression of each seat-session's counts on a small random
+  perturbation of its style (`--perturb`, so one simulation gives every profile's rates and slopes),
+  then a Gauss-Newton step with a ridge. 12 rounds of 400,000 hands (the last four with the axes
+  allowed to +-3: the looseness axis saturates at -1.5 and VPIP stayed ~36): every profile within
+  0.07-0.22 population sd of its target over the nine statistics (the unstyled #1: 1.0-2.4). What is
+  left: the tight-aggressive profile's VPIP (30 against 22, the looseness axis at -3). Every human
+  profile needs the looseness and preflop aggression far down (to -1.5..-3), a lower c-bet, and a
+  temperature 0.6-1.2.
+- **Their strength** (`strength`, paired hands at the training mixture, one seat, the #1 in every
+  other, two seeds of 200,000 hands each, bb/100 against the #1 in that seat): medio/fold-to-c-bet
+  +0.8/+1.3, tight-aggressive -9.5/-9.2, medio/low c-bet +0.5/-1.2, **loose-passive +4.2/+6.0** (+-3.3),
+  loose-balanced -13.0/-10.9. Three human styles cost nothing against a table of #1s and the
+  loose-passive one (calls, rarely raises, never folds to a 3-bet) beats it: the #1 over-raises into
+  callers. Against the #1 only, not against the field.
+- **A model that imitates them** (`studies/human_clone/`: `clone_generate.py`, `clone_train.py`;
+  `checkpoints/studies/human_clone/`): every HandHQ hand of one file in 25 (882,477 hands, 1% the
+  engine plays otherwise) replayed through the engine with a session's statistics tracker, so every
+  human decision (6.9M) is what one of our models would be asked, version 3. The #1's policy is
+  trained to give the actions taken; **a player's cards are known only when shown**, so the loss is
+  the likelihood of everything a player did in a hand marginal over the cards it could hold (`log
+  mean_c prod_t pi(a_t | c)`, 64 uniform candidates, the true cards when shown): maximum likelihood,
+  not the showdown-biased "train on shown hands". 20,000 steps of 384 player-hands (~55 minutes on the
+  shared GPU). Held-out sessions: loss 3.03 nats a decision for the #1, **0.85** for the clone; on the
+  decisions with the cards known its likeliest bin is the human's 66% of the time (the #1: 41%). At
+  human tables, every seat the clone, it shows the human median within 0.35 sd (the #1: 1.42; VPIP 35
+  against 28 is the gap). **It is weaker than our models**: -18.6/-22.7 bb/100 against the #1 in the
+  duel above, and against the anchors (300 sessions, the same for both) 1731 / -5.0 bb/100 against
+  the #1's 1945 / +25.8, about the anchors' generation of 2026-10-08. Not used anywhere: a candidate
+  for human-like opponents in training, or a human prior to start PPO from.
+- **A clone per profile, and the clones as anchors** (2026-11-18, the user's request). `clone_generate.py`
+  keeps each group's player (`<site>|<name>`), `human_imitation.py profiles` writes `profile_of` (player
+  -> profile; 66% of the groups belong to a profiled player), and `clone_train.py --profile K` trains on
+  that profile's players only: from the general clone, 4,000 steps at 5e-5, held-out loss on the
+  profile's players 1-4% below the general clone's (loose-passive 0.892 -> 0.859, its likeliest bin the
+  human's 70% -> 74%). All six (general + five) rated against the anchors from 1500 over 500 sessions
+  (`rate_and_publish.py --publish --prefix human`): p0 medio/fold-to-c-bet 1792 (+3.4 bb/100), p1
+  tight-aggressive 1793 (+2.4), p2 medio/low c-bet 1791 (+3.4), general 1748 (-1.7), p3 loose-passive
+  1744 (-2.6), p4 loose-balanced 1723 (-9.0); then made anchors at those ratings
+  (`studies/agents/add_anchors.py`, `global_arena.promote_to_benchmark`, the move the fleet's own
+  promotion does) and settled by a `benchmark_arena` run (`checkpoints/studies/human_clone/arena/`).
+  The anchors then hold a human-like ladder in the middle of their range; the styled #1s were left out
+  by the user's choice.
+
+## Belief on models and on real players (`studies/belief/belief_unified.py`, 2026-11-18)
+
+The `memory` arm trained on any mix of sources (`--weights group=w`, a group is a prefix of the source
+names: `selfplay` = `data-v2`, `handhq`, `acpc`), a player identified by name (`player`, `seq_pos`:
+the memory runs over each player's own hands, however many an online session names: the memory grid
+holds only the players present, `memory_inputs`), and a **condition** input (1: the cards are known
+because they were shown at a showdown, which is all an online hand tells; 0: dealt known, our models,
+ACPC, Pluribus; play asks with 0; `--condition-share` of the dealt samples whose target showed are
+read again with 1). `--test-only` sources (Pluribus: five professionals and the bot, every card) are
+never trained on. Every source is reported on its test sessions, also on a row "showdown, letto come
+mostrato" (the samples whose target showed, read with the condition 1), the one row every network
+can be compared on. `--evaluate-run` evaluates any saved `belief.pt` (this script's or
+`belief_history.py`'s) on whatever `--data` loads; `--stop-after` ends a run of `--steps` early, so
+arms are compared at equal steps and learning rate.
+
+**Trained on one, read on the other** (10,000 steps of 16 sessions and 4,096 samples, one seed, the
+same schedule; `checkpoints/studies/belief/unified/`, `eval-*/evaluation.json`): bits gained on the
+true hand over "any two cards", the opponents that have acted.
+
+| network | our models (styled) | HandHQ (online) | Pluribus pros | ACPC bots |
+|---|---|---|---|---|
+| models only (`M-models`) | **1.24** | 0.68 | 0.55 | -0.07 |
+| humans only (`H-humans`) | 0.58 | **1.45** | **1.34** | 0.18 |
+| v2 in production (models, 20,000 steps) | 1.29 | 0.63 | 0.70 | -0.06 |
+| everything (`A-all`: selfplay 0.45, handhq 0.35, acpc 0.2, condition) | 1.21 | 1.36 | 1.29 | 0.39 |
+
+Neither transfers: each reads the other's players at about half (the human network on our models,
+even read as shown, 0.72 against 1.31). The network trained on online players' showdowns reads the
+professionals of Pluribus, every card dealt known, almost as well as it reads online players (1.34),
+so it learnt how people play, not only which hands reach a showdown; the networks trained on our
+models read them at 0.55-0.70, confidently wrong (narrower ranges, 340 combos against 420). Nobody
+reads the ACPC heads-up bots well (200 bb, near-equilibrium play): 0.39 bits trained on them. **One
+network on everything costs almost nothing on each** (`A-all`: 1.21 on our models against 1.24, 1.36
+on HandHQ against 1.45, 1.29 on the professionals against 1.34): the candidate to replace v2, which
+is a models-only network whose ranges are worth half against people (not exported yet; replacing
+the production file resets the version-5 lineages, of which the store has none). **In production
+since 2026-11-18** as `belief_evaluator/belief-memory-v3.pt` (the 10,000-step `A-all`, exported with
+`belief_export.py`, which handles the condition column; on a test session the production reader's
+ranges equal the study network's within 1.3e-5). `A-long` (`--steps 300000 --keep-evaluations`, a copy
+every 25,000 steps) is the longer run of the same arm (11.3 h on the shared GPU). Bits on the acted
+opponents, by step (25k / 100k / 300k): our models 1.27 / 1.27 / **1.11** (best 1.30 at 50-75k, then it
+overfits the self-play data: the training loss keeps falling), HandHQ by site 1.22-1.53 / 1.26-1.55 /
+1.25-1.56 (flat from ~100k), Pluribus 1.40 / 1.39 / 1.34 (8,568 samples, noisy), ACPC 0.35-0.49 /
+0.39-0.56 / 0.40-0.60 (still rising slowly). **The candidate is the 100k copy** (`A-long/belief-0100000.pt`),
+above v3 everywhere; not exported: replacing the file again resets the version-5 lineages.
+
+## Belief architecture, size and data (`checkpoints/studies/belief/arch/`, 2026-11-19, running)
+
+`belief_unified.py` takes `--hand-encoder gru|transformer` (what reads a hand's tokens, the current hand
+and each past hand of the memory; `belief_model.TokenTransformer`, 2 layers, 4 heads), `--memory
+gru|attention` (a causal transformer over the player's past hands instead of the GRU: the state before hand
+k reads hands 0..k-1 only, pinned by the check in the study) and `--head dot|mixture|mlp` (a range as the
+log of a sum of `--mixture` dot products, or the dot product plus an MLP on `psi(c) + q(h)`). Only the
+default (GRU, GRU, dot) is what `rl/belief.py` reads: `belief_export.py` refuses the others. New self-play
+data: `data-v3`, 24,000 sessions as `data-v2` (seed 2000000), 78M samples. Arms (100,000 steps each, the
+A-all mix, a copy every 25,000): `base-v2` (old data), `base`, `att-mem`, `mixture`, `mlp`, `tf-hand`,
+`small` (64/128/32/64), `large` (256/512/128/256), all but the first on data-v2 + data-v3. One arm fills the
+GPU (59 GB, 90%), so they run one after another (`queue.sh`).
+
+**More self-play data** (`base-v2` against `base`, 100,000 steps, bits on the acted opponents): on the real players,
+whose test sessions are the same for both, nothing changes (HandHQ 1.420 / 1.426, ACPC 0.518 / 0.525, Pluribus
+1.37 / 1.36). On the self-play test sessions of data-v3, which neither trained on (`--evaluate-run`, `eval-v3-*`):
+`base-v2` 1.08, `base` **1.20** (every street, every count of hands seen). data-v3 was played by today's store and
+anchors (the human clones among them), so part of that is a newer field rather than more hands: `base-v2` reads its
+own data-v2 test at 1.30 and the new one at 1.08. On data-v2's test `base` is ~1.35 (inferred from its mixed test,
+1.25 over both): more hands help a little even on the old field. Old-data arms are compared with `base-v2`, the rest
+with `base`.
 
 ## Player embedder (`studies/player_embedding/`) -- a study, nothing in `src/` uses it
 
@@ -3523,6 +4049,27 @@ do the numbers.
     **The ranking moves while the fleet trains** (`#1` was another model a day earlier and
     mixing two in one file gave nonsense): the calibration pins the labels in its file and
     `--restart` discards it. Recalibrate when the population has moved far.
+  - **Ten axes of detail (2026-11-17, the user's request: more parameters and detail)**:
+    `DETAIL_AXES` after the first five (`LEGACY_AXES`): `posizione` (looser and more aggressive
+    the later it acts, `position_of`), `aggressivita_flop/_turn/_river` (one street's aggression),
+    `bluff` (bets and raises with nothing, `strength_of`'s `debole`) and `slowplay` (checks and calls
+    with `forte`; negative fast-plays), `tre_bet`, `fold_al_tre_bet`, `check_raise`, `shove_corto`
+    (from 25 bb down). A list of five scales means the first five and leaves the detail at 0, off
+    (`full_scales`), so `config.toml`'s five keep the fleet's opponents as they were; fifteen switch
+    it on. **Calibrated** (`checkpoints/studies/style_calibration-detail.json`, the #1 of
+    2026-11-17, 40,000 hands a cell, strengths 2-32): nothing costs anything up to strength 8 and the
+    statistics barely move (the models' logits are decisive); the scale where the costlier sign's
+    extreme costs what the #50 does (-16.8 bb/100, a noisy reference: #20 and #100 read +5.1 and
+    +3.1), rounded down: posizione 20, flop 24, turn 32, river 20, bluff 28, slowplay 32, tre_bet 28,
+    fold_al_tre_bet 24, check_raise 16, shove_corto 32 -- `--style-scales 5 8 8 4 8 20 24 32 20 28
+    32 28 24 16 32`. At those strengths the styles are visible: c-bet 3-90%, 3-bet 1-40%, fold to a
+    3-bet 0-80%, steal 17-50%. **On in `config.toml` since 2026-11-17**, one line an axis, the ten new ones
+    at **60% of their calibration**: each axis was calibrated alone, and fifteen add up. A random style
+    at `style_spread` 0.75 (paired hands, 40,000 a setting, against the same baseline) costs +0.5 +- 5.5
+    bb/100 with the first five alone, -1.5 +- 6.0 with the new ones at 40%, -14 +- 6.7 at 60% (about
+    the #50, the calibration's own yardstick) and -44 +- 7.9 at 100%. The second belief data set was
+    played at 100%, spread 0.75, temperature spread 0.3, jitter 0.2: harsher than the fleet's styles,
+    on purpose (the network should read players more varied than the ones it will meet).
   - **Share, spread, temperature spread and jitter are axes of the sweep** (`HP_AXES`, values in
     `[starting-point]`): each lineage inherits and perturbs its own, so the optimizer can say whether
     styled opponents pay. The scales stay fleet-wide (`[styles]`). A share of 0 stays 0.
@@ -3615,12 +4162,13 @@ do the numbers.
   then re-derive the numbers from the formula rather than editing them.
 - **The critic on short stacks (`<10` bb effective).** On the first v2 run its explained
   variance there is a median 0.03, negative for a quarter of the workers, against ~0.18 on
-  the deeper groups, with the stake weighting (`critic_stack_power` 1.4) already on (see
-  "Value diagnostics" in the RL section). Not understood: the critic is given every
+  the deeper groups, with the stake weighting of the time (power 1.4) on (see "Value
+  diagnostics" in the RL section). The classifier critic (on since 2026-11-16, unweighted)
+  explained this group 0.38 -> 0.43 offline; read it again in the fleet first. Not understood: the critic is given every
   player's equity, and a short stack's hand mostly ends all-in and is trained on the mean
   over runouts (`allin_runouts`), so this group should be among the easiest. Find out
-  why before reaching for a remedy (a higher power, or the per-hand scale the from-scratch
-  study preferred, which changes the policy's objective).
+  why before reaching for a remedy (the per-hand scale the from-scratch study preferred
+  changes the policy's objective).
 - **Make the Elo update take the bb difference into account.** `pairwise_elo_delta`
   reads only the *sign* of each pair's chip delta, so winning by one chip counts as
   much as winning by 100 bb. Decided to do, not yet done. The design has to avoid

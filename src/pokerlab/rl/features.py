@@ -31,12 +31,16 @@ from version 3:
   first and right-aligned so the most recent action is always in the same place. The per-street
   aggregates stay, for what falls out of the window. Every seat also says whether it still has
   to respond to the street's bet (`_seats_to_act`).
+
+**Version 5** (built when asked, `--feature-version 5`) is version 3 with every seat's opponent
+statistics replaced by a belief about that seat's cards: `BELIEF_FEATURES` numbers a belief network
+computes at the decision (`rl/belief.py`) and hands in as `beliefs=`. This module only lays them out.
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
 from pokerlab.cards.card import Card, Suit
@@ -56,7 +60,9 @@ MAX_SEATS = 9
 # another. Comparing dimensions alone would not catch it: the position fix that reordered
 # seats kept OBS_DIM identical.
 FEATURE_VERSION = 3
-SUPPORTED_VERSIONS = (3, 4)
+SUPPORTED_VERSIONS = (3, 4, 5)
+# The versions a new model may be built at (`--feature-version`): 4 is only served.
+BUILT_VERSIONS = (3, 5)
 
 CARD_PLANES = 6
 CARDS_DIM = CARD_PLANES * 52
@@ -103,7 +109,25 @@ OBS_DIM_V4 = (
     + MASK_DIM
 )
 
-_OBS_DIM_BY_VERSION = {3: OBS_DIM_V3, 4: OBS_DIM_V4}
+# Version 5: version 3 with every seat's opponent statistics replaced by the belief the model
+# holds about that seat (`rl/belief.py`): the range's mean in the equity encoder's space
+# (`BELIEF_LATENT`) and how wide it is. Zero for me, for a folded seat and for a seat with
+# no belief supplied.
+BELIEF_LATENT = 32
+BELIEF_FEATURES = BELIEF_LATENT + 1
+SEAT_FEATURES_V5 = SEAT_BASE_FEATURES_V3 + BELIEF_FEATURES
+SEATS_DIM_V5 = MAX_SEATS * SEAT_FEATURES_V5
+OBS_DIM_V5 = (
+    CARDS_DIM
+    + STREET_DIM
+    + POT_SCALARS_DIM_V3
+    + FIELD_SCALARS_DIM
+    + SEATS_DIM_V5
+    + HISTORY_DIM
+    + MASK_DIM
+)
+
+_OBS_DIM_BY_VERSION = {3: OBS_DIM_V3, 4: OBS_DIM_V4, 5: OBS_DIM_V5}
 assert set(_OBS_DIM_BY_VERSION) == set(SUPPORTED_VERSIONS)
 # The names without a suffix are the layout of the version new models are built at.
 OBS_DIM = _OBS_DIM_BY_VERSION[FEATURE_VERSION]
@@ -195,26 +219,6 @@ def committed_by_seat(observation: Observation) -> dict[int, int]:
     for (seat, _street), amount in per_street.items():
         totals[seat] = totals.get(seat, 0) + amount
     return totals
-
-
-def chips_at_stake(observation: Observation) -> int:
-    """The most this seat can still win or lose from one opponent this hand, in chips:
-    its own chips for the hand (stack plus what it has put in) against the deepest
-    opponent still in it, measured the same way.
-
-    Not the effective stack the features carry, which is what is left *behind* and
-    reads 0 as soon as one opponent is all-in: this counts the chips already in too,
-    so it is what the size of the hand's result goes with. A function of the
-    Observation alone, which is what lets the critic's loss weigh a decision by it
-    (`rl/ppo.py`)."""
-    committed = committed_by_seat(observation)
-    mine = observation.my_stack + committed.get(observation.my_seat, 0)
-    opponents = [
-        seat.stack + committed.get(seat.seat, 0)
-        for seat in observation.seats
-        if seat.seat != observation.my_seat and seat.status is not PlayerStatus.FOLDED
-    ]
-    return min(mine, max(opponents)) if opponents else mine
 
 
 def _card_planes(observation: Observation) -> list[float]:
@@ -323,14 +327,23 @@ def _field_scalars(observation: Observation, seats_from_button: list[int]) -> li
     ]
 
 
-def _seat_slots_v3(observation: Observation, rotated_seats: list, starting_stack: int) -> list[float]:
+def _seat_slots_v3(
+    observation: Observation,
+    rotated_seats: list,
+    starting_stack: int,
+    beliefs: Mapping[int, Sequence[float]] | None = None,
+) -> list[float]:
     """Seats indexed relative to me (slot 0 is always me), so the encoding is
-    invariant to absolute seat numbering."""
-    slots = [0.0] * SEATS_DIM_V3
+    invariant to absolute seat numbering.
+
+    With `beliefs` (version 5), every seat's opponent statistics give way to the belief
+    the model holds about it, `BELIEF_FEATURES` numbers, zero for a seat with none."""
+    per_seat = SEAT_FEATURES_V3 if beliefs is None else SEAT_FEATURES_V5
+    slots = [0.0] * (MAX_SEATS * per_seat)
     pot = observation.pot_size
     committed = committed_by_seat(observation)
     for slot, seat in enumerate(rotated_seats):
-        offset = slot * SEAT_FEATURES_V3
+        offset = slot * per_seat
         slots[offset : offset + SEAT_BASE_FEATURES_V3] = [
             1.0,
             1.0 if seat.seat == observation.my_seat else 0.0,
@@ -342,6 +355,16 @@ def _seat_slots_v3(observation: Observation, rotated_seats: list, starting_stack
             _ratio(committed.get(seat.seat, 0), pot),
             1.0 if seat.is_button else 0.0,
         ]
+        start = offset + SEAT_BASE_FEATURES_V3
+        if beliefs is not None:
+            belief = beliefs.get(seat.seat)
+            if belief:
+                if len(belief) != BELIEF_FEATURES:
+                    raise ValueError(
+                        f"seat {seat.seat} has a belief of {len(belief)} numbers, not {BELIEF_FEATURES}"
+                    )
+                slots[start : start + BELIEF_FEATURES] = list(belief)
+            continue
         # Optional: a seat with no statistics supplied keeps its stat slots at zero.
         supplied = observation.seat_stats.get(seat.seat)
         if supplied:
@@ -350,7 +373,6 @@ def _seat_slots_v3(observation: Observation, rotated_seats: list, starting_stack
                     f"seat {seat.seat} has {len(supplied)} statistics, the encoding has "
                     f"room for {STAT_SLOTS}: truncating would silently drop some"
                 )
-            start = offset + SEAT_BASE_FEATURES_V3
             slots[start : start + len(supplied)] = [_clip01(value) for value in supplied]
     return slots
 
@@ -574,6 +596,7 @@ def encode_observation(
     starting_stack: int,
     legal_mask: Sequence[bool],
     version: int = FEATURE_VERSION,
+    beliefs: Mapping[int, Sequence[float]] | None = None,
 ) -> list[float]:
     """Flatten an `Observation` into `observation_dim(version)` features in [0, 1].
 
@@ -584,7 +607,10 @@ def encode_observation(
     spares the value head from re-deriving which actions even exist.
 
     `version` is the encoding the model being fed was trained on. `starting_stack` is read
-    only by version 3: version 4 has one scale in big blinds and no stack constant at all.
+    only by versions 3 and 5: version 4 has one scale in big blinds and no stack constant at all.
+
+    `beliefs` is read by version 5 only: per seat, the belief vector a belief network computed
+    for this decision (`rl/belief.py`); a seat missing from it encodes as zeros.
     """
     if version not in SUPPORTED_VERSIONS:
         raise ValueError(f"feature version {version} is not one this build serves {SUPPORTED_VERSIONS}")
@@ -600,13 +626,13 @@ def encode_observation(
     street_one_hot[_STREET_INDEX[observation.street]] = 1.0
     mask = [1.0 if allowed else 0.0 for allowed in legal_mask]
 
-    if version == 3:
+    if version in (3, 5):
         return [
             *_card_planes(observation),
             *street_one_hot,
             *_pot_scalars_v3(observation, big_blind, starting_stack),
             *_field_scalars(observation, seats_from_button),
-            *_seat_slots_v3(observation, rotated, starting_stack),
+            *_seat_slots_v3(observation, rotated, starting_stack, None if version == 3 else beliefs or {}),
             *_history_aggregates(observation, slot_of_seat),
             *mask,
         ]

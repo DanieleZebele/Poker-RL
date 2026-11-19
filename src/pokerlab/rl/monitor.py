@@ -681,18 +681,17 @@ class WorkerHistory:
     value_ev_street: dict[str, list[list[float]]] = field(default_factory=dict)
     value_spread_size: list[list[float]] = field(default_factory=list)
     value_spread_stack: list[list[float]] = field(default_factory=list)
-    # The gradient-norm clips (`rl/grad_log.py`), one per network: the mean and sd of the
-    # norm before the cut and the share of steps cut, one `[iteration, value]` pair per
-    # kept iteration (thinned with the `iter` columns), and each threshold as of the
-    # latest reading. Empty, and None, for a log without the line.
+    # The gradient norms (`rl/grad_log.py`), one per network: the mean and sd of the norm
+    # (the policy's before its cut), one `[iteration, value]` pair per kept iteration
+    # (thinned with the `iter` columns); for the policy, which alone is clipped, the share
+    # of steps cut and the threshold as of the latest reading. Empty, and None, for a log
+    # without the line.
     grad_policy_mean: list[list[float]] = field(default_factory=list)
     grad_policy_sd: list[list[float]] = field(default_factory=list)
     grad_policy_clipped: list[list[float]] = field(default_factory=list)
     grad_policy_threshold: float | None = None
     grad_critic_mean: list[list[float]] = field(default_factory=list)
     grad_critic_sd: list[list[float]] = field(default_factory=list)
-    grad_critic_clipped: list[list[float]] = field(default_factory=list)
-    grad_critic_threshold: float | None = None
     # How the model plays (`rl/style_log.py`): each statistic's rate over its recent
     # training hands, one `[iteration, rate]` pair per reading (the first iteration
     # and every tenth), and the last reading's raw `[events, opportunities]` with the
@@ -846,8 +845,6 @@ def parse_worker_history(
         grad_policy_threshold=kept_gradients[-1][1].policy.threshold if kept_gradients else None,
         grad_critic_mean=[[it, g.critic.mean] for it, g in kept_gradients],
         grad_critic_sd=[[it, g.critic.sd] for it, g in kept_gradients],
-        grad_critic_clipped=[[it, g.critic.clipped] for it, g in kept_gradients],
-        grad_critic_threshold=kept_gradients[-1][1].critic.threshold if kept_gradients else None,
         style_rate=style_rate,
         style_latest=style_latest,
         style_hands=style_hands,

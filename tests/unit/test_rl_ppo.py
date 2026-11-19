@@ -16,7 +16,7 @@ from pokerlab.engine.config import GameConfig
 from pokerlab.engine.table import Table
 from pokerlab.players.rl_agent import DecisionRecord
 from pokerlab.rl.action_space import ACTION_DIM
-from pokerlab.rl.features import FEATURE_VERSION, OBS_DIM, SUPPORTED_VERSIONS
+from pokerlab.rl.features import CARDS_DIM, FEATURE_VERSION, OBS_DIM, SUPPORTED_VERSIONS
 from pokerlab.rl.global_store import read_sidecar
 from pokerlab.rl.policy import EQUITY_SLOTS, PokerActorCritic
 from pokerlab.rl.pool_registry import (
@@ -34,7 +34,6 @@ from pokerlab.rl.ppo import (
     build_batch,
     build_model_from_checkpoint,
     check_compatible,
-    critic_weights,
     entropy_coefficient_at,
     learning_rate_at,
     load_checkpoint,
@@ -67,7 +66,6 @@ def synthetic_trajectory(length: int, offset: float) -> HandTrajectory:
             action_index=i % ACTION_DIM,
             log_prob=-float(i),
             value=0.0,
-            stake_bb=50.0,
             critic_extra=[0.0] * EQUITY_SLOTS,
         )
         for i in range(length)
@@ -94,7 +92,6 @@ def constant_batch(model: PokerActorCritic, advantage: float, size: int = 32) ->
         advantages=torch.full((size,), advantage),
         returns=torch.zeros(size),
         critic_extra=torch.rand(size, EQUITY_SLOTS),
-        stakes=torch.full((size,), 50.0),
     )
 
 
@@ -125,7 +122,7 @@ def test_update_returns_finite_diagnostics(model):
     assert set(stats) == {
         "policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction", "grad_steps",
         "adv_mean", "adv_std", "grad_norm_policy", "grad_norm_policy_sd", "grad_clipped_policy",
-        "grad_norm_critic", "grad_norm_critic_sd", "grad_clipped_critic",
+        "grad_norm_critic", "grad_norm_critic_sd",
     }
     for name, value in stats.items():
         assert math.isfinite(value), f"{name} was not finite"
@@ -139,71 +136,27 @@ def test_update_returns_finite_diagnostics(model):
     assert stats["grad_norm_policy_sd"] >= 0.0 and 0.0 <= stats["grad_clipped_policy"] <= 1.0
 
 
-def test_each_network_is_cut_against_its_own_threshold(model):
-    """A threshold no norm can reach cuts nothing; one every norm exceeds cuts every step;
-    and each network's clip answers to its own threshold only. The norm reported is the
-    one before the cut, not the threshold."""
+def test_the_policy_is_cut_against_its_threshold_and_the_critic_only_measured(model):
+    """A threshold no norm can reach cuts nothing and one every norm exceeds cuts every step;
+    the policy's norm reported is the one before the cut. The critic has no clip: its norm is
+    reported, and does not depend on the policy's threshold."""
     batch = constant_batch(model, advantage=1.0)
     batch.returns = torch.full_like(batch.returns, 5.0)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-6)
-
-    def update(policy: float, critic: float) -> dict[str, float]:
-        # Advantage normalisation would zero a constant advantage, and with it the policy's gradient.
-        config = PPOConfig(epochs=1, minibatch_size=8, policy_max_grad_norm=policy,
-                           critic_max_grad_norm=critic, normalize_advantages=False)
-        return ppo_update(model, optimizer, batch, config)
-
-    loose = update(1e9, 1e9)
-    assert loose["grad_clipped_policy"] == 0.0 and loose["grad_clipped_critic"] == 0.0
-    assert loose["grad_norm_policy"] > 0 and loose["grad_norm_critic"] > 0
-    policy_only = update(1e-9, 1e9)
-    assert policy_only["grad_clipped_policy"] == 1.0 and policy_only["grad_clipped_critic"] == 0.0
-    assert policy_only["grad_norm_policy"] > 1e-6
-    critic_only = update(1e9, 1e-9)
-    assert critic_only["grad_clipped_policy"] == 0.0 and critic_only["grad_clipped_critic"] == 1.0
-
-
-def test_the_critics_weights_fall_with_the_stake_and_average_one():
-    stakes = torch.tensor([0.2, 1.0, 10.0, 100.0])
-    assert torch.equal(critic_weights(stakes, 0.0), torch.ones(4))
-    weights = critic_weights(stakes, 1.4)
-    assert float(weights.mean()) == pytest.approx(1.0)
-    # Below a big blind a stake weighs as one big blind: the weight cannot grow without bound.
-    assert float(weights[0]) == pytest.approx(float(weights[1]))
-    assert float(weights[1]) > float(weights[2]) > float(weights[3])
-    assert float(weights[2] / weights[3]) == pytest.approx(10**1.4, rel=1e-4)
-
-
-def test_weighing_the_critic_by_the_stake_leaves_the_policy_untouched(model):
-    """The weight goes into the critic's loss only: a policy step is the same whatever
-    the power, and the critic's is not."""
-    batch = constant_batch(model, advantage=1.0)
-    batch.stakes = torch.linspace(1.0, 100.0, len(batch))
-    batch.returns = torch.linspace(-2.0, 2.0, len(batch))
     start = copy.deepcopy(model.state_dict())
 
-    def step(power: float) -> dict[str, torch.Tensor]:
+    def update(policy: float) -> dict[str, float]:
         model.load_state_dict(start)
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
-        torch.manual_seed(3)
-        config = PPOConfig(epochs=2, minibatch_size=8, critic_stack_power=power,
-                           normalize_advantages=False)
-        ppo_update(model, optimizer, batch, config)
-        return {name: tensor.clone() for name, tensor in model.state_dict().items()}
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-6)
+        torch.manual_seed(0)   # the same minibatches in both runs
+        # Advantage normalisation would zero a constant advantage, and with it the policy's gradient.
+        config = PPOConfig(epochs=1, minibatch_size=8, policy_max_grad_norm=policy, normalize_advantages=False)
+        return ppo_update(model, optimizer, batch, config)
 
-    flat, weighted = step(0.0), step(1.4)
-    policy = {id(p) for p in model.policy_parameters()}
-    names = {id(p): name for name, p in model.named_parameters() if p.requires_grad}
-    for parameter_id, name in names.items():
-        same = torch.equal(flat[name], weighted[name])
-        assert same == (parameter_id in policy), name
-
-
-def test_build_batch_carries_each_decisions_stake():
-    trajectory = synthetic_trajectory(3, 0.0)
-    for stake, decision in zip((2.0, 30.0, 90.0), trajectory.decisions, strict=True):
-        decision.stake_bb = stake
-    assert build_batch([trajectory]).stakes.tolist() == [2.0, 30.0, 90.0]
+    loose, tight = update(1e9), update(1e-9)
+    assert loose["grad_clipped_policy"] == 0.0 and tight["grad_clipped_policy"] == 1.0
+    assert tight["grad_norm_policy"] > 1e-6
+    assert loose["grad_norm_critic"] > 0 and tight["grad_norm_critic"] == pytest.approx(loose["grad_norm_critic"])
+    assert "grad_clipped_critic" not in loose
 
 
 def test_the_two_halves_cover_every_trainable_weight_once(model):
@@ -866,17 +819,17 @@ def _train_args(**overrides):
     from types import SimpleNamespace
 
     values = {
-        "hp_arm": "sampled", "parent_label": "", "hidden": 512, "num_layers": 3, "head_hidden": 256, "head_layers": 1, "machine": "host-a", "seed": 7, "resume": False,
+        "hp_arm": "sampled", "parent_label": "", "hidden": 512, "num_layers": 3, "head_hidden": 256, "head_layers": 1, "critic_bins": 0, "machine": "host-a", "seed": 7, "resume": False,
         "iterations": 1000, "hands": 512, "table_weights": [25.0, 20.0, 15.0, 10.0, 10.0, 10.0, 5.0, 5.0],
         "stack_min_bb": 1.0, "stack_max_bb": 100.0, "sb": 50, "bb": 100,
         "lr": 3e-4, "ppo_epochs": 4, "clip_epsilon": 0.2,
         "opponent_probability": 0.5,
-        "minibatch_size": 1024, "gae_lambda": 0.95, "value_coef": 0.5, "policy_max_grad_norm": 0.5, "critic_max_grad_norm": 1.0,
+        "minibatch_size": 1024, "gae_lambda": 0.95, "value_coef": 0.5, "policy_max_grad_norm": 0.5,
         "pool_models": 20, "table_hands": 200, "concurrent_tables": 8, "pool_top_share": 0.5, "pool_top_n": 100,
         "lr_anneal_final": 1e-5, "lr_anneal_iterations": 500, "entropy_anneal_start": 0.1,
         "entropy_anneal_final": 1e-4, "entropy_anneal_iterations": 500, "style_share": 0.3,
         "style_spread": 0.5, "style_temperature_spread": 0.2, "style_jitter": 0.1,
-        "critic_stack_power": 1.4,
+        "belief_oracle": 0.0, "belief_oracle_iterations": 0,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -893,10 +846,10 @@ def test_run_metadata_records_every_swept_axis():
     for axis in (
         "lr", "hands", "ppo_epochs", "clip_epsilon",
         "opponent_probability", "pool_top_share", "pool_top_n",
-        "minibatch_size", "gae_lambda", "value_coef", "policy_max_grad_norm", "critic_max_grad_norm",
+        "minibatch_size", "gae_lambda", "value_coef", "policy_max_grad_norm",
         "lr_anneal_final", "lr_anneal_iterations", "entropy_anneal_start", "entropy_anneal_final",
         "entropy_anneal_iterations", "style_share", "style_spread", "style_temperature_spread",
-        "style_jitter", "critic_stack_power",
+        "style_jitter", "belief_oracle", "belief_oracle_iterations",
     ):
         assert axis in recorded, axis
     assert (recorded["lr"], recorded["hands"], recorded["ppo_epochs"]) == (7e-4, 1024, 2)
@@ -1666,7 +1619,7 @@ def test_a_learner_trains_against_pool_models_of_the_other_feature_version(tmp_p
     widths: set[int] = set()
 
     def record(module, args, _output):
-        if isinstance(module, PokerActorCritic):
+        if isinstance(module, torch.nn.Linear):
             widths.add(args[0].shape[1])
 
     handle = torch.nn.modules.module.register_module_forward_hook(record)
@@ -1685,4 +1638,62 @@ def test_a_learner_trains_against_pool_models_of_the_other_feature_version(tmp_p
 
     assert stats["decisions"] > 0
     assert trainer.model.feature_version == FEATURE_VERSION
-    assert widths == {OBS_DIM, OBS_DIM_V4}, "the learner read its own vector, the veteran its own"
+    # The first layer of each policy's trunk reads the features after the card planes and the
+    # encoder's output: its width says which encoding the model was fed.
+    latent = trainer.model.equity["latent"]
+    trunk_inputs = {OBS_DIM - CARDS_DIM + latent, OBS_DIM_V4 - CARDS_DIM + latent}
+    assert trunk_inputs <= widths, "the learner read its own vector, the veteran its own"
+
+
+# -- study settings: residual trunks, dual clip, shrink and perturb ---------------------------
+
+
+def test_a_residual_network_is_rebuilt_residual_and_an_old_checkpoint_as_plain(tmp_path):
+    from pokerlab.rl.policy import ResidualBlock
+
+    residual = tiny_model(hidden=16, num_layers=2, residual=1)
+    assert sum(isinstance(m, ResidualBlock) for m in residual.trunk) == 2
+    path = tmp_path / "residual.pt"
+    save_checkpoint(path, residual)
+    rebuilt, _ = build_model_from_checkpoint(path)
+    assert rebuilt.residual == 1
+    for before, after in zip(residual.parameters(), rebuilt.parameters()):
+        assert torch.equal(before, after)
+
+    plain = tmp_path / "plain.pt"
+    save_checkpoint(plain, tiny_model(hidden=16, num_layers=2))
+    saved = torch.load(plain, weights_only=True)
+    del saved["residual"]  # as every checkpoint saved before the setting existed
+    torch.save(saved, plain)
+    old, _ = build_model_from_checkpoint(plain)
+    assert old.residual == 0
+
+
+def test_the_dual_clip_bounds_a_negative_advantage_and_leaves_the_rest():
+    from pokerlab.rl.ppo import clipped_objective
+
+    ratio = torch.tensor([10.0, 10.0, 0.5, 1.1])
+    advantages = torch.tensor([-1.0, 1.0, -1.0, -2.0])
+    plain = clipped_objective(ratio, advantages, 0.2)
+    dual = clipped_objective(ratio, advantages, 0.2, dual_clip=3.0)
+    assert plain.tolist() == pytest.approx([-10.0, 1.2, -0.8, -2.2])
+    assert dual.tolist() == pytest.approx([-3.0, 1.2, -0.8, -2.2])
+    with pytest.raises(ValueError):
+        PPOConfig(dual_clip=0.5)
+
+
+def test_shrink_and_perturb_moves_the_trained_layers_and_not_the_frozen_encoder():
+    from pokerlab.rl.ppo import shrink_and_perturb
+
+    model = tiny_model(hidden=16, num_layers=1)
+    before = copy.deepcopy(model.state_dict())
+    torch.manual_seed(0)
+    shrink_and_perturb(model, 0.0)
+    assert all(torch.equal(before[k], v) for k, v in model.state_dict().items())
+    shrink_and_perturb(model, 0.5)
+    after = model.state_dict()
+    assert all(torch.equal(before[k], v) for k, v in after.items() if k.startswith("equity_encoder"))
+    assert not torch.equal(before["trunk.0.weight"], after["trunk.0.weight"])
+    assert not torch.equal(before["value_head.0.weight"], after["value_head.0.weight"])
+    # LayerNorm is not a Linear: left alone
+    assert torch.equal(before["trunk.1.weight"], after["trunk.1.weight"])

@@ -183,6 +183,23 @@ def test_the_network_shape_reaches_every_worker_and_survives_inheritance(tmp_pat
     assert "resumed from" in second and "different network" not in second
 
 
+def test_a_classifier_critic_reaches_every_worker_and_survives_inheritance(tmp_path):
+    """`--critic-bins` from the loop's flags: every published model records the classifier,
+    and the second generation resumes from parents with the same critic, all of it."""
+    import torch
+
+    result = run_loop(tmp_path, generations=2, extra=("--critic-bins", "21"))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    models = _published(tmp_path)
+    assert len(models) == 6
+    for path in models:
+        saved = torch.load(path, map_location="cpu", weights_only=True)
+        assert saved["critic"]["bins"] == 21 and saved["metadata"]["critic_bins"] == 21
+    second = (tmp_path / "logs" / "gen0002-w00.log").read_text()
+    assert "resumed from" in second and "starts afresh" not in second
+
+
 def test_the_old_per_machine_layout_is_never_created(tmp_path):
     result = run_loop(tmp_path, generations=1, extra=("--no-global-elo",))
     assert result.returncode == 0, result.stdout + result.stderr

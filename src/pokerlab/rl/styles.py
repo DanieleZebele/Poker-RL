@@ -20,6 +20,21 @@ study, `studies/agents/style_calibration.py`):
   bet;
 - **dimensione** (small <-> big bets): the small raise bins against the big ones;
 
+and, since 2026-11-17, ten axes of detail (`DETAIL_AXES`, off where only five scales are given):
+
+- **posizione**: looser and more aggressive the later it acts (`position_of`: the button 1, the
+  first seat after the blinds -1, the blinds 0), preflop; more aggressive in position postflop;
+- **aggressivita_flop / _turn / _river**: the postflop aggression of one street alone (c-bet,
+  second barrel, river bet);
+- **bluff**: bets and raises with nothing (`strength_of`: `debole`, nothing the board does not
+  have); **slowplay**: checks and calls with a strong hand (`forte`, a set or better, or two pair
+  on an unpaired board) instead of betting -- negative is a player who fast-plays;
+- **tre_bet**: re-raises a single raise preflop; **fold_al_tre_bet**: folds its own raise to a
+  re-raise;
+- **check_raise**: raises a bet after checking the same street;
+- **shove_corto**: shoves instead of raising small when its stack is short (from
+  `SHORT_FROM_BB` big blinds down, fully at `SHORT_FULL_BB`);
+
 plus a **temperature** (the logits divided by it: above 1 an erratic player, below 1 a
 mechanical one) and a little **noise** on the shape of the push, so that two players at
 the same point of the space are not one pattern either.
@@ -34,15 +49,35 @@ from __future__ import annotations
 
 import math
 import random
+from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 
+from pokerlab.cards.card import Card
+from pokerlab.engine.actions import FORCED_ACTIONS, ActionType
 from pokerlab.engine.state import Street
+from pokerlab.evaluator.evaluator import HandCategory, evaluate
 from pokerlab.players.base import Observation
 from pokerlab.rl.action_space import ACTION_DIM, ALL_IN_BIN, CHECK_CALL_BIN, FOLD_BIN, POT_FRACTIONS
 from pokerlab.rl.hand_tiers import TIER_OF, TIERS, hand_class
 
-AXES = ("larghezza", "aggressivita_preflop", "aggressivita_postflop", "tenacia", "dimensione")
+LEGACY_AXES = ("larghezza", "aggressivita_preflop", "aggressivita_postflop", "tenacia", "dimensione")
+# Added 2026-11-17, after the first five (so a list of five scales still means the first five,
+# and the new ones are off): position, street by street, bluff against value, preflop spots.
+DETAIL_AXES = (
+    "posizione",
+    "aggressivita_flop",
+    "aggressivita_turn",
+    "aggressivita_river",
+    "bluff",
+    "slowplay",
+    "tre_bet",
+    "fold_al_tre_bet",
+    "check_raise",
+    "shove_corto",
+)
+AXES = LEGACY_AXES + DETAIL_AXES
 SITUATIONS = ("preflop", "checked", "facing")
 GROUPS = ("fold", "call", "small", "big", "allin")
 
@@ -75,7 +110,7 @@ PATTERNS: dict[str, dict[str, dict[str, float]]] = {
         situation: {"small": -0.5, "big": 0.5, "allin": 0.5} for situation in SITUATIONS
     },
 }
-assert set(PATTERNS) == set(AXES)
+assert set(PATTERNS) == set(LEGACY_AXES)
 
 # How much of `larghezza` reaches each band of starting hands: the marginal ones move, the
 # best and the worst much less.
@@ -83,11 +118,124 @@ HAND_WEIGHT = dict(zip(TIERS, (0.2, 0.5, 1.0, 1.0, 0.7)))
 
 DEFAULT_SCALES = (1.0,) * len(AXES)
 
+# `shove_corto` acts from this many big blinds of stack down, fully at `SHORT_FULL_BB` and below.
+SHORT_FROM_BB = 25.0
+SHORT_FULL_BB = 5.0
+_STREET_AXIS = {Street.FLOP: "aggressivita_flop", Street.TURN: "aggressivita_turn", Street.RIVER: "aggressivita_river"}
+_AGGRESSIVE = {"call": -0.5, **_RAISES}
+
 
 def situation_of(observation: Observation) -> str:
     if observation.street == Street.PREFLOP:
         return "preflop"
     return "facing" if observation.current_bet_to_match > observation.my_current_bet else "checked"
+
+
+def position_of(observation: Observation) -> float:
+    """How late I act, in [-1, 1]: the button 1, the first seat after the big blind -1, the seats
+    between evenly spaced; the blinds 0 (heads-up the button 1 and the big blind 0)."""
+    seats = [seat.seat for seat in observation.seats]
+    start = seats.index(observation.button_seat)
+    order = seats[start + 1 :] + seats[: start + 1]  # small blind, big blind, ..., button
+    if len(seats) == 2:
+        return 1.0 if observation.my_seat == observation.button_seat else 0.0
+    index = order.index(observation.my_seat)
+    if index < 2:
+        return 0.0
+    others = len(seats) - 2
+    return 1.0 if others == 1 else -1.0 + 2.0 * (index - 2) / (others - 1)
+
+
+def preflop_raises(observation: Observation) -> tuple[int, bool]:
+    """How many raises the preflop has seen (a shove above the bet is one; blinds and antes are
+    not), and whether one of them was mine."""
+    level, raises, mine = 0, 0, False
+    for record in observation.action_history:
+        if record.street is not Street.PREFLOP:
+            continue
+        if record.action_type in FORCED_ACTIONS:
+            level = max(level, record.amount)
+            continue
+        if record.amount > level and record.action_type in (ActionType.BET, ActionType.RAISE, ActionType.ALL_IN):
+            raises += 1
+            mine = mine or record.seat == observation.my_seat
+        level = max(level, record.amount)
+    return raises, mine
+
+
+def _board_category(board: Sequence[Card]) -> HandCategory:
+    counts = sorted(Counter(card.rank for card in board).values(), reverse=True) + [0]
+    if counts[0] >= 4:
+        return HandCategory.FOUR_OF_A_KIND
+    if counts[0] == 3:
+        return HandCategory.FULL_HOUSE if counts[1] >= 2 else HandCategory.THREE_OF_A_KIND
+    if counts[0] == 2:
+        return HandCategory.TWO_PAIR if counts[1] == 2 else HandCategory.PAIR
+    return HandCategory.HIGH_CARD
+
+
+@lru_cache(maxsize=65_536)
+def strength_of(hole: tuple[Card, Card], board: tuple[Card, ...]) -> str:
+    """How much my two cards make of the board, after the flop: `forte` (a set or better, or two
+    pair on an unpaired board, my cards in it), `media` (a pair of my own, or better than the
+    board by one step), `debole` (nothing the board does not already have)."""
+    mine = evaluate((*hole, *board)).category
+    shared = _board_category(board)
+    if mine <= shared:
+        return "debole"
+    if mine >= HandCategory.THREE_OF_A_KIND or (mine == HandCategory.TWO_PAIR and shared == HandCategory.HIGH_CARD):
+        return "forte"
+    return "media"
+
+
+def _detail(axis: str, observation: Observation, situation: str) -> dict[str, float] | None:
+    """The push of one of `DETAIL_AXES` at a value of 1 and a scale of 1, in this state."""
+    street = observation.street
+    if axis == "posizione":
+        where = position_of(observation)
+        if situation == "preflop":
+            return {"fold": -1.0 * where, "small": 0.5 * where, "big": 0.5 * where, "allin": 0.5 * where}
+        return {group: unit * where for group, unit in _RAISES.items()}
+    if axis in _STREET_AXIS.values():
+        return dict(_AGGRESSIVE) if _STREET_AXIS.get(street) == axis else None
+    if axis in ("bluff", "slowplay"):
+        if situation == "preflop":
+            return None
+        strength = strength_of(tuple(observation.hole_cards), tuple(observation.community_cards))
+        if axis == "bluff":
+            return dict(_AGGRESSIVE) if strength == "debole" else None
+        return {"call": 1.0, "small": -0.5, "big": -0.5, "allin": -0.5} if strength == "forte" else None
+    if axis in ("tre_bet", "fold_al_tre_bet"):
+        if situation != "preflop":
+            return None
+        raises, mine = preflop_raises(observation)
+        if axis == "tre_bet" and raises == 1 and not mine:
+            return {"fold": -0.25, "call": -0.25, **_RAISES}
+        if axis == "fold_al_tre_bet" and raises >= 2 and mine:
+            return {"fold": 1.0, "call": -0.5, **{group: -0.5 for group in _RAISES}}
+        return None
+    if axis == "check_raise":
+        checked = any(
+            record.seat == observation.my_seat and record.street is street and record.action_type is ActionType.CHECK
+            for record in observation.action_history
+        )
+        return dict(_AGGRESSIVE) if situation == "facing" and checked else None
+    if axis == "shove_corto":
+        if not observation.big_blind:
+            return None
+        stack_bb = (observation.my_stack + observation.my_current_bet) / observation.big_blind
+        short = min(1.0, max(0.0, (SHORT_FROM_BB - stack_bb) / (SHORT_FROM_BB - SHORT_FULL_BB)))
+        return {"allin": 1.0 * short, "small": -0.5 * short} if short > 0 else None
+    raise ValueError(f"unknown style axis {axis!r}")
+
+
+def full_scales(scales: Sequence[float]) -> tuple[float, ...]:
+    """One scale per axis of `AXES`: a list of the first five alone (what was written before the
+    detail axes existed) leaves the detail axes at 0, off."""
+    scales = tuple(scales)
+    if len(scales) == len(LEGACY_AXES):
+        return scales + (0.0,) * len(DETAIL_AXES)
+    return scales
 
 
 @dataclass(frozen=True)
@@ -111,9 +259,11 @@ class Style:
         """What is added to the logits of every bin, in this state."""
         situation = situation_of(observation)
         by_group = dict.fromkeys(GROUPS, 0.0)
-        for axis, value, scale in zip(AXES, self.axes, scales):
-            pattern = PATTERNS[axis].get(situation)
-            if not pattern or not value:
+        for axis, value, scale in zip(AXES, self.axes, full_scales(scales)):
+            if not value or not scale:
+                continue
+            pattern = PATTERNS[axis].get(situation) if axis in PATTERNS else _detail(axis, observation, situation)
+            if not pattern:
                 continue
             weight = HAND_WEIGHT[TIER_OF[hand_class(observation.hole_cards)]] if axis == "larghezza" else 1.0
             for group, unit in pattern.items():
@@ -161,8 +311,12 @@ class StyleConfig:
             raise ValueError("style_share is a share of the opponent seats, between 0 and 1")
         if min(self.spread, self.temperature_spread, self.jitter) < 0:
             raise ValueError("style_spread, style_temperature_spread and style_jitter cannot be negative")
-        if len(self.scales) != len(AXES) or min(self.scales) < 0:
-            raise ValueError(f"style_scales is one non-negative number per axis {AXES}")
+        if len(self.scales) not in (len(LEGACY_AXES), len(AXES)) or min(self.scales) < 0:
+            raise ValueError(
+                f"style_scales is one non-negative number per axis {AXES} (or per one of the first "
+                f"{len(LEGACY_AXES)}, which leaves the others off)"
+            )
+        object.__setattr__(self, "scales", full_scales(self.scales))
 
     @property
     def enabled(self) -> bool:
